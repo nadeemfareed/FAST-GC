@@ -1,0 +1,14 @@
+name: fastgc
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - numpy>=1.22
+  - scipy>=1.9
+  - rasterio>=1.3
+  - tqdm>=4.64
+  - pip
+  - pip:
+      - laspy>=2.4
+      - lazrs>=0.6
