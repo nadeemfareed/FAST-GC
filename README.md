@@ -1,5 +1,5 @@
 # FAST-GC
- `<img src="docs/images/logo_fastgc.png" align="right" width="180"/>`{=html}
+ <img src="docs/images/logo_fastgc.png" align="right" width="180"/>
 
 !![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
@@ -7,18 +7,10 @@
 ![Conda](https://img.shields.io/badge/conda-supported-green)
 ![Colab](https://img.shields.io/badge/Google%20Colab-supported-orange)
 ![Cloud](https://img.shields.io/badge/cloud-ready-blue)
-![Geospatial](https://img.shields.io/badge/geospatial-workflows-brightgreen)
 ![Status](https://img.shields.io/badge/status-research%20software-green)
-
-![LAS/LAZ](https://img.shields.io/badge/LiDAR-LAS%20%7C%20LAZ-blue)
-![GeoTIFF](https://img.shields.io/badge/Raster-GeoTIFF-green)
-![GDAL](https://img.shields.io/badge/GDAL-compatible-green)
-![PDAL](https://img.shields.io/badge/PDAL-compatible-blue)
-
 [![USGS 3DEP](https://img.shields.io/badge/USGS-3DEP%20Compatible-blue)](https://www.usgs.gov/3d-elevation-program)
 [![OpenTopography](https://img.shields.io/badge/OpenTopography-LiDAR%20Datasets-orange)](https://opentopography.org)
 [![QGIS Compatible](https://img.shields.io/badge/QGIS-Compatible-green)](https://qgis.org)
-[![CloudCompare Compatible](https://img.shields.io/badge/CloudCompare-Compatible-blue)](https://www.cloudcompare.org)
 
 ## Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification for LiDAR Point Clouds
 
