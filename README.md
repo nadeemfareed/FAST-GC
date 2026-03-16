@@ -1,4 +1,5 @@
-# FAST-GC `<img src="docs/images/logo_fastgc.png" align="right" width="180"/>`{=html}
+# FAST-GC
+ `<img src="docs/images/logo_fastgc.png" align="right" width="180"/>`{=html}
 
 !![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
