@@ -1,5 +1,4 @@
 # FAST-GC
- <img src="docs/images/logo_fastgc.png" align="right" width="180"/>
 
 !![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
@@ -7,10 +6,8 @@
 ![Conda](https://img.shields.io/badge/conda-supported-green)
 ![Colab](https://img.shields.io/badge/Google%20Colab-supported-orange)
 ![Cloud](https://img.shields.io/badge/cloud-ready-blue)
-![Status](https://img.shields.io/badge/status-research%20software-green)
 [![USGS 3DEP](https://img.shields.io/badge/USGS-3DEP%20Compatible-blue)](https://www.usgs.gov/3d-elevation-program)
 [![OpenTopography](https://img.shields.io/badge/OpenTopography-LiDAR%20Datasets-orange)](https://opentopography.org)
-[![QGIS Compatible](https://img.shields.io/badge/QGIS-Compatible-green)](https://qgis.org)
 
 ## Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification for LiDAR Point Clouds
 
