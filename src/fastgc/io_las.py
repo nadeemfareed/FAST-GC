@@ -8,11 +8,12 @@ from typing import Callable, Iterable
 import laspy
 import numpy as np
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
-from scipy.ndimage import median_filter
 from scipy.spatial import QhullError
 from tqdm import tqdm
 
+from .monster import log_fail, log_info, run_stage
 from .invert_vote import InvertVoteConfig, build_surface_invert_vote, classify_by_surface
+from .sensors import sensor_defaults
 from .tls_vote import TlsInvertDsmVoteConfig, build_tls_surface_invert_dsm_vote, classify_tls_by_surface
 from .utils import as_f64
 from .void_recover import recover_ground_in_voids
@@ -31,7 +32,21 @@ PRODUCT_DEM = "FAST_DEM"
 PRODUCT_NORMALIZED = "FAST_NORMALIZED"
 PRODUCT_DSM = "FAST_DSM"
 PRODUCT_CHM = "FAST_CHM"
-ALL_PRODUCTS = {PRODUCT_GC, PRODUCT_DEM, PRODUCT_NORMALIZED, PRODUCT_DSM, PRODUCT_CHM}
+PRODUCT_TERRAIN = "FAST_TERRAIN"
+PRODUCT_CHANGE = "FAST_CHANGE"
+PRODUCT_ITD = "FAST_ITD"
+
+ALL_PRODUCTS = {
+    PRODUCT_GC,
+    PRODUCT_DEM,
+    PRODUCT_NORMALIZED,
+    PRODUCT_DSM,
+    PRODUCT_CHM,
+    PRODUCT_TERRAIN,
+    PRODUCT_CHANGE,
+    PRODUCT_ITD,
+}
+
 RASTER_METHOD_CHOICES = {"min", "max", "mean", "nearest", "idw"}
 
 
@@ -168,6 +183,9 @@ def _make_product_dirs(root: str) -> dict[str, str]:
         PRODUCT_NORMALIZED: os.path.join(root, PRODUCT_NORMALIZED),
         PRODUCT_DSM: os.path.join(root, PRODUCT_DSM),
         PRODUCT_CHM: os.path.join(root, PRODUCT_CHM),
+        PRODUCT_TERRAIN: os.path.join(root, PRODUCT_TERRAIN),
+        PRODUCT_CHANGE: os.path.join(root, PRODUCT_CHANGE),
+        PRODUCT_ITD: os.path.join(root, PRODUCT_ITD),
     }
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
@@ -237,6 +255,7 @@ def _idw_grid(
 
     try:
         from scipy.spatial import cKDTree
+
         tree = cKDTree(pts)
         kk = max(1, min(int(k), pts.shape[0]))
         d, idx = tree.query(q, k=kk)
@@ -251,50 +270,6 @@ def _idw_grid(
         z = nn(gx, gy)
 
     return z.reshape(xx.shape).astype(np.float32), xs, ys
-
-
-def _build_surface_from_points(
-    px: np.ndarray,
-    py: np.ndarray,
-    pz: np.ndarray,
-    bounds: tuple[float, float, float, float],
-    res: float,
-    method: str,
-):
-    method = str(method).lower().strip()
-    if method not in RASTER_METHOD_CHOICES:
-        raise ValueError(f"Unsupported raster method: {method}")
-
-    if method in {"min", "max", "mean"}:
-        sx, sy, sz = _grid_support(px, py, pz, cell=res, mode=method)
-        grid, xs, ys = _interpolate_tin_grid(sx, sy, sz, bounds=bounds, res=res)
-        return grid, xs, ys
-
-    if method == "nearest":
-        xs, ys, xx, yy = _grid_xy(bounds, res)
-        pts = np.column_stack([px, py])
-        if pts.shape[0] < 1:
-            raise ValueError("Need at least 1 support point for nearest interpolation.")
-        nn = NearestNDInterpolator(pts, pz)
-        grid = nn(xx, yy).astype(np.float32)
-        return grid, xs, ys
-
-    if method == "idw":
-        return _idw_grid(px, py, pz, bounds=bounds, res=res)
-
-    raise ValueError(f"Unsupported raster method: {method}")
-
-
-def _postprocess_chm(chm: np.ndarray, median_size: int = 0, min_height: float = 0.0) -> np.ndarray:
-    out = np.asarray(chm, dtype=np.float32)
-    if int(median_size) >= 3:
-        k = int(median_size)
-        if k % 2 == 0:
-            k += 1
-        out = median_filter(out, size=k, mode="nearest").astype(np.float32)
-    if float(min_height) > 0:
-        out = np.where(out >= float(min_height), out, 0.0).astype(np.float32)
-    return out
 
 
 def _grid_xy(bounds: tuple[float, float, float, float], res: float):
@@ -329,6 +304,38 @@ def _interpolate_tin_grid(
         grid = np.where(np.isfinite(grid), grid, fill)
 
     return grid.astype(np.float32), xs, ys
+
+
+def _build_surface_from_points(
+    px: np.ndarray,
+    py: np.ndarray,
+    pz: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    res: float,
+    method: str,
+):
+    method = str(method).lower().strip()
+    if method not in RASTER_METHOD_CHOICES:
+        raise ValueError(f"Unsupported raster method: {method}")
+
+    if method in {"min", "max", "mean"}:
+        sx, sy, sz = _grid_support(px, py, pz, cell=res, mode=method)
+        grid, xs, ys = _interpolate_tin_grid(sx, sy, sz, bounds=bounds, res=res)
+        return grid, xs, ys
+
+    if method == "nearest":
+        xs, ys, xx, yy = _grid_xy(bounds, res)
+        pts = np.column_stack([px, py])
+        if pts.shape[0] < 1:
+            raise ValueError("Need at least 1 support point for nearest interpolation.")
+        nn = NearestNDInterpolator(pts, pz)
+        grid = nn(xx, yy).astype(np.float32)
+        return grid, xs, ys
+
+    if method == "idw":
+        return _idw_grid(px, py, pz, bounds=bounds, res=res)
+
+    raise ValueError(f"Unsupported raster method: {method}")
 
 
 def _write_tif(arr, out_fp, xmin, ymax, grid_res, crs=None, nodata=np.nan):
@@ -501,18 +508,25 @@ def _resolve_products(products: Iterable[str] | None) -> tuple[set[str], set[str
         requested = set(ALL_PRODUCTS)
 
     compute = set(requested)
+
     if PRODUCT_NORMALIZED in requested:
         compute.add(PRODUCT_DEM)
+
+    # CHM now depends only on DEM + NORMALIZED, not DSM
     if PRODUCT_CHM in requested:
-        compute.update({PRODUCT_DEM, PRODUCT_DSM})
+        compute.update({PRODUCT_DEM, PRODUCT_NORMALIZED})
+
+    if PRODUCT_TERRAIN in requested:
+        compute.update({PRODUCT_DEM})
+
     return requested, compute
 
 
 def _require_rasterio_for_products(compute_products: set[str]):
-    needs_raster = bool({PRODUCT_DEM, PRODUCT_DSM, PRODUCT_CHM} & compute_products)
+    needs_raster = bool({PRODUCT_DEM, PRODUCT_DSM, PRODUCT_CHM, PRODUCT_TERRAIN} & compute_products)
     if needs_raster and rasterio is None:
         raise RuntimeError(
-            "rasterio is required for DEM/DSM/CHM products. Install FAST-GC with rasterio available."
+            "rasterio is required for DEM/DSM/CHM/TERRAIN products. Install FAST-GC with rasterio available."
         )
 
 
@@ -549,8 +563,12 @@ def _build_dem_bundle(ctx: dict, grid_res: float, dem_method: str = "min"):
         raise RuntimeError(f"Too few ground points remain after DEM cleanup for {ctx['classified_fp']}")
 
     dem, xs, ys = _build_surface_from_points(
-        x[ground], y[ground], z[ground],
-        bounds=bounds, res=grid_res, method=dem_method,
+        x[ground],
+        y[ground],
+        z[ground],
+        bounds=bounds,
+        res=grid_res,
+        method=dem_method,
     )
     xmin = float(xs[0] - 0.5 * grid_res)
     ymax = float(ys[0] + 0.5 * grid_res)
@@ -559,8 +577,12 @@ def _build_dem_bundle(ctx: dict, grid_res: float, dem_method: str = "min"):
 
 def _build_dsm(ctx: dict, grid_res: float, dsm_method: str = "max"):
     dsm, xs, ys = _build_surface_from_points(
-        ctx["x"], ctx["y"], ctx["z"],
-        bounds=ctx["bounds"], res=grid_res, method=dsm_method,
+        ctx["x"],
+        ctx["y"],
+        ctx["z"],
+        bounds=ctx["bounds"],
+        res=grid_res,
+        method=dsm_method,
     )
     xmin = float(xs[0] - 0.5 * grid_res)
     ymax = float(ys[0] + 0.5 * grid_res)
@@ -574,24 +596,12 @@ def _write_dem(classified_fp: str, product_dirs: dict[str, str], grid_res: float
     except RuntimeError as e:
         msg = str(e)
         if "Too few ground points" in msg:
-            return {
-                "status": "skipped",
-                "product": PRODUCT_DEM,
-                "tile": classified_fp,
-                "output": None,
-                "reason": msg,
-            }
+            return {"status": "skipped", "product": PRODUCT_DEM, "tile": classified_fp, "output": None, "reason": msg}
         raise
 
     out_fp = os.path.join(product_dirs[PRODUCT_DEM], f"{ctx['base']}.tif")
     _write_tif(dem_pack["dem"], out_fp, dem_pack["xmin"], dem_pack["ymax"], grid_res, crs=ctx["crs"])
-    return {
-        "status": "ok",
-        "product": PRODUCT_DEM,
-        "tile": classified_fp,
-        "output": out_fp,
-        "reason": None,
-    }
+    return {"status": "ok", "product": PRODUCT_DEM, "tile": classified_fp, "output": out_fp, "reason": None}
 
 
 def _write_normalized(classified_fp: str, product_dirs: dict[str, str], grid_res: float, dem_method: str = "min"):
@@ -601,13 +611,7 @@ def _write_normalized(classified_fp: str, product_dirs: dict[str, str], grid_res
     except RuntimeError as e:
         msg = str(e)
         if "Too few ground points" in msg:
-            return {
-                "status": "skipped",
-                "product": PRODUCT_NORMALIZED,
-                "tile": classified_fp,
-                "output": None,
-                "reason": msg,
-            }
+            return {"status": "skipped", "product": PRODUCT_NORMALIZED, "tile": classified_fp, "output": None, "reason": msg}
         raise
 
     z_dem = _sample_bilinear_from_grid(
@@ -635,84 +639,19 @@ def _write_normalized(classified_fp: str, product_dirs: dict[str, str], grid_res
 
     out_fp = os.path.join(product_dirs[PRODUCT_NORMALIZED], f"{ctx['base']}.las")
     out.write(out_fp)
-    return {
-        "status": "ok",
-        "product": PRODUCT_NORMALIZED,
-        "tile": classified_fp,
-        "output": out_fp,
-        "reason": None,
-    }
-
-
-def _write_dsm(classified_fp: str, product_dirs: dict[str, str], grid_res: float, dsm_method: str = "max"):
-    ctx = _load_product_context(classified_fp)
-    dsm_pack = _build_dsm(ctx, grid_res, dsm_method=dsm_method)
-    out_fp = os.path.join(product_dirs[PRODUCT_DSM], f"{ctx['base']}.tif")
-    _write_tif(dsm_pack["dsm"], out_fp, dsm_pack["xmin"], dsm_pack["ymax"], grid_res, crs=ctx["crs"])
+    return {"status": "ok", "product": PRODUCT_NORMALIZED, "tile": classified_fp, "output": out_fp, "reason": None}
 
 
 def _write_dsm_from_raw(raw_fp: str, product_dirs: dict[str, str], grid_res: float, dsm_method: str = "max"):
     las, x, y, z, _, crs = _read_las(raw_fp)
-
     bounds = (float(np.min(x)), float(np.min(y)), float(np.max(x)), float(np.max(y)))
-    dsm, xs, ys = _build_surface_from_points(
-        x, y, z,
-        bounds=bounds,
-        res=grid_res,
-        method=dsm_method,
-    )
+    dsm, xs, ys = _build_surface_from_points(x, y, z, bounds=bounds, res=grid_res, method=dsm_method)
     xmin = float(xs[0] - 0.5 * grid_res)
     ymax = float(ys[0] + 0.5 * grid_res)
 
     out_fp = os.path.join(product_dirs[PRODUCT_DSM], f"{Path(raw_fp).stem}.tif")
     _write_tif(dsm, out_fp, xmin, ymax, grid_res, crs=crs)
-
-
-def _write_chm(
-    classified_fp: str,
-    product_dirs: dict[str, str],
-    grid_res: float,
-    dem_method: str = "min",
-    dsm_method: str = "max",
-    chm_median_size: int = 0,
-    chm_min_height: float = 0.0,
-):
-    ctx = _load_product_context(classified_fp)
-    try:
-        dem_pack = _build_dem_bundle(ctx, grid_res, dem_method=dem_method)
-    except RuntimeError as e:
-        msg = str(e)
-        if "Too few ground points" in msg:
-            return {
-                "status": "skipped",
-                "product": PRODUCT_CHM,
-                "tile": classified_fp,
-                "output": None,
-                "reason": msg,
-            }
-        raise
-
-    base = ctx["base"]
-    dsm_fp_existing = os.path.join(product_dirs[PRODUCT_DSM], f"{base}.tif")
-
-    if os.path.exists(dsm_fp_existing) and rasterio is not None:
-        with rasterio.open(dsm_fp_existing) as src:
-            dsm = src.read(1).astype(np.float32)
-    else:
-        dsm_pack = _build_dsm(ctx, grid_res, dsm_method=dsm_method)
-        dsm = dsm_pack["dsm"]
-
-    chm = np.maximum(dsm - dem_pack["dem"], 0.0).astype(np.float32)
-    chm = _postprocess_chm(chm, median_size=chm_median_size, min_height=chm_min_height)
-    out_fp = os.path.join(product_dirs[PRODUCT_CHM], f"{ctx['base']}.tif")
-    _write_tif(chm, out_fp, dem_pack["xmin"], dem_pack["ymax"], grid_res, crs=ctx["crs"])
-    return {
-        "status": "ok",
-        "product": PRODUCT_CHM,
-        "tile": classified_fp,
-        "output": out_fp,
-        "reason": None,
-    }
+    return {"status": "ok", "product": PRODUCT_DSM, "tile": raw_fp, "output": out_fp, "reason": None}
 
 
 def classify_ground_file(in_path: str, out_path: str, cfg: dict, show_progress: bool = False):
@@ -821,8 +760,6 @@ def classify_ground_file(in_path: str, out_path: str, cfg: dict, show_progress: 
 
 
 def classify_ground_path(in_path: str, out_dir: str, sensor_mode: str, show_progress: bool = False) -> str:
-    from .sensors import sensor_defaults
-
     cfg = sensor_defaults(sensor_mode)
     os.makedirs(out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(in_path))[0]
@@ -840,64 +777,76 @@ def list_classified_files(classified_root: str | os.PathLike[str]) -> list[str]:
     return files
 
 
+
 def _run_phase(
     items: list[str],
     desc: str,
     sensor_mode: str,
     worker: Callable[[str], object],
+    *,
+    n_jobs: int = 1,
+    joblib_backend: str = "loky",
+    joblib_batch_size: int | str = "auto",
+    joblib_pre_dispatch: str | int = "2*n_jobs",
+    source: str | None = None,
 ) -> dict[str, list[object]]:
-    summary: dict[str, list[object]] = {"ok": [], "skipped": [], "failed": []}
     if not items:
-        return summary
+        log_info(f"{desc}: no input tiles found.")
+        return {"ok": [], "skipped": [], "failed": []}
 
-    t0 = perf_counter()
-    pbar = tqdm(items, desc=desc, unit="tile", dynamic_ncols=True)
-    ema_dt: float | None = None
-    for idx, item in enumerate(pbar, start=1):
-        item_t0 = perf_counter()
-        try:
-            result = worker(item)
-            if isinstance(result, dict) and result.get("status") == "skipped":
-                summary["skipped"].append(result)
-            elif isinstance(result, dict) and result.get("status") == "ok":
-                summary["ok"].append(result)
-            else:
-                summary["ok"].append(result)
-        except Exception as e:
-            summary["failed"].append(
-                {
-                    "status": "failed",
-                    "tile": str(item),
-                    "reason": str(e),
-                }
-            )
-        dt = perf_counter() - item_t0
-        ema_dt = dt if ema_dt is None else 0.2 * dt + 0.8 * ema_dt
-        pbar.set_postfix_str(f"{idx}/{len(items)} | {ema_dt:.2f}s/tile | current={Path(str(item)).name}")
-    pbar.close()
-    total_dt = perf_counter() - t0
-    print(
-        f"[TIME] {desc}: {len(items)} tiles | total={total_dt:.2f}s | "
-        f"avg={total_dt / max(len(items), 1):.2f}s/tile | "
-        f"ok={len(summary['ok'])} | skipped={len(summary['skipped'])} | failed={len(summary['failed'])}"
+    summary = run_stage(
+        stage_name=desc,
+        items=items,
+        func=worker,
+        n_jobs=n_jobs,
+        backend=joblib_backend,
+        batch_size=joblib_batch_size,
+        pre_dispatch=joblib_pre_dispatch,
+        source=source,
+        unit="tile",
+        show_banner=True,
+        show_progress=True,
     )
 
-    if summary["skipped"]:
+    out: dict[str, list[object]] = {"ok": [], "skipped": [], "failed": []}
+    for rec in summary.records:
+        if rec.status == "ok":
+            out["ok"].append(rec.result)
+        elif rec.status == "skipped":
+            if isinstance(rec.result, dict):
+                out["skipped"].append(rec.result)
+            else:
+                out["skipped"].append(
+                    {"status": "skipped", "tile": rec.name, "reason": "worker returned skipped"}
+                )
+        else:
+            reason = rec.error
+            if isinstance(rec.result, dict):
+                reason = rec.result.get("reason", reason)
+            out["failed"].append(
+                {
+                    "status": "failed",
+                    "tile": rec.name,
+                    "reason": reason or "worker failed",
+                }
+            )
+
+    if out["skipped"]:
         print(f"[INFO] {desc} skipped tiles:")
-        for rec in summary["skipped"]:
+        for rec in out["skipped"]:
             tile_name = Path(str(rec.get("tile", ""))).name
             reason = rec.get("reason", "skipped")
             print(f"  - {tile_name}: {reason}")
 
-    if summary["failed"]:
+    if out["failed"]:
         print(f"[ERROR] {desc} failed tiles:")
-        for rec in summary["failed"]:
+        for rec in out["failed"]:
             tile_name = Path(str(rec.get("tile", ""))).name
-            reason = rec.get("reason", "failed")
+            reason = str(rec.get("reason", "failed")).splitlines()[0]
             print(f"  - {tile_name}: {reason}")
-        raise RuntimeError(f"{desc} failed for {len(summary['failed'])} tile(s).")
+        raise RuntimeError(f"{desc} failed for {len(out['failed'])} tile(s).")
 
-    return summary
+    return out
 
 
 def derive_products_from_classified_root(
@@ -906,15 +855,25 @@ def derive_products_from_classified_root(
     products: Iterable[str] | None,
     grid_res: float = 0.5,
     dem_method: str = "min",
-    dsm_method: str = "max",
-    chm_median_size: int = 0,
-    chm_min_height: float = 0.0,
+    *,
+    n_jobs: int = 1,
+    joblib_backend: str = "loky",
+    joblib_batch_size: int | str = "auto",
+    joblib_pre_dispatch: str | int = "2*n_jobs",
 ) -> str:
     requested_products, compute_products = _resolve_products(products)
     requested_products.discard(PRODUCT_GC)
     compute_products.discard(PRODUCT_GC)
     requested_products.discard(PRODUCT_DSM)
     compute_products.discard(PRODUCT_DSM)
+    requested_products.discard(PRODUCT_CHM)
+    compute_products.discard(PRODUCT_CHM)
+    requested_products.discard(PRODUCT_TERRAIN)
+    compute_products.discard(PRODUCT_TERRAIN)
+    requested_products.discard(PRODUCT_CHANGE)
+    compute_products.discard(PRODUCT_CHANGE)
+    requested_products.discard(PRODUCT_ITD)
+    compute_products.discard(PRODUCT_ITD)
 
     if not requested_products:
         return str(out_root)
@@ -933,6 +892,11 @@ def derive_products_from_classified_root(
             desc="FAST-GC derive DEM",
             sensor_mode="POST",
             worker=lambda gc_fp: _write_dem(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+            n_jobs=n_jobs,
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
+            source=str(classified_root),
         )
         if not dem_summary["ok"] and dem_summary["skipped"]:
             raise RuntimeError("FAST-GC derive DEM skipped all tiles because no valid ground points were available.")
@@ -943,27 +907,14 @@ def derive_products_from_classified_root(
             desc="FAST-GC derive NORMALIZED",
             sensor_mode="POST",
             worker=lambda gc_fp: _write_normalized(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+            n_jobs=n_jobs,
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
+            source=str(classified_root),
         )
         if not norm_summary["ok"] and norm_summary["skipped"]:
             raise RuntimeError("FAST-GC derive NORMALIZED skipped all tiles because no valid DEM could be built.")
-
-    if PRODUCT_CHM in requested_products:
-        chm_summary = _run_phase(
-            classified_files,
-            desc="FAST-GC derive CHM",
-            sensor_mode="POST",
-            worker=lambda gc_fp: _write_chm(
-                gc_fp,
-                product_dirs,
-                grid_res,
-                dem_method=dem_method,
-                dsm_method=dsm_method,
-                chm_median_size=chm_median_size,
-                chm_min_height=chm_min_height,
-            ),
-        )
-        if not chm_summary["ok"] and chm_summary["skipped"]:
-            raise RuntimeError("FAST-GC derive CHM skipped all tiles because no valid DEM could be built.")
 
     return str(out_root)
 
@@ -976,6 +927,11 @@ def derive_products_from_raw_root(
     grid_res: float = 0.5,
     dsm_method: str = "max",
     recursive: bool = False,
+    *,
+    n_jobs: int = 1,
+    joblib_backend: str = "loky",
+    joblib_batch_size: int | str = "auto",
+    joblib_pre_dispatch: str | int = "2*n_jobs",
 ) -> str:
     requested_products, compute_products = _resolve_products(products)
     requested_products.intersection_update({PRODUCT_DSM})
@@ -998,6 +954,11 @@ def derive_products_from_raw_root(
             desc=f"FAST-GC raw DSM {sensor_mode}",
             sensor_mode=sensor_mode,
             worker=lambda raw_fp: _write_dsm_from_raw(raw_fp, product_dirs, grid_res, dsm_method=dsm_method),
+            n_jobs=n_jobs,
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
+            source=str(raw_root),
         )
 
     return str(out_root)
@@ -1012,8 +973,11 @@ def process_fastgc_path(
     recursive: bool = False,
     dem_method: str = "min",
     dsm_method: str = "max",
-    chm_median_size: int = 0,
-    chm_min_height: float = 0.0,
+    *,
+    n_jobs: int = 1,
+    joblib_backend: str = "loky",
+    joblib_batch_size: int | str = "auto",
+    joblib_pre_dispatch: str | int = "2*n_jobs",
 ) -> str:
     requested_products, compute_products = _resolve_products(products)
     _require_rasterio_for_products(compute_products)
@@ -1027,7 +991,7 @@ def process_fastgc_path(
 
     total_t0 = perf_counter()
 
-    need_classified = bool({PRODUCT_GC, PRODUCT_DEM, PRODUCT_NORMALIZED, PRODUCT_CHM} & requested_products)
+    need_classified = bool({PRODUCT_GC, PRODUCT_DEM, PRODUCT_NORMALIZED, PRODUCT_CHM, PRODUCT_TERRAIN} & requested_products)
     need_dsm = PRODUCT_DSM in requested_products
 
     if Path(in_path).is_file():
@@ -1046,45 +1010,54 @@ def process_fastgc_path(
         if need_dsm:
             _write_dsm_from_raw(in_path, product_dirs, grid_res, dsm_method=dsm_method)
 
-        if PRODUCT_CHM in requested_products and gc_fp is not None:
-            _write_chm(
-                gc_fp,
-                product_dirs,
-                grid_res,
-                dem_method=dem_method,
-                dsm_method=dsm_method,
-                chm_median_size=chm_median_size,
-                chm_min_height=chm_min_height,
-            )
-
         total_dt = perf_counter() - stage_t0
         print(f"[TIME] FAST-GC {sensor_mode} {Path(in_path).name}: total={total_dt:.2f}s")
         return out_root
 
     classified_files: list[str] = []
     if need_classified:
-        classified_files = _run_phase(
+        classified_phase = _run_phase(
             files,
-            desc=f"FAST-GC phase 1/4 CLASSIFY {sensor_mode}",
+            desc=f"FAST-GC phase 1/3 CLASSIFY {sensor_mode}",
             sensor_mode=sensor_mode,
             worker=lambda fp: classify_ground_path(fp, product_dirs[PRODUCT_GC], sensor_mode, show_progress=False),
+            n_jobs=n_jobs,
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
+            source=in_path,
         )
+        classified_files = [str(v) for v in classified_phase["ok"]]
 
     if PRODUCT_DEM in requested_products:
-        _run_phase(
+        dem_phase = _run_phase(
             classified_files,
-            desc=f"FAST-GC phase 2/4 DEM {sensor_mode}",
+            desc=f"FAST-GC phase 2/3 DEM {sensor_mode}",
             sensor_mode=sensor_mode,
             worker=lambda gc_fp: _write_dem(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+            n_jobs=n_jobs,
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
+            source=str(classified_root),
         )
+        if not dem_phase["ok"] and dem_phase["skipped"]:
+            raise RuntimeError(f"FAST-GC phase 2/3 DEM {sensor_mode} skipped all tiles.")
 
     if PRODUCT_NORMALIZED in requested_products:
-        _run_phase(
+        norm_phase = _run_phase(
             classified_files,
-            desc=f"FAST-GC phase 3/4 NORMALIZED {sensor_mode}",
+            desc=f"FAST-GC phase 3/3 NORMALIZED {sensor_mode}",
             sensor_mode=sensor_mode,
             worker=lambda gc_fp: _write_normalized(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+            n_jobs=n_jobs,
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
+            source=str(classified_root),
         )
+        if not norm_phase["ok"] and norm_phase["skipped"]:
+            raise RuntimeError(f"FAST-GC phase 3/3 NORMALIZED {sensor_mode} skipped all tiles.")
 
     if need_dsm:
         _run_phase(
@@ -1092,22 +1065,11 @@ def process_fastgc_path(
             desc=f"FAST-GC raw DSM {sensor_mode}",
             sensor_mode=sensor_mode,
             worker=lambda raw_fp: _write_dsm_from_raw(raw_fp, product_dirs, grid_res, dsm_method=dsm_method),
-        )
-
-    if PRODUCT_CHM in requested_products:
-        _run_phase(
-            classified_files,
-            desc=f"FAST-GC phase 4/4 CHM {sensor_mode}",
-            sensor_mode=sensor_mode,
-            worker=lambda gc_fp: _write_chm(
-                gc_fp,
-                product_dirs,
-                grid_res,
-                dem_method=dem_method,
-                dsm_method=dsm_method,
-                chm_median_size=chm_median_size,
-                chm_min_height=chm_min_height,
-            ),
+            n_jobs=n_jobs,
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
+            source=in_path,
         )
 
     total_dt = perf_counter() - total_t0
@@ -1116,3 +1078,24 @@ def process_fastgc_path(
         f"total={total_dt:.2f}s | avg={total_dt / max(len(files), 1):.2f}s/tile"
     )
     return out_root
+
+
+__all__ = [
+    "PRODUCT_ALL",
+    "PRODUCT_GC",
+    "PRODUCT_DEM",
+    "PRODUCT_NORMALIZED",
+    "PRODUCT_DSM",
+    "PRODUCT_CHM",
+    "PRODUCT_TERRAIN",
+    "PRODUCT_CHANGE",
+    "PRODUCT_ITD",
+    "ALL_PRODUCTS",
+    "RASTER_METHOD_CHOICES",
+    "classify_ground_file",
+    "classify_ground_path",
+    "derive_products_from_classified_root",
+    "derive_products_from_raw_root",
+    "list_classified_files",
+    "process_fastgc_path",
+]

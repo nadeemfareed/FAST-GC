@@ -8,7 +8,6 @@ from typing import Any
 
 import laspy
 import numpy as np
-from tqdm import tqdm
 
 from .io_las import (
     PRODUCT_DEM,
@@ -21,21 +20,36 @@ from .io_las import (
     _write_tif,
     list_classified_files,
 )
+from .monster import DEFAULT_BACKEND, log_info, run_stage
 
 
-def _write_temp_normalized_from_residual(ctx: dict[str, Any], residual: np.ndarray, out_fp: Path) -> None:
+def _write_temp_normalized_from_residual(
+    ctx: dict[str, Any],
+    residual: np.ndarray,
+    out_fp: Path,
+) -> None:
     out = laspy.LasData(ctx["las"].header)
     out.points = ctx["las"].points.copy()
-    z_norm = np.maximum(residual, 0.0)
+
+    z_norm = np.maximum(np.asarray(residual, dtype=np.float64), 0.0)
 
     z_scale = float(out.header.scales[2])
     z_offset = float(out.header.offsets[2])
-    raw_Z = np.round((z_norm - z_offset) / z_scale).astype(out.points.array["Z"].dtype, copy=False)
+    raw_Z = np.round((z_norm - z_offset) / z_scale).astype(
+        out.points.array["Z"].dtype,
+        copy=False,
+    )
     out.points.array["Z"] = raw_Z
+
     try:
-        out.classification = ctx["cls"].astype(np.uint8)
+        out.classification = ctx["cls"].astype(np.uint8, copy=False)
     except Exception:
-        pass
+        try:
+            out.classification = np.asarray(ctx["cls"], dtype=np.uint8)
+        except Exception:
+            pass
+
+    out_fp.parent.mkdir(parents=True, exist_ok=True)
     out.write(out_fp)
 
 
@@ -48,7 +62,6 @@ def _fix_one_classified_tile(
 ) -> dict[str, Any]:
     ctx = _load_product_context(classified_fp)
 
-    # Try to build provisional DEM. If not enough ground points exist, skip tile.
     try:
         dem_pack = _build_dem_bundle(ctx, dem_res)
     except RuntimeError as e:
@@ -64,21 +77,30 @@ def _fix_one_classified_tile(
             }
         raise
 
-    # provisional temp DEM
     temp_dem_fp = Path(temp_product_dirs[PRODUCT_DEM]) / f"{ctx['base']}.tif"
-    _write_tif(dem_pack["dem"], str(temp_dem_fp), dem_pack["xmin"], dem_pack["ymax"], dem_res, crs=ctx["crs"])
+    _write_tif(
+        dem_pack["dem"],
+        str(temp_dem_fp),
+        dem_pack["xmin"],
+        dem_pack["ymax"],
+        dem_res,
+        crs=ctx["crs"],
+    )
 
     z_dem = _sample_bilinear_from_grid(
-        dem_pack["dem"], ctx["x"], ctx["y"], dem_pack["xmin"], dem_pack["ymax"], dem_res
+        dem_pack["dem"],
+        ctx["x"],
+        ctx["y"],
+        dem_pack["xmin"],
+        dem_pack["ymax"],
+        dem_res,
     )
     residual = ctx["z"] - z_dem
 
-    # provisional temp normalized for inspection/debug
     temp_norm_fp = Path(temp_product_dirs[PRODUCT_NORMALIZED]) / f"{ctx['base']}.las"
     _write_temp_normalized_from_residual(ctx, residual, temp_norm_fp)
 
     cls = ctx["cls"].copy()
-
     nonground = cls != 2
     ground = cls == 2
 
@@ -86,6 +108,7 @@ def _fix_one_classified_tile(
     demote = ground & np.isfinite(residual) & (residual > float(ground_to_nonground_min_z))
 
     changed = int(np.count_nonzero(promote) + np.count_nonzero(demote))
+
     if np.any(promote):
         cls[promote] = 2
     if np.any(demote):
@@ -106,6 +129,7 @@ def _fix_one_classified_tile(
         "promoted_to_ground": int(np.count_nonzero(promote)),
         "demoted_to_nonground": int(np.count_nonzero(demote)),
         "status": "ok",
+        "message": None,
     }
 
 
@@ -117,9 +141,14 @@ def apply_fp_fix_to_output_root(
     nonground_to_ground_max_z: float = 0.0,
     ground_to_nonground_min_z: float = 0.06,
     keep_temp: bool = False,
+    n_jobs: int = 1,
+    joblib_backend: str = DEFAULT_BACKEND,
+    joblib_batch_size: int | str = "auto",
+    joblib_pre_dispatch: str | int = "2*n_jobs",
 ) -> dict[str, Any]:
     out_root = Path(out_root)
     classified_root = out_root / PRODUCT_GC
+
     if not classified_root.exists():
         raise FileNotFoundError(f"FAST_GC folder not found: {classified_root}")
 
@@ -131,42 +160,70 @@ def apply_fp_fix_to_output_root(
     temp_root.mkdir(parents=True, exist_ok=True)
     temp_product_dirs = _make_product_dirs(str(temp_root))
 
+    log_info(
+        f"FP-FIX thresholds: promote<= {float(nonground_to_ground_max_z):.4f} m | "
+        f"demote> {float(ground_to_nonground_min_z):.4f} m | dem_res={float(dem_res):.3f} m"
+    )
+
     total_t0 = perf_counter()
+
+    def _worker(gc_fp: str) -> dict[str, Any]:
+        return _fix_one_classified_tile(
+            gc_fp,
+            temp_product_dirs=temp_product_dirs,
+            dem_res=dem_res,
+            nonground_to_ground_max_z=nonground_to_ground_max_z,
+            ground_to_nonground_min_z=ground_to_nonground_min_z,
+        )
+
+    stage_summary = run_stage(
+        f"FP-FIX {sensor_mode.upper()}",
+        classified_files,
+        _worker,
+        n_jobs=n_jobs,
+        backend=joblib_backend,
+        batch_size=joblib_batch_size,
+        pre_dispatch=joblib_pre_dispatch,
+        source=str(classified_root),
+        unit="tile",
+        show_banner=True,
+        show_progress=True,
+    )
+
     summary_rows: list[dict[str, Any]] = []
+    failed_rows: list[dict[str, Any]] = []
+    for rec in stage_summary.records:
+        if isinstance(rec.result, dict):
+            row = dict(rec.result)
+        else:
+            row = {
+                "tile": rec.name,
+                "changed_points": 0,
+                "promoted_to_ground": 0,
+                "demoted_to_nonground": 0,
+                "status": rec.status,
+                "message": rec.error,
+            }
 
-    with tqdm(classified_files, desc=f"FP-FIX {sensor_mode.upper()}", unit="tile", dynamic_ncols=True) as pbar:
-        ema_dt: float | None = None
-        for idx, gc_fp in enumerate(pbar, start=1):
-            t0 = perf_counter()
+        if rec.status == "failed":
+            row.setdefault("tile", rec.name)
+            row["status"] = "failed"
+            row["message"] = rec.error
+            failed_rows.append(row)
+        elif row.get("status") == "skipped_too_few_ground":
+            row["status"] = "skipped"
 
-            row = _fix_one_classified_tile(
-                gc_fp,
-                temp_product_dirs=temp_product_dirs,
-                dem_res=dem_res,
-                nonground_to_ground_max_z=nonground_to_ground_max_z,
-                ground_to_nonground_min_z=ground_to_nonground_min_z,
-            )
-
-            summary_rows.append(row)
-
-            dt = perf_counter() - t0
-            ema_dt = dt if ema_dt is None else (0.85 * ema_dt + 0.15 * dt)
-
-            status = row.get("status", "ok")
-            if status == "skipped_too_few_ground":
-                pbar.set_postfix_str(
-                    f"{idx}/{len(classified_files)} | {ema_dt:.2f}s/tile | skipped={Path(gc_fp).name}"
-                )
-            else:
-                pbar.set_postfix_str(
-                    f"{idx}/{len(classified_files)} | {ema_dt:.2f}s/tile | current={Path(gc_fp).name}"
-                )
+        summary_rows.append(row)
 
     total_elapsed = perf_counter() - total_t0
+
     total_changed = int(sum(int(r.get("changed_points", 0)) for r in summary_rows))
     total_promoted = int(sum(int(r.get("promoted_to_ground", 0)) for r in summary_rows))
     total_demoted = int(sum(int(r.get("demoted_to_nonground", 0)) for r in summary_rows))
-    skipped_tiles = [r["tile"] for r in summary_rows if r.get("status") == "skipped_too_few_ground"]
+
+    skipped_rows = [r for r in summary_rows if r.get("status") == "skipped"]
+    skipped_tiles = [str(r.get("tile")) for r in skipped_rows]
+    failed_tiles = [str(r.get("tile")) for r in failed_rows]
 
     summary = {
         "sensor_mode": sensor_mode.upper(),
@@ -174,8 +231,11 @@ def apply_fp_fix_to_output_root(
         "nonground_to_ground_max_z": float(nonground_to_ground_max_z),
         "ground_to_nonground_min_z": float(ground_to_nonground_min_z),
         "tile_count": len(classified_files),
+        "ok_tile_count": int(stage_summary.ok),
         "skipped_tile_count": len(skipped_tiles),
+        "failed_tile_count": len(failed_tiles),
         "skipped_tiles": skipped_tiles,
+        "failed_tiles": failed_tiles,
         "total_changed_points": total_changed,
         "total_promoted_to_ground": total_promoted,
         "total_demoted_to_nonground": total_demoted,
@@ -187,15 +247,14 @@ def apply_fp_fix_to_output_root(
     with summary_fp.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(
-        f"[TIME] FP-FIX {sensor_mode.upper()}: {len(classified_files)} tiles | "
-        f"total={total_elapsed:.2f}s | avg={total_elapsed / max(len(classified_files), 1):.2f}s/tile | "
-        f"changed={total_changed} | skipped={len(skipped_tiles)}"
-    )
-
     if skipped_tiles:
         print("[INFO] FP-FIX skipped tiles with too few ground points:")
         for name in skipped_tiles:
+            print(f"  - {name}")
+
+    if failed_tiles:
+        print("[INFO] FP-FIX failed tiles:")
+        for name in failed_tiles:
             print(f"  - {name}")
 
     if not keep_temp:

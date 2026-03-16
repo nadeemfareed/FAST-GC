@@ -40,7 +40,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: GIS",
-  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: Scientific/Engineering :: Information Analysis"
 ]
 
 dependencies = [
@@ -49,7 +49,9 @@ dependencies = [
   "laspy>=2.4",
   "lazrs>=0.6",
   "rasterio>=1.3",
-  "tqdm>=4.64"
+  "tqdm>=4.64",
+  "joblib>=1.3",
+  "psutil>=5.9"
 ]
 
 [project.urls]

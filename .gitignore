@@ -1,53 +1,128 @@
+# =========================================================
 # Python bytecode / caches
+# =========================================================
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 
-# Native / compiled
+# =========================================================
+# Native / compiled extensions
+# =========================================================
 *.so
 *.dylib
 *.dll
 
+# =========================================================
 # Packaging / build
+# =========================================================
 build/
 dist/
+site/
 *.egg-info/
 .eggs/
 pip-wheel-metadata/
+wheels/
 
-# Test / lint / type-check caches
+# =========================================================
+# Test / lint / coverage / type-check caches
+# =========================================================
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.tox/
+.nox/
 .coverage
 .coverage.*
 htmlcov/
 
+# =========================================================
 # Virtual environments
+# =========================================================
 .venv/
 venv/
 env/
 ENV/
+conda_env/
+conda-env/
+.micromamba/
 
-# Jupyter
+# =========================================================
+# Jupyter / notebooks
+# =========================================================
 .ipynb_checkpoints/
+*.nbconvert.ipynb
 
+# =========================================================
 # IDE / editor
+# =========================================================
 .vscode/
 .idea/
+*.code-workspace
 
+# =========================================================
 # OS files
+# =========================================================
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Local temp / logs
+# =========================================================
+# Local temp / logs / backups
+# =========================================================
 *.log
 *.tmp
 *.bak
+*.swp
+*.swo
+*~
+logs/
 
-# Optional: local output data
-# Uncomment if you do not want generated outputs tracked
+# =========================================================
+# FAST-GC temporary workspaces
+# =========================================================
+_temp_fp_fix/
+*_temp_fp_fix/
+temp/
+scratch/
+
+# =========================================================
+# FAST-GC generated outputs
+# Uncomment these if you do not want processed outputs tracked
+# =========================================================
 # outputs/
-# temp/
-# scratch/
+# Processed_ALS/
+# Processed_ULS/
+# Processed_TLS/
+# Merged_ALS/
+# Merged_ULS/
+# Merged_TLS/
+# ALS_tiles/
+# ULS_tiles/
+# TLS_tiles/
+
+# =========================================================
+# Raster / point-cloud sidecar temp files
+# Keep commented unless they appear in your workflows
+# =========================================================
+# *.aux.xml
+# *.ovr
+# *.tfw
+# *.prj
+# *.cpg
+# *.dbf
+# *.shx
+# *.qmd
+
+# =========================================================
+# Docs build artifacts
+# =========================================================
+docs/_build/
+mkdocs/site/
+
+# =========================================================
+# Local package manager / install noise
+# =========================================================
+.python-version
+Pipfile.lock
+poetry.lock
