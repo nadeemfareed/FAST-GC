@@ -10,3 +10,4 @@ shapely>=2.0
 
 tqdm>=4.64
 joblib>=1.3
+psutil>=5.9

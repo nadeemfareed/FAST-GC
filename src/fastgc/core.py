@@ -6,6 +6,7 @@ from pathlib import Path
 from time import perf_counter
 
 from .chm import (
+    build_chm_from_dem_and_dsm,
     build_chm_from_normalized_root,
     chm_method_output_dir,
     chm_output_label,
@@ -27,16 +28,21 @@ from .merge import cleanup_tiling_workspace, merge_processed_tiles
 from .monster import log_info, stage_banner
 from .post_fp_fix import apply_fp_fix_to_output_root
 from .preprocess import tile_las_dataset
+from .structure import run_structure_from_root
 from .terrain import run_terrain_from_processed_root
+from .treeclouds import PRODUCT_TREECLOUDS, run_treeclouds_from_root
 
 PRODUCT_TERRAIN = "FAST_TERRAIN"
 PRODUCT_CHANGE = "FAST_CHANGE"
 PRODUCT_ITD = "FAST_ITD"
+PRODUCT_STRUCTURE = "FAST_STRUCTURE"
 
 DEFAULT_WORKFLOW = "run"
 WORKFLOW_CHOICES = ["run", "tile-only", "tile-run", "tile-run-merge", "merge", "derive-only"]
 
-_CHM_ALGORITHMS = {"p2r", "p99", "tin", "pitfree", "spikefree"}
+_CHM_ALGORITHMS = {"p2r", "p99", "tin", "pitfree", "csf_chm", "spikefree"}
+_CHM_NATIVE = {"p2r", "p99", "tin", "pitfree", "csf_chm"}
+_CHM_DSM_DERIVED = {"spikefree"}
 _CHM_SELECTORS = {"percentile", "percentile_top", "percentile_band"}
 
 
@@ -62,6 +68,7 @@ def _resolve_products(products: list[str] | None) -> list[str]:
             PRODUCT_DSM,
             PRODUCT_CHM,
             PRODUCT_TERRAIN,
+            PRODUCT_STRUCTURE,
         ]
 
     out = list(requested)
@@ -83,12 +90,31 @@ def _resolve_products(products: list[str] | None) -> list[str]:
         out.insert(out.index(PRODUCT_TERRAIN), PRODUCT_DEM)
         seen.add(PRODUCT_DEM)
 
+    if PRODUCT_STRUCTURE in seen and PRODUCT_NORMALIZED not in seen:
+        insert_at = out.index(PRODUCT_STRUCTURE)
+        if PRODUCT_DEM not in seen:
+            out.insert(insert_at, PRODUCT_DEM)
+            seen.add(PRODUCT_DEM)
+            insert_at += 1
+        out.insert(insert_at, PRODUCT_NORMALIZED)
+        seen.add(PRODUCT_NORMALIZED)
+
     return out
 
 
 def _needs_classified_source(products: list[str]) -> bool:
     needed = set(products)
-    return bool({PRODUCT_GC, PRODUCT_DEM, PRODUCT_NORMALIZED, PRODUCT_CHM, PRODUCT_TERRAIN} & needed)
+    return bool(
+        {
+            PRODUCT_GC,
+            PRODUCT_DEM,
+            PRODUCT_NORMALIZED,
+            PRODUCT_CHM,
+            PRODUCT_TERRAIN,
+            PRODUCT_STRUCTURE,
+        }
+        & needed
+    )
 
 
 def _needs_raw_dsm(products: list[str]) -> bool:
@@ -145,25 +171,52 @@ def _existing_path(path: Path) -> bool:
     return path.exists() and any(path.iterdir()) if path.is_dir() else path.exists()
 
 
+def _has_raster_outputs(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    return any(p.is_file() and p.suffix.lower() in {".tif", ".tiff"} for p in path.rglob("*"))
+
+
 def _contains_downstream_only_products(products: list[str]) -> bool:
-    return bool({PRODUCT_CHANGE, PRODUCT_ITD} & set(products))
+    return bool({PRODUCT_CHANGE, PRODUCT_ITD, PRODUCT_TREECLOUDS} & set(products))
 
 
 def _call_with_supported_kwargs(func, /, **kwargs):
-    """Call a function using only the kwargs it actually supports.
-
-    This keeps core.py compatible with modules that have already been rewired
-    for Joblib/monster.py as well as older modules that still expose the older
-    sequential signatures.
-    """
     sig = inspect.signature(func)
-    supported = {}
     accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     if accepts_var_kw:
         supported = dict(kwargs)
     else:
         supported = {k: v for k, v in kwargs.items() if k in sig.parameters}
     return func(**supported)
+
+
+def _is_las_like(path: str | Path) -> bool:
+    path = Path(path)
+    return path.is_file() and path.suffix.lower() in {".las", ".laz"}
+
+
+def _ensure_tiles_for_raw_input(
+    *,
+    in_path: str,
+    out_dir: str | None,
+    sensor_mode: str,
+    tile_size_m: float,
+    buffer_m: float,
+    recursive: bool,
+    overwrite_tiles: bool,
+    small_tile_merge_frac: float,
+) -> dict:
+    return tile_las_dataset(
+        in_path=in_path,
+        out_dir=out_dir,
+        sensor_mode=sensor_mode,
+        tile_size_m=tile_size_m,
+        buffer_m=buffer_m,
+        recursive=recursive,
+        overwrite_tiles=overwrite_tiles,
+        small_tile_merge_frac=small_tile_merge_frac,
+    )
 
 
 def _resolve_chm_targets(
@@ -181,12 +234,15 @@ def _resolve_chm_targets(
         for m in chm_methods:
             mm = str(m).strip().lower()
             if mm not in _CHM_ALGORITHMS:
-                raise ValueError(f"--chm_methods only supports surface algorithms: {sorted(_CHM_ALGORITHMS)}")
+                raise ValueError(
+                    f"--chm_methods supports: {sorted(_CHM_ALGORITHMS | _CHM_SELECTORS)}"
+                )
             targets.append(
                 {
                     "method": mm,
                     "surface_method": None,
                     "label": chm_output_label(mm, None),
+                    "is_dsm_derived": mm in _CHM_DSM_DERIVED,
                 }
             )
         return targets
@@ -197,18 +253,20 @@ def _resolve_chm_targets(
                 "method": method,
                 "surface_method": None,
                 "label": chm_output_label(method, None),
+                "is_dsm_derived": method in _CHM_DSM_DERIVED,
             }
         )
         return targets
 
     if method in _CHM_SELECTORS:
-        if surface_method not in _CHM_ALGORITHMS:
+        if surface_method not in _CHM_NATIVE:
             raise ValueError(f"Invalid --chm_surface_method: {surface_method}")
         targets.append(
             {
                 "method": method,
                 "surface_method": surface_method,
                 "label": chm_output_label(method, surface_method),
+                "is_dsm_derived": False,
             }
         )
         return targets
@@ -245,9 +303,6 @@ def derive_chm_from_processed_root(
     overwrite: bool = False,
 ) -> list[str]:
     processed_root = Path(processed_root)
-    normalized_root = resolve_normalized_root(processed_root)
-    if not Path(normalized_root).exists():
-        raise FileNotFoundError(f"FAST_NORMALIZED folder not found: {normalized_root}")
 
     outputs: list[str] = []
     targets = _resolve_chm_targets(
@@ -256,12 +311,50 @@ def derive_chm_from_processed_root(
         chm_surface_method=chm_surface_method,
     )
 
+    normalized_root = None
+    if any(not t["is_dsm_derived"] for t in targets):
+        normalized_root = resolve_normalized_root(processed_root)
+        if not Path(normalized_root).exists():
+            raise FileNotFoundError(f"FAST_NORMALIZED folder not found: {normalized_root}")
+
+    dem_root = processed_root / PRODUCT_DEM
+    dsm_root = processed_root / PRODUCT_DSM
+
     for target in targets:
         out_root = Path(chm_method_output_dir(processed_root, target["method"], target["surface_method"]))
         if skip_existing and _existing_path(out_root) and not overwrite:
             print(f"[SKIP] Existing CHM output found: {out_root}")
             outputs.append(str(out_root))
             continue
+
+        if target["is_dsm_derived"]:
+            if target["method"] == "spikefree":
+                if not _has_raster_outputs(dem_root):
+                    raise FileNotFoundError(f"No DEM rasters found for CHM spikefree derivation: {dem_root}")
+
+                if not _has_raster_outputs(dsm_root):
+                    raise FileNotFoundError(f"No DSM rasters found for CHM spikefree derivation: {dsm_root}")
+
+                out = _call_with_supported_kwargs(
+                    build_chm_from_dem_and_dsm,
+                    dem_root=dem_root,
+                    dsm_root=dsm_root,
+                    out_root=out_root,
+                    method_label="spikefree",
+                    min_height=chm_min_height,
+                    smooth_method=chm_smooth_method,
+                    median_size=chm_median_size,
+                    gaussian_sigma=chm_gaussian_sigma,
+                    overwrite=overwrite,
+                    n_jobs=n_jobs,
+                    joblib_backend=joblib_backend,
+                    joblib_batch_size=joblib_batch_size,
+                    joblib_pre_dispatch=joblib_pre_dispatch,
+                )
+                outputs.append(out)
+                continue
+
+            raise ValueError(f"Unsupported DSM-derived CHM target: {target['method']}")
 
         out = _call_with_supported_kwargs(
             build_chm_from_normalized_root,
@@ -327,13 +420,20 @@ def _run_processing_with_optional_fpfix(
     tpi_radius: int,
     twi_eps: float,
     dtw_max_distance: float | None,
+    structure_products: list[str] | None,
+    structure_res: float | None,
+    structure_min_h: float | None,
+    structure_bin_size: float | None,
+    canopy_thr: float | None,
+    canopy_mode: str | None,
+    structure_na_fill: str | None,
     recursive: bool,
     n_jobs: int = 1,
     joblib_backend: str = "loky",
     joblib_batch_size: int | str = "auto",
     joblib_pre_dispatch: str | int = "2*n_jobs",
     apply_fp_fix: bool = True,
-    fp_fix_dem_res: float = 0.25,
+    fp_fix_dem_res: float | None = None,
     fp_fix_nonground_to_ground_max_z: float = 0.0,
     fp_fix_ground_to_nonground_min_z: float = 0.06,
     keep_fp_fix_temp: bool = False,
@@ -357,6 +457,8 @@ def _run_processing_with_optional_fpfix(
             joblib_backend=joblib_backend,
             joblib_batch_size=joblib_batch_size,
             joblib_pre_dispatch=joblib_pre_dispatch,
+            spikefree_freeze_distance=chm_spikefree_freeze_distance,
+            spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
         )
 
     base_products = [p for p in resolved_products if p in {PRODUCT_GC, PRODUCT_DEM, PRODUCT_NORMALIZED, PRODUCT_DSM}]
@@ -375,6 +477,8 @@ def _run_processing_with_optional_fpfix(
             joblib_backend=joblib_backend,
             joblib_batch_size=joblib_batch_size,
             joblib_pre_dispatch=joblib_pre_dispatch,
+            spikefree_freeze_distance=chm_spikefree_freeze_distance,
+            spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
         )
     else:
         out_root = process_fastgc_path(
@@ -390,13 +494,15 @@ def _run_processing_with_optional_fpfix(
             joblib_backend=joblib_backend,
             joblib_batch_size=joblib_batch_size,
             joblib_pre_dispatch=joblib_pre_dispatch,
+            spikefree_freeze_distance=chm_spikefree_freeze_distance,
+            spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
         )
 
         fix_summary = _call_with_supported_kwargs(
             apply_fp_fix_to_output_root,
             out_root=out_root,
             sensor_mode=sensor_mode,
-            dem_res=fp_fix_dem_res,
+            dem_res=grid_res if fp_fix_dem_res is None else fp_fix_dem_res,
             nonground_to_ground_max_z=fp_fix_nonground_to_ground_max_z,
             ground_to_nonground_min_z=fp_fix_ground_to_nonground_min_z,
             keep_temp=keep_fp_fix_temp,
@@ -434,6 +540,8 @@ def _run_processing_with_optional_fpfix(
                 joblib_backend=joblib_backend,
                 joblib_batch_size=joblib_batch_size,
                 joblib_pre_dispatch=joblib_pre_dispatch,
+                spikefree_freeze_distance=chm_spikefree_freeze_distance,
+                spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
             )
 
     if PRODUCT_CHM in resolved_products:
@@ -484,6 +592,26 @@ def _run_processing_with_optional_fpfix(
             overwrite=overwrite,
         )
 
+    if PRODUCT_STRUCTURE in resolved_products:
+        _call_with_supported_kwargs(
+            run_structure_from_root,
+            source_root=out_root,
+            sensor_mode=sensor_mode,
+            structure_products=structure_products,
+            structure_res=structure_res,
+            structure_min_h=structure_min_h,
+            structure_bin_size=structure_bin_size,
+            canopy_thr=canopy_thr,
+            canopy_mode=canopy_mode,
+            structure_na_fill=structure_na_fill,
+            n_jobs=n_jobs,
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
+            skip_existing=skip_existing,
+            overwrite=overwrite,
+        )
+
     return out_root
 
 
@@ -501,7 +629,7 @@ def run_fastgc(
     *,
     skip_existing: bool = False,
     overwrite: bool = False,
-    dem_method: str = "min",
+    dem_method: str = "nearest",
     dsm_method: str = "max",
     chm_method: str = "p2r",
     chm_methods: list[str] | None = None,
@@ -526,6 +654,13 @@ def run_fastgc(
     tpi_radius: int = 3,
     twi_eps: float = 1e-6,
     dtw_max_distance: float | None = None,
+    structure_products: list[str] | None = None,
+    structure_res: float | None = None,
+    structure_min_h: float | None = None,
+    structure_bin_size: float | None = None,
+    canopy_thr: float | None = None,
+    canopy_mode: str | None = None,
+    structure_na_fill: str | None = None,
     change_input_type: str = "FAST_DEM",
     change_mode: str = "pairwise",
     change_threshold: float = 0.0,
@@ -536,6 +671,16 @@ def run_fastgc(
     change_lod_mode: str = "rss",
     itd_method: str = "placeholder",
     itd_source_chm: str | None = None,
+    itd_min_height: float = 2.0,
+    itd_crown_window_m: float = 3.0,
+    itd_min_peak_separation_m: float = 1.5,
+    itd_angle_threshold_deg: float = 110.0,
+    itd_screen_max_pair_distance_m: float = 6.0,
+    itd_banded_neighborhood_px: int = 1,
+    itd_min_crown_area_m2: float = 0.75,
+    treeclouds_las_source: str = "FAST_NORMALIZED",
+    treeclouds_min_height: float = 0.5,
+    treeclouds_write_individual: bool = False,
     workflow: str = DEFAULT_WORKFLOW,
     tile_size_m: float = 30.0,
     buffer_m: float = 5.0,
@@ -543,7 +688,7 @@ def run_fastgc(
     overwrite_tiles: bool = False,
     small_tile_merge_frac: float = 0.25,
     apply_fp_fix: bool = True,
-    fp_fix_dem_res: float = 0.25,
+    fp_fix_dem_res: float | None = None,
     fp_fix_nonground_to_ground_max_z: float = 0.0,
     fp_fix_ground_to_nonground_min_z: float = 0.06,
     keep_fp_fix_temp: bool = False,
@@ -551,6 +696,11 @@ def run_fastgc(
     workflow = str(workflow).strip().lower()
     if workflow not in WORKFLOW_CHOICES:
         raise ValueError(f"Unsupported workflow: {workflow}")
+
+    if grid_res <= 0:
+        raise ValueError("grid_res must be > 0")
+    if fp_fix_dem_res is not None and fp_fix_dem_res <= 0:
+        raise ValueError("fp_fix_dem_res must be > 0 when provided")
 
     requested_products = _requested_products(products)
     resolved_products = _resolve_products(products)
@@ -562,11 +712,14 @@ def run_fastgc(
     log_info(f"Requested products: {requested_products}")
     log_info(f"Resolved products: {resolved_products}")
     log_info(f"Joblib: jobs={n_jobs} | backend={joblib_backend} | batch_size={joblib_batch_size} | pre_dispatch={joblib_pre_dispatch}")
+    log_info(f"Grid resolution: {grid_res}")
+    if apply_fp_fix:
+        log_info(f"FP-fix DEM resolution: {grid_res if fp_fix_dem_res is None else fp_fix_dem_res}")
 
     if workflow == "run":
         if _contains_downstream_only_products(resolved_products):
             raise ValueError(
-                "FAST_CHANGE and FAST_ITD are downstream-only products. "
+                "FAST_CHANGE, FAST_ITD, and FAST_TREECLOUDS are downstream-only products. "
                 "Use --workflow derive-only on an existing processed root."
             )
 
@@ -601,6 +754,13 @@ def run_fastgc(
             tpi_radius=tpi_radius,
             twi_eps=twi_eps,
             dtw_max_distance=dtw_max_distance,
+            structure_products=structure_products,
+            structure_res=structure_res,
+            structure_min_h=structure_min_h,
+            structure_bin_size=structure_bin_size,
+            canopy_thr=canopy_thr,
+            canopy_mode=canopy_mode,
+            structure_na_fill=structure_na_fill,
             recursive=recursive,
             n_jobs=n_jobs,
             joblib_backend=joblib_backend,
@@ -666,10 +826,33 @@ def run_fastgc(
 
     if workflow == "derive-only":
         p = Path(in_path)
+        workspace_manifest: dict | None = None
+        direct_dsm_input: Path | None = None
 
-        if (p / "tile_manifest.json").exists():
+        explicitly_requested = set(requested_products)
+        explicitly_requested.discard("all")
+
+        if _is_las_like(p) and bool({PRODUCT_DSM, PRODUCT_ITD, PRODUCT_TREECLOUDS} & explicitly_requested):
+            workspace_manifest = _ensure_tiles_for_raw_input(
+                in_path=in_path,
+                out_dir=out_dir,
+                sensor_mode=sensor_mode,
+                tile_size_m=tile_size_m,
+                buffer_m=buffer_m,
+                recursive=recursive,
+                overwrite_tiles=overwrite_tiles,
+                small_tile_merge_frac=small_tile_merge_frac,
+            )
+            workspace_root = Path(workspace_manifest["workspace_root"])
+            processed_root = _resolve_processed_root(workspace_root, sensor_mode)
+            raw_tiles_root = Path(workspace_manifest["tiles_dir"])
+        elif (p / "tile_manifest.json").exists():
             processed_root = _resolve_processed_root(p, sensor_mode)
             raw_tiles_root = p / "tiles"
+        elif p.name == PRODUCT_DSM and p.exists():
+            processed_root = p.parent
+            raw_tiles_root = processed_root.parent / "tiles"
+            direct_dsm_input = p
         elif (p / PRODUCT_NORMALIZED).exists() or (p / PRODUCT_GC).exists() or (p / PRODUCT_DEM).exists():
             processed_root = p
             raw_tiles_root = p.parent / "tiles"
@@ -689,15 +872,13 @@ def run_fastgc(
         classified_root = processed_root / PRODUCT_GC
         normalized_root = processed_root / PRODUCT_NORMALIZED
         dem_root = processed_root / PRODUCT_DEM
+        dsm_root = processed_root / PRODUCT_DSM
 
         print(f"[INFO] derive-only root: {processed_root}")
         if normalized_root.exists():
             print(f"[INFO] Existing FAST_NORMALIZED found: {normalized_root}")
 
-        explicitly_requested = set(requested_products)
-        explicitly_requested.discard("all")
-
-        if PRODUCT_DEM in explicitly_requested and not (_existing_path(dem_root) and skip_existing and not overwrite):
+        if PRODUCT_DEM in explicitly_requested and not (_has_raster_outputs(dem_root) and skip_existing and not overwrite):
             if not classified_root.exists():
                 raise FileNotFoundError(f"FAST_GC folder not found for DEM derivation: {classified_root}")
             derive_products_from_classified_root(
@@ -713,9 +894,12 @@ def run_fastgc(
             )
 
         need_normalized_for_chm = PRODUCT_CHM in explicitly_requested
+        need_normalized_for_structure = PRODUCT_STRUCTURE in explicitly_requested
+
         if (
-            (PRODUCT_NORMALIZED in explicitly_requested) or
-            (need_normalized_for_chm and not normalized_root.exists())
+            (PRODUCT_NORMALIZED in explicitly_requested)
+            or (need_normalized_for_chm and not normalized_root.exists())
+            or (need_normalized_for_structure and not normalized_root.exists())
         ) and not (_existing_path(normalized_root) and skip_existing and not overwrite):
             if not classified_root.exists():
                 raise FileNotFoundError(f"FAST_GC folder not found for NORMALIZED derivation: {classified_root}")
@@ -732,10 +916,26 @@ def run_fastgc(
             )
 
         if PRODUCT_DSM in explicitly_requested:
-            dsm_root = processed_root / PRODUCT_DSM
-            if not (_existing_path(dsm_root) and skip_existing and not overwrite):
+            if not (_has_raster_outputs(dsm_root) and skip_existing and not overwrite):
                 if not raw_tiles_root.exists():
-                    raise FileNotFoundError(f"Raw tiles root not found for DSM derivation: {raw_tiles_root}")
+                    if _is_las_like(p):
+                        workspace_manifest = _ensure_tiles_for_raw_input(
+                            in_path=in_path,
+                            out_dir=out_dir,
+                            sensor_mode=sensor_mode,
+                            tile_size_m=tile_size_m,
+                            buffer_m=buffer_m,
+                            recursive=recursive,
+                            overwrite_tiles=overwrite_tiles,
+                            small_tile_merge_frac=small_tile_merge_frac,
+                        )
+                        workspace_root = Path(workspace_manifest["workspace_root"])
+                        processed_root = _resolve_processed_root(workspace_root, sensor_mode)
+                        raw_tiles_root = Path(workspace_manifest["tiles_dir"])
+                        dsm_root = processed_root / PRODUCT_DSM
+                    else:
+                        raise FileNotFoundError(f"Raw tiles root not found for DSM derivation: {raw_tiles_root}")
+
                 derive_products_from_raw_root(
                     raw_root=raw_tiles_root,
                     out_root=processed_root,
@@ -748,11 +948,98 @@ def run_fastgc(
                     joblib_backend=joblib_backend,
                     joblib_batch_size=joblib_batch_size,
                     joblib_pre_dispatch=joblib_pre_dispatch,
+                    spikefree_freeze_distance=chm_spikefree_freeze_distance,
+                    spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
                 )
 
+                if workspace_manifest is not None:
+                    merge_root = Path(workspace_manifest["workspace_root"]) / f"Merged_{sensor_mode.upper()}"
+                    merge_root.mkdir(parents=True, exist_ok=True)
+                    merge_processed_tiles(
+                        manifest=workspace_manifest,
+                        processed_root=processed_root,
+                        merged_root=merge_root,
+                        products=[PRODUCT_DSM],
+                        chm_method=None,
+                    )
+
         if PRODUCT_CHM in explicitly_requested:
-            if not normalized_root.exists():
+            targets = _resolve_chm_targets(
+                chm_method=chm_method,
+                chm_methods=chm_methods,
+                chm_surface_method=chm_surface_method,
+            )
+            has_spikefree = any(t["method"] == "spikefree" for t in targets)
+            has_native = any(not t["is_dsm_derived"] for t in targets)
+
+            if has_native and not normalized_root.exists():
                 raise FileNotFoundError(f"FAST_NORMALIZED folder not found for CHM derivation: {normalized_root}")
+
+            if has_spikefree:
+                if not _has_raster_outputs(dem_root):
+                    if not classified_root.exists():
+                        raise FileNotFoundError(f"FAST_GC folder not found for DEM derivation: {classified_root}")
+                    derive_products_from_classified_root(
+                        classified_root=classified_root,
+                        out_root=processed_root,
+                        products=[PRODUCT_DEM],
+                        grid_res=grid_res,
+                        dem_method=dem_method,
+                        n_jobs=n_jobs,
+                        joblib_backend=joblib_backend,
+                        joblib_batch_size=joblib_batch_size,
+                        joblib_pre_dispatch=joblib_pre_dispatch,
+                    )
+
+                if not _has_raster_outputs(dsm_root):
+                    if not raw_tiles_root.exists():
+                        if _is_las_like(p):
+                            workspace_manifest = _ensure_tiles_for_raw_input(
+                                in_path=in_path,
+                                out_dir=out_dir,
+                                sensor_mode=sensor_mode,
+                                tile_size_m=tile_size_m,
+                                buffer_m=buffer_m,
+                                recursive=recursive,
+                                overwrite_tiles=overwrite_tiles,
+                                small_tile_merge_frac=small_tile_merge_frac,
+                            )
+                            workspace_root = Path(workspace_manifest["workspace_root"])
+                            processed_root = _resolve_processed_root(workspace_root, sensor_mode)
+                            raw_tiles_root = Path(workspace_manifest["tiles_dir"])
+                            dsm_root = processed_root / PRODUCT_DSM
+                        else:
+                            raise FileNotFoundError(f"Raw tiles root not found for DSM derivation: {raw_tiles_root}")
+
+                    derive_products_from_raw_root(
+                        raw_root=raw_tiles_root,
+                        out_root=processed_root,
+                        sensor_mode=sensor_mode,
+                        products=[PRODUCT_DSM],
+                        grid_res=grid_res,
+                        dsm_method="spikefree",
+                        recursive=True,
+                        n_jobs=n_jobs,
+                        joblib_backend=joblib_backend,
+                        joblib_batch_size=joblib_batch_size,
+                        joblib_pre_dispatch=joblib_pre_dispatch,
+                        spikefree_freeze_distance=chm_spikefree_freeze_distance,
+                        spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
+                    )
+
+                    if workspace_manifest is not None:
+                        merge_root = Path(workspace_manifest["workspace_root"]) / f"Merged_{sensor_mode.upper()}"
+                        merge_root.mkdir(parents=True, exist_ok=True)
+                        merge_processed_tiles(
+                            manifest=workspace_manifest,
+                            processed_root=processed_root,
+                            merged_root=merge_root,
+                            products=[PRODUCT_DSM],
+                            chm_method=None,
+                        )
+
+                if not _has_raster_outputs(dsm_root):
+                    raise FileNotFoundError(f"No DSM rasters found even after spikefree DSM generation: {dsm_root}")
 
             derive_chm_from_processed_root(
                 processed_root=processed_root,
@@ -783,7 +1070,7 @@ def run_fastgc(
             )
 
         if PRODUCT_TERRAIN in explicitly_requested:
-            if not dem_root.exists():
+            if not _has_raster_outputs(dem_root):
                 if not classified_root.exists():
                     raise FileNotFoundError(f"FAST_GC folder not found for TERRAIN derivation: {classified_root}")
                 derive_products_from_classified_root(
@@ -816,6 +1103,31 @@ def run_fastgc(
                 overwrite=overwrite,
             )
 
+        if PRODUCT_STRUCTURE in explicitly_requested:
+            structure_root = processed_root
+            if p.is_dir() and p.name.startswith("Merged_"):
+                structure_root = p
+            elif _is_las_like(p) and "FAST_NORMALIZED" in p.stem:
+                structure_root = p
+            _call_with_supported_kwargs(
+                run_structure_from_root,
+                source_root=structure_root,
+                sensor_mode=sensor_mode,
+                structure_products=structure_products,
+                structure_res=structure_res,
+                structure_min_h=structure_min_h,
+                structure_bin_size=structure_bin_size,
+                canopy_thr=canopy_thr,
+                canopy_mode=canopy_mode,
+                structure_na_fill=structure_na_fill,
+                n_jobs=n_jobs,
+                joblib_backend=joblib_backend,
+                joblib_batch_size=joblib_batch_size,
+                joblib_pre_dispatch=joblib_pre_dispatch,
+                skip_existing=skip_existing,
+                overwrite=overwrite,
+            )
+
         if PRODUCT_CHANGE in explicitly_requested:
             _call_with_supported_kwargs(
                 run_change_from_processed_root,
@@ -837,11 +1149,105 @@ def run_fastgc(
             )
 
         if PRODUCT_ITD in explicitly_requested:
+            itd_input_root = processed_root
+
+            chm_root = processed_root / PRODUCT_CHM
+            has_any_chm = chm_root.exists() and any(chm_root.iterdir())
+            has_dsm = _has_raster_outputs(dsm_root)
+
+            if direct_dsm_input is not None:
+                itd_input_root = direct_dsm_input
+            elif itd_source_chm is not None and str(itd_source_chm).strip():
+                itd_input_root = processed_root
+            elif has_any_chm:
+                itd_input_root = processed_root
+            else:
+                if not has_dsm:
+                    if not raw_tiles_root.exists():
+                        if _is_las_like(p):
+                            workspace_manifest = _ensure_tiles_for_raw_input(
+                                in_path=in_path,
+                                out_dir=out_dir,
+                                sensor_mode=sensor_mode,
+                                tile_size_m=tile_size_m,
+                                buffer_m=buffer_m,
+                                recursive=recursive,
+                                overwrite_tiles=overwrite_tiles,
+                                small_tile_merge_frac=small_tile_merge_frac,
+                            )
+                            workspace_root = Path(workspace_manifest["workspace_root"])
+                            processed_root = _resolve_processed_root(workspace_root, sensor_mode)
+                            raw_tiles_root = Path(workspace_manifest["tiles_dir"])
+                            dsm_root = processed_root / PRODUCT_DSM
+                        else:
+                            raise FileNotFoundError(f"Raw tiles root not found for DSM derivation: {raw_tiles_root}")
+
+                    derive_products_from_raw_root(
+                        raw_root=raw_tiles_root,
+                        out_root=processed_root,
+                        sensor_mode=sensor_mode,
+                        products=[PRODUCT_DSM],
+                        grid_res=grid_res,
+                        dsm_method=dsm_method,
+                        recursive=True,
+                        n_jobs=n_jobs,
+                        joblib_backend=joblib_backend,
+                        joblib_batch_size=joblib_batch_size,
+                        joblib_pre_dispatch=joblib_pre_dispatch,
+                        spikefree_freeze_distance=chm_spikefree_freeze_distance,
+                        spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
+                    )
+
+                    if workspace_manifest is not None:
+                        merge_root = Path(workspace_manifest["workspace_root"]) / f"Merged_{sensor_mode.upper()}"
+                        merge_root.mkdir(parents=True, exist_ok=True)
+                        merge_processed_tiles(
+                            manifest=workspace_manifest,
+                            processed_root=processed_root,
+                            merged_root=merge_root,
+                            products=[PRODUCT_DSM],
+                            chm_method=None,
+                        )
+
+                itd_input_root = dsm_root
+
             _call_with_supported_kwargs(
                 run_itd_from_processed_root,
-                processed_root=processed_root,
+                processed_root=itd_input_root,
                 method=itd_method,
                 source_chm=itd_source_chm,
+                itd_min_height=itd_min_height,
+                itd_crown_window_m=itd_crown_window_m,
+                itd_min_peak_separation_m=itd_min_peak_separation_m,
+                itd_angle_threshold_deg=itd_angle_threshold_deg,
+                itd_screen_max_pair_distance_m=itd_screen_max_pair_distance_m,
+                itd_banded_neighborhood_px=itd_banded_neighborhood_px,
+                itd_min_crown_area_m2=itd_min_crown_area_m2,
+                n_jobs=n_jobs,
+                joblib_backend=joblib_backend,
+                joblib_batch_size=joblib_batch_size,
+                joblib_pre_dispatch=joblib_pre_dispatch,
+                skip_existing=skip_existing,
+                overwrite=overwrite,
+            )
+
+        if PRODUCT_TREECLOUDS in explicitly_requested:
+            treeclouds_root = processed_root
+            if p.is_dir() and p.name.startswith("Merged_"):
+                treeclouds_root = p
+            elif _is_las_like(p) and "FAST_CHM_" in p.stem:
+                treeclouds_root = p.parent
+            elif _is_las_like(p) and ("FAST_NORMALIZED" in p.stem or "FAST_GC" in p.stem):
+                treeclouds_root = p.parent
+
+            _call_with_supported_kwargs(
+                run_treeclouds_from_root,
+                source_root=treeclouds_root,
+                method=itd_method,
+                source_chm=itd_source_chm,
+                las_source=treeclouds_las_source,
+                min_height=treeclouds_min_height,
+                write_individual=treeclouds_write_individual,
                 n_jobs=n_jobs,
                 joblib_backend=joblib_backend,
                 joblib_batch_size=joblib_batch_size,
@@ -856,7 +1262,7 @@ def run_fastgc(
     if workflow in {"tile-only", "tile-run", "tile-run-merge"}:
         if _contains_downstream_only_products(resolved_products):
             raise ValueError(
-                "FAST_CHANGE and FAST_ITD are downstream-only products. "
+                "FAST_CHANGE, FAST_ITD, and FAST_TREECLOUDS are downstream-only products. "
                 "Use --workflow derive-only on an existing processed root."
             )
 
@@ -909,6 +1315,13 @@ def run_fastgc(
                 tpi_radius=tpi_radius,
                 twi_eps=twi_eps,
                 dtw_max_distance=dtw_max_distance,
+                structure_products=structure_products,
+                structure_res=structure_res,
+                structure_min_h=structure_min_h,
+                structure_bin_size=structure_bin_size,
+                canopy_thr=canopy_thr,
+                canopy_mode=canopy_mode,
+                structure_na_fill=structure_na_fill,
                 recursive=False,
                 n_jobs=n_jobs,
                 joblib_backend=joblib_backend,

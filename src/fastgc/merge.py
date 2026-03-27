@@ -172,26 +172,88 @@ def merge_point_product(
     return None
 
 
-def _snap_window_to_grid(src, core_bounds: list[float]) -> Window:
+def _normalize_bounds(bounds: list[float] | tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    xmin, ymin, xmax, ymax = [float(v) for v in bounds]
+    if xmax < xmin:
+        xmin, xmax = xmax, xmin
+    if ymax < ymin:
+        ymin, ymax = ymax, ymin
+    return xmin, ymin, xmax, ymax
+
+
+def _intersect_bounds(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    axmin, aymin, axmax, aymax = a
+    bxmin, bymin, bxmax, bymax = b
+
+    xmin = max(axmin, bxmin)
+    ymin = max(aymin, bymin)
+    xmax = min(axmax, bxmax)
+    ymax = min(aymax, bymax)
+
+    if xmax <= xmin or ymax <= ymin:
+        return None
+
+    return xmin, ymin, xmax, ymax
+
+
+def _src_bounds(src) -> tuple[float, float, float, float]:
+    b = src.bounds
+    return float(b.left), float(b.bottom), float(b.right), float(b.top)
+
+
+def _safe_window_from_bounds(src, bounds: tuple[float, float, float, float]) -> Window | None:
+    """
+    Build a window safely:
+    - intersect requested bounds with src bounds
+    - snap to grid
+    - clamp to raster extent
+    - return None for empty/degenerate windows
+    """
     if from_bounds is None or Window is None:
         raise RuntimeError("rasterio is required for raster merge workflows.")
 
-    win_f = from_bounds(*core_bounds, transform=src.transform)
+    overlap = _intersect_bounds(_normalize_bounds(bounds), _src_bounds(src))
+    if overlap is None:
+        return None
 
-    col_off = math.floor(win_f.col_off)
-    row_off = math.floor(win_f.row_off)
-    col_end = math.ceil(win_f.col_off + win_f.width)
-    row_end = math.ceil(win_f.row_off + win_f.height)
+    try:
+        win_f = from_bounds(*overlap, transform=src.transform)
+    except Exception:
+        return None
+
+    col_off = math.floor(float(win_f.col_off))
+    row_off = math.floor(float(win_f.row_off))
+    col_end = math.ceil(float(win_f.col_off + win_f.width))
+    row_end = math.ceil(float(win_f.row_off + win_f.height))
 
     col_off = max(0, col_off)
     row_off = max(0, row_off)
-    col_end = min(src.width, col_end)
-    row_end = min(src.height, row_end)
+    col_end = min(int(src.width), col_end)
+    row_end = min(int(src.height), row_end)
 
     width = col_end - col_off
     height = row_end - row_off
 
-    return Window(col_off=col_off, row_off=row_off, width=width, height=height)
+    if width <= 0 or height <= 0:
+        return None
+
+    return Window(
+        col_off=int(col_off),
+        row_off=int(row_off),
+        width=int(width),
+        height=int(height),
+    )
+
+
+def _snap_window_to_grid(src, core_bounds: list[float]) -> Window | None:
+    """
+    Backward-compatible wrapper name kept intact.
+    Now returns None for empty/non-overlapping windows instead of raising.
+    """
+    return _safe_window_from_bounds(src, _normalize_bounds(core_bounds))
 
 
 def _crop_raster_to_core(tile_src: Path, tile_dst: Path, core_bounds: list[float]) -> bool:
@@ -201,11 +263,15 @@ def _crop_raster_to_core(tile_src: Path, tile_dst: Path, core_bounds: list[float
     with rasterio.open(tile_src) as src:
         win = _snap_window_to_grid(src, core_bounds)
 
+        if win is None:
+            return False
         if win.width <= 0 or win.height <= 0:
             return False
 
         data = src.read(window=win)
         if data.size == 0:
+            return False
+        if data.shape[1] <= 0 or data.shape[2] <= 0:
             return False
 
         transform = src.window_transform(win)
@@ -277,6 +343,10 @@ def merge_raster_product(
 
     stage_banner(f"TRIM {trim_label}", source=str(processed_root), total=len(manifest["tiles"]), unit="tile")
     pbar_trim = tqdm(manifest["tiles"], desc=f"TRIM {trim_label}", unit="tile", dynamic_ncols=True)
+
+    skipped_empty = 0
+    missing_src = 0
+
     for idx, tile in enumerate(pbar_trim, start=1):
         tile_src = _expected_tile_output_path(
             processed_root,
@@ -286,17 +356,31 @@ def merge_raster_product(
             terrain_subproduct=terrain_subproduct,
         )
         if not tile_src.exists():
+            missing_src += 1
             elapsed = perf_counter() - t0
-            pbar_trim.set_postfix_str(f"{idx}/{len(manifest['tiles'])} | {elapsed / max(idx, 1):.2f}s/tile")
+            pbar_trim.set_postfix_str(
+                f"{idx}/{len(manifest['tiles'])} | {elapsed / max(idx, 1):.2f}s/tile | kept={len(trimmed)} | skip={skipped_empty}"
+            )
             continue
 
         tile_dst = temp_trim_dir / tile_src.name
-        if _crop_raster_to_core(tile_src, tile_dst, tile["core_bounds"]):
+        kept = _crop_raster_to_core(tile_src, tile_dst, tile["core_bounds"])
+        if kept:
             trimmed.append(tile_dst)
+        else:
+            skipped_empty += 1
 
         elapsed = perf_counter() - t0
-        pbar_trim.set_postfix_str(f"{idx}/{len(manifest['tiles'])} | {elapsed / max(idx, 1):.2f}s/tile")
+        pbar_trim.set_postfix_str(
+            f"{idx}/{len(manifest['tiles'])} | {elapsed / max(idx, 1):.2f}s/tile | kept={len(trimmed)} | skip={skipped_empty}"
+        )
+
     pbar_trim.close()
+
+    if missing_src:
+        log_info(f"{trim_label}: missing source rasters skipped = {missing_src}")
+    if skipped_empty:
+        log_info(f"{trim_label}: empty/non-overlapping core trims skipped = {skipped_empty}")
 
     if not trimmed:
         log_info(f"No trimmed rasters available for merge: {trim_label}")
@@ -389,6 +473,10 @@ def merge_processed_tiles(
 
         else:
             continue
+
+    trim_root = merged_root / "_trimmed_rasters"
+    if trim_root.exists():
+        shutil.rmtree(trim_root, ignore_errors=True)
 
     return outputs
 

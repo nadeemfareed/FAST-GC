@@ -8,10 +8,10 @@ version = "0.2.0"
 description = "FAST-GC: Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification for LiDAR point clouds"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "Apache-2.0"}
+license = { text = "Apache-2.0" }
 
 authors = [
-  {name = "Nadeem Fareed"}
+  { name = "Nadeem Fareed" }
 ]
 
 keywords = [
@@ -65,6 +65,16 @@ dev = [
   "twine>=5.0",
   "pytest>=8.0",
   "ruff>=0.6"
+]
+
+treeclouds = [
+  "fiona>=1.9",
+  "shapely>=2.0"
+]
+
+all = [
+  "fiona>=1.9",
+  "shapely>=2.0"
 ]
 
 [project.scripts]

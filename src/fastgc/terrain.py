@@ -98,6 +98,22 @@ def _pixel_size(transform) -> tuple[float, float]:
     return dx, dy
 
 
+def _dem_valid_mask(dem: np.ndarray, nodata) -> np.ndarray:
+    valid = np.isfinite(dem)
+    if nodata is not None and np.isfinite(nodata):
+        valid &= dem != np.float32(nodata)
+    return valid
+
+
+def _apply_valid_mask(arr: np.ndarray, valid_mask: np.ndarray, nodata) -> np.ndarray:
+    out = np.array(arr, copy=True, dtype=np.float32)
+    if nodata is None or (isinstance(nodata, float) and np.isnan(nodata)):
+        out[~valid_mask] = np.nan
+    else:
+        out[~valid_mask] = np.float32(nodata)
+    return out
+
+
 def _nanmean_filter(arr: np.ndarray, radius: int) -> np.ndarray:
     if radius <= 0:
         return arr.copy()
@@ -298,7 +314,9 @@ def _process_dem_for_product(item: dict[str, Any], *, force: bool = False) -> di
         return {"status": "skipped", "path": str(out_fp), "name": dem_fp.name}
 
     dem, profile, transform, nodata = _read_dem(str(dem_fp))
+    valid_mask = _dem_valid_mask(dem, nodata)
     dx, dy = _pixel_size(transform)
+
     arr = _compute_terrain_array(
         item["product"],
         dem,
@@ -311,6 +329,8 @@ def _process_dem_for_product(item: dict[str, Any], *, force: bool = False) -> di
         twi_eps=float(item["twi_eps"]),
         dtw_max_distance=item["dtw_max_distance"],
     )
+
+    arr = _apply_valid_mask(arr, valid_mask, nodata)
     _write_raster(arr, profile, str(out_fp), nodata=nodata)
     return {"status": "ok", "path": str(out_fp), "name": dem_fp.name}
 

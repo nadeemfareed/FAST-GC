@@ -115,6 +115,7 @@ sensor-adaptive** manner.
   `FAST_TERRAIN`      Terrain derivatives
   `FAST_ITD`          Individual tree detection outputs
   `FAST_CHANGE`       Change detection outputs
+  'FAST_STRUCTURE'    Structural variables for Forest from point clouds
 
 ------------------------------------------------------------------------
 
@@ -293,8 +294,11 @@ Large LiDAR datasets should be tiled for efficient processing.
 
   `overwrite_tiles`                Force tile rebuild
   -----------------------------------------------------------------------
+## Example: set working directory or repo paths
+## if not installed through pip or conda
+cd "C:\folder\FAST-GC" 
 
-## Example --- Tiling Only
+## Example 1 --- Tiling Only
 
 ``` bash
 fastgc \
@@ -325,9 +329,6 @@ FAST-GC performs multi-stage ground classification.
 
 1.  Initial ground detection\
 2.  DEM construction\
-3.  Residual analysis\
-4.  FP-Fix correction (optional)\
-5.  Final ground classification
 
 ## Run FAST-GC on a Single File
 
@@ -338,61 +339,17 @@ fastgc \
   --products FAST_GC
 ```
 
-## Batch Processing (Tiled Dataset)
+## Batch Processing (Tiled Dataset) - Example 1
 
 ``` bash
 fastgc \
-  --in_path "F:\lidar_data\ALS_tiles\tiles" \
-  --out_dir "F:\lidar_data\ALS_tiles" \
+  --in_path "F:\lidar_data\USA" \
+  --out_dir "F:\lidar_data" \
   --sensor_mode ALS \
   --workflow run \
   --products FAST_GC \
   --recursive
 ```
-
-## Disable FP-Fix (optional)
-
-``` text
---no_fp_fix
-```
-
-------------------------------------------------------------------------
-
-# FP-Fix Logic
-
-FP-Fix is an optional post-classification correction step that uses
-DEM-normalized residuals to reduce classification leakage.
-
-## Concept
-
-A temporary DEM is generated from ground points. Each point is then
-compared to the DEM surface using:
-
-``` text
-residual = Zpoint − Zdem
-```
-
-The residual is used to detect likely false positives and false
-negatives in the classification.
-
-## Rules
-
-  -----------------------------------------------------------------------
-  Condition                                 Action
-  ----------------------------------------- -----------------------------
-  Non-ground point with normalized          Convert to ground
-  elevation ≤ 0                             
-
-  Ground point with normalized elevation \> Convert to non-ground
-  6 cm                                      
-  -----------------------------------------------------------------------
-
-Temporary surfaces used for FP-Fix are removed automatically unless:
-
-``` text
---keep_fp_fix_temp
-```
-
 ------------------------------------------------------------------------
 
 # Terrain Derivative Products
@@ -550,42 +507,90 @@ be extended consistently as algorithm modules mature.
 ------------------------------------------------------------------------
 
 # Example --- Generate All Products
-
-``` bash
-fastgc \
-  --in_path "F:\lidar_data\ALS_tiles\tiles" \
-  --out_dir "F:\lidar_data\ALS_tiles" \
-  --sensor_mode ALS \
-  --workflow run \
-  --products all \
-  --grid_res 0.25 \
-  --recursive
+'''
+fastgc `
+  --in_path $IN `
+  --out_dir $ROOT `
+  --sensor_mode ALS `
+  --workflow tile-run-merge `
+  --tile_size_m 250 `
+  --buffer_m 5 `
+  --products all `
+  --grid_res 0.25 `
+  --dem_method nearest `
+  --dsm_method max `
+  --chm_methods p2r p99 pitfree `
+  --terrain_products all `
+  --apply_fp_fix `
+  --jobs 8 `
+  --joblib_backend loky `
+  --overwrite `
+  --overwrite_tiles
 ```
 
 # Example --- Generate Selected Products
 
-### DEM only
+### Tile, classify, and derive products, but do not merge
 
 ``` bash
-fastgc --in_path input.las --sensor_mode ALS --products FAST_DEM
+ffastgc `
+  --in_path $IN `
+  --out_dir $ROOT `
+  --sensor_mode ALS `
+  --workflow tile-run `
+  --tile_size_m 250 `
+  --buffer_m 5 `
+  --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_CHM FAST_TERRAIN `
+  --grid_res 0.25 `
+  --dem_method nearest `
+  --dsm_method max `
+  --chm_methods p2r p99 pitfree `
+  --terrain_products all `
+  --apply_fp_fix `
+  --jobs 8 `
+  --joblib_backend loky `
+  --overwrite `
+  --overwrite_tiles
 ```
 
-### DSM only
+### Merge all non-CHM tiled outputs
 
-``` bash
-fastgc --in_path input.las --sensor_mode ALS --products FAST_DSM
+``` 
+fastgc `
+  --in_path $WS `
+  --sensor_mode ALS `
+  --workflow merge `
+  --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_TERRAIN
 ```
 
-### CHM only
+### Merge one CHM method at a time
 
 ``` bash
-fastgc --in_path input.las --sensor_mode ALS --products FAST_CHM
+ffastgc `
+  --in_path $WS `
+  --sensor_mode ALS `
+  --workflow merge `
+  --products FAST_CHM `
+  --chm_method p2r
 ```
 
-### DEM + DSM
+### Whole-file processing with no tiling
+### FAST-GC only
+### Choose the sensor mode one of the option (ALS, ULS, TLS)
+### MLS/PLS falls under the sensor mode TLS
 
 ``` bash
-fastgc --in_path input.las --sensor_mode ALS --products FAST_DEM FAST_DSM
+fastgc `
+  --in_path $IN `
+  --out_dir $ROOT `
+  --sensor_mode ALS `
+  --workflow run `
+  --products FAST_GC `
+  --grid_res 0.25 `
+  --apply_fp_fix `
+  --jobs 8 `
+  --joblib_backend loky `
+  --overwrite
 ```
 
 ------------------------------------------------------------------------
@@ -620,7 +625,6 @@ fastgc \
 This workflow is especially useful when:
 
 -   FAST_GC has already been completed
--   FP-Fix has already been applied
 -   one or more downstream products need to be rebuilt
 -   long reprocessing of classification should be avoided
 
@@ -681,21 +685,7 @@ Pipeline executed:
 
 ------------------------------------------------------------------------
 
-# Output Structure
-
-A typical processed workspace looks like this:
-
-``` text
-FAST-GC/
-│
-├── docs/
-│   └── images/
-│
-├── README.md
-└── LICENSE
-```
-
-A typical FAST-GC output folder may contain:
+A typical FAST-GC output folder may contain (tiled datasets):
 
 ``` text
 Processed_ALS/
@@ -754,7 +744,7 @@ FAST-GC development builds upon advances in:
 
 # About
 
-FAST-GC is a research software framework for scalable LiDAR ground
+FAST-GC is a production grade software framework for scalable LiDAR ground
 classification and terrain modeling across ALS, ULS, MLS/PLS, and TLS systems.
 
 It is intended for applications in:
@@ -765,3 +755,95 @@ It is intended for applications in:
 -   wildfire fuel mapping from LiDAR
 -   wall-to-wall LiDAR processing
 -   large-scale geospatial workflows
+
+
+------------------------------------------------------------------------
+
+# ADDITIONAL EXECUTION EXAMPLES (EXTENDED WORKFLOWS)
+
+## Example --- FAST_DSM (Tile-wise then Merge)
+
+```bash
+fastgc \
+  --in_path "F:\FAST_GC_Test\ALS\ALS-on_KA11_2019-07-05_300m_fastgc\ALS_tiles\Processed_ALS" \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_DSM \
+  --grid_res 0.25 \
+  --dsm_method max \
+  --jobs 8 \
+  --joblib_backend loky \
+  --overwrite
+```
+
+```bash
+fastgc \
+  --in_path "F:\FAST_GC_Test\ALS\ALS-on_KA11_2019-07-05_300m_fastgc\ALS_tiles" \
+  --sensor_mode ALS \
+  --workflow merge \
+  --products FAST_DSM
+```
+
+## Example --- FAST_STRUCTURE
+
+```bash
+fastgc \
+  --in_path "F:\FAST_GC_Test\ALS\ALS-on_KA11_2019-07-05_300m_fastgc\ALS_tiles\Processed_ALS" \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_STRUCTURE \
+  --structure_products all \
+  --structure_res 0.5 \
+  --structure_min_h 2.0 \
+  --structure_bin_size 1.0 \
+  --canopy_thr 2.0 \
+  --structure_na_fill none \
+  --jobs 8 \
+  --joblib_backend loky \
+  --overwrite
+```
+
+## Example --- FAST_ITD (Tree Detection and Crowns)
+
+```bash
+fastgc \
+  --in_path "F:\FAST_GC_Test\ALS\ALS-on_KA11_2019-07-05_300m_fastgc\ALS_tiles\Merged_ALS\ALS-on_KA11_2019-07-05_300m_FAST_CHM_p2r.tif" \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_ITD \
+  --itd_method watershed \
+  --jobs 8 \
+  --joblib_backend loky \
+  --overwrite
+```
+
+## Example --- FAST_TERRAIN Only
+
+```bash
+fastgc \
+  --in_path "F:\FAST_GC_Test\ALS\ALS-on_KA11_2019-07-05_300m_fastgc\ALS_tiles\Processed_ALS" \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_TERRAIN \
+  --terrain_products all \
+  --jobs 8 \
+  --joblib_backend loky \
+  --overwrite
+```
+
+## Example --- FAST_CHANGE
+
+```bash
+fastgc \
+  --in_path "F:\FAST_GC_Test\ALS\ALS-on_KA11_2019-07-05_300m_fastgc\ALS_tiles\Processed_ALS" \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_CHANGE \
+  --change_input_type FAST_CHM \
+  --change_mode pairwise \
+  --jobs 8 \
+  --joblib_backend loky \
+  --overwrite
+```
+
+------------------------------------------------------------------------

@@ -15,15 +15,19 @@ PRODUCT_CHOICES = [
     "FAST_TERRAIN",
     "FAST_CHANGE",
     "FAST_ITD",
+    "FAST_STRUCTURE",
+    "FAST_TREECLOUDS",
 ]
 
 RASTER_METHOD_CHOICES = ["min", "max", "mean", "nearest", "idw"]
+DSM_METHOD_CHOICES = ["min", "max", "mean", "nearest", "idw", "spikefree"]
 
 CHM_METHOD_CHOICES = [
     "p2r",
     "p99",
     "tin",
     "pitfree",
+    "csf_chm",
     "spikefree",
     "percentile",
     "percentile_top",
@@ -35,6 +39,15 @@ CHM_SURFACE_METHOD_CHOICES = [
     "p99",
     "tin",
     "pitfree",
+    "csf_chm",
+]
+
+CHM_MULTI_METHOD_CHOICES = [
+    "p2r",
+    "p99",
+    "tin",
+    "pitfree",
+    "csf_chm",
     "spikefree",
 ]
 
@@ -72,13 +85,30 @@ CHANGE_LOD_MODE_CHOICES = [
     "max",
 ]
 
+STRUCTURE_PRODUCT_CHOICES = [
+    "all",
+    "canopy_cover",
+    "z_mean",
+    "z_max",
+    "z_sd",
+    "FHD",
+    "VCI",
+    "n_points",
+]
+
 ITD_METHOD_CHOICES = [
     "placeholder",
     "lmf",
     "watershed",
+    "yun2021",
     "dalponte2016",
     "li2012",
     "csp",
+]
+
+TREECLOUDS_LAS_SOURCE_CHOICES = [
+    "FAST_NORMALIZED",
+    "FAST_GC",
 ]
 
 
@@ -193,8 +223,8 @@ def main(argv=None):
         dest="dsm_method",
         type=str,
         default="max",
-        choices=RASTER_METHOD_CHOICES,
-        help="DSM raster method. Default: max",
+        choices=DSM_METHOD_CHOICES,
+        help="DSM raster method. Includes 'spikefree' for DSM-first spikefree routing.",
     )
 
     parser.add_argument(
@@ -204,7 +234,7 @@ def main(argv=None):
         type=str,
         default="p2r",
         choices=CHM_METHOD_CHOICES,
-        help="Primary CHM mode. Can be a direct algorithm or a selector family.",
+        help="Primary CHM mode. 'spikefree' is routed DSM-first; 'csf_chm' is cloth-simulation CHM.",
     )
     parser.add_argument(
         "--chm_methods",
@@ -212,8 +242,8 @@ def main(argv=None):
         dest="chm_methods",
         nargs="+",
         default=None,
-        choices=CHM_SURFACE_METHOD_CHOICES,
-        help="Optional list of CHM surface methods to generate in one run, e.g. p2r p99 pitfree.",
+        choices=CHM_MULTI_METHOD_CHOICES,
+        help="Optional list of CHM methods to generate in one run, e.g. p2r p99 pitfree csf_chm spikefree.",
     )
     parser.add_argument(
         "--chm_surface_method",
@@ -287,7 +317,7 @@ def main(argv=None):
         dest="chm_spikefree_freeze_distance",
         type=float,
         default=None,
-        help="Spike-free freeze distance in map units. If omitted, auto defaults are used.",
+        help="Spikefree freeze distance in map units. Used for DSM spikefree and derived CHM spikefree.",
     )
     parser.add_argument(
         "--chm_spikefree_insertion_buffer",
@@ -295,7 +325,7 @@ def main(argv=None):
         dest="chm_spikefree_insertion_buffer",
         type=float,
         default=None,
-        help="Spike-free insertion buffer in height units. If omitted, auto defaults are used.",
+        help="Spikefree insertion buffer in height units. Used for DSM spikefree and derived CHM spikefree.",
     )
     parser.add_argument(
         "--chm_median_size",
@@ -478,7 +508,7 @@ def main(argv=None):
         type=str,
         default="placeholder",
         choices=ITD_METHOD_CHOICES,
-        help="ITD method placeholder for future tree detection workflows.",
+        help="ITD method for tree detection workflows.",
     )
     parser.add_argument(
         "--itd_source_chm",
@@ -486,11 +516,175 @@ def main(argv=None):
         dest="itd_source_chm",
         type=str,
         default=None,
-        help="Optional CHM variant folder to use for ITD, e.g. pitfree or percentile_p99.",
+        help="Optional CHM variant folder to use for ITD, e.g. pitfree or percentile_band.",
     )
 
-    parser.add_argument("--tile_size_m", "--tile-size-m", dest="tile_size_m", type=float, default=30.0, help="Tile core size in meters for tiling workflows.")
-    parser.add_argument("--buffer_m", "--buffer-m", dest="buffer_m", type=float, default=5.0, help="Tile buffer size in meters for tiling workflows.")
+    parser.add_argument(
+        "--itd_min_height",
+        "--itd-min-height",
+        dest="itd_min_height",
+        type=float,
+        default=2.0,
+        help="Minimum canopy/surface height used for ITD eligibility.",
+    )
+    parser.add_argument(
+        "--itd_crown_window_m",
+        "--itd-crown-window-m",
+        dest="itd_crown_window_m",
+        type=float,
+        default=3.0,
+        help="Approximate crown-detection window in map units used for local maxima search.",
+    )
+    parser.add_argument(
+        "--itd_min_peak_separation_m",
+        "--itd-min-peak-separation-m",
+        dest="itd_min_peak_separation_m",
+        type=float,
+        default=1.5,
+        help="Minimum separation between retained treetop candidates in map units.",
+    )
+    parser.add_argument(
+        "--itd_angle_threshold_deg",
+        "--itd-angle-threshold-deg",
+        dest="itd_angle_threshold_deg",
+        type=float,
+        default=110.0,
+        help="Valley-angle threshold used to prune likely false adjacent treetops.",
+    )
+    parser.add_argument(
+        "--itd_screen_max_pair_distance_m",
+        "--itd-screen-max-pair-distance-m",
+        dest="itd_screen_max_pair_distance_m",
+        type=float,
+        default=6.0,
+        help="Maximum treetop-pair distance checked during false-peak screening.",
+    )
+    parser.add_argument(
+        "--itd_banded_neighborhood_px",
+        "--itd-banded-neighborhood-px",
+        dest="itd_banded_neighborhood_px",
+        type=int,
+        default=1,
+        help="Half-width in pixels of the banded neighborhood sampled between adjacent treetop pairs.",
+    )
+    parser.add_argument(
+        "--itd_min_crown_area_m2",
+        "--itd-min-crown-area-m2",
+        dest="itd_min_crown_area_m2",
+        type=float,
+        default=0.75,
+        help="Minimum crown area retained after raster crown delineation.",
+    )
+
+    parser.add_argument(
+        "--structure_products",
+        "--structure-products",
+        dest="structure_products",
+        nargs="+",
+        default=["all"],
+        choices=STRUCTURE_PRODUCT_CHOICES,
+        help="FAST_STRUCTURE products to generate from normalized point clouds.",
+    )
+    parser.add_argument(
+        "--structure_res",
+        "--structure-res",
+        dest="structure_res",
+        type=float,
+        default=1.0,
+        help="Output raster resolution for FAST_STRUCTURE products.",
+    )
+    parser.add_argument(
+        "--structure_min_h",
+        "--structure-min-h",
+        dest="structure_min_h",
+        type=float,
+        default=2.0,
+        help="Minimum normalized height considered vegetation for FAST_STRUCTURE metrics.",
+    )
+    parser.add_argument(
+        "--structure_bin_size",
+        "--structure-bin-size",
+        dest="structure_bin_size",
+        type=float,
+        default=1.0,
+        help="Vertical bin size for FHD and VCI metrics.",
+    )
+    parser.add_argument(
+        "--canopy_thr",
+        "--canopy-thr",
+        dest="canopy_thr",
+        type=float,
+        default=2.0,
+        help="Height threshold used for canopy cover.",
+    )
+    parser.add_argument(
+        "--canopy_mode",
+        "--canopy-mode",
+        dest="canopy_mode",
+        type=str,
+        default="all_points",
+        choices=["all_points"],
+        help="Canopy-cover mode.",
+    )
+    parser.add_argument(
+        "--structure_na_fill",
+        "--structure-na-fill",
+        dest="structure_na_fill",
+        type=str,
+        default="none",
+        choices=["none", "3x3_mean"],
+        help="Optional NA fill mode for FAST_STRUCTURE outputs.",
+    )
+
+    parser.add_argument(
+        "--treeclouds_las_source",
+        "--treeclouds-las-source",
+        dest="treeclouds_las_source",
+        type=str,
+        default="FAST_NORMALIZED",
+        choices=TREECLOUDS_LAS_SOURCE_CHOICES,
+        help="LAS source used by FAST_TREECLOUDS. Default: FAST_NORMALIZED",
+    )
+    parser.add_argument(
+        "--treeclouds_min_height",
+        "--treeclouds-min-height",
+        dest="treeclouds_min_height",
+        type=float,
+        default=0.5,
+        help="Minimum point height retained during FAST_TREECLOUDS segmentation.",
+    )
+    parser.add_argument(
+        "--treeclouds_write_individual",
+        "--treeclouds-write-individual",
+        dest="treeclouds_write_individual",
+        action="store_true",
+        default=False,
+        help="Also write individual per-tree/per-segment LAS files.",
+    )
+    parser.add_argument(
+        "--treeclouds_no_write_individual",
+        "--treeclouds-no-write-individual",
+        dest="treeclouds_write_individual",
+        action="store_false",
+        help="Disable individual per-tree/per-segment LAS writing.",
+    )
+
+    parser.add_argument(
+        "--tile_size_m",
+        "--tile-size-m",
+        dest="tile_size_m",
+        type=float,
+        default=30.0,
+        help="Tile core size in meters for tiling workflows.",
+    )
+    parser.add_argument(
+        "--buffer_m",
+        "--buffer-m",
+        dest="buffer_m",
+        type=float,
+        default=5.0,
+        help="Tile buffer size in meters for tiling workflows.",
+    )
     parser.add_argument(
         "--small_tile_merge_frac",
         "--small-tile-merge-frac",
@@ -499,8 +693,20 @@ def main(argv=None):
         default=0.25,
         help="Merge planned tiles smaller than this fraction into a neighbor.",
     )
-    parser.add_argument("--cleanup_tiles", "--cleanup-tiles", dest="cleanup_tiles", action="store_true", help="Remove tiling workspace after successful merge.")
-    parser.add_argument("--overwrite_tiles", "--overwrite-tiles", dest="overwrite_tiles", action="store_true", help="Rebuild tiles even if a tile manifest already exists.")
+    parser.add_argument(
+        "--cleanup_tiles",
+        "--cleanup-tiles",
+        dest="cleanup_tiles",
+        action="store_true",
+        help="Remove tiling workspace after successful merge.",
+    )
+    parser.add_argument(
+        "--overwrite_tiles",
+        "--overwrite-tiles",
+        dest="overwrite_tiles",
+        action="store_true",
+        help="Rebuild tiles even if a tile manifest already exists.",
+    )
 
     parser.add_argument(
         "--apply_fp_fix",
@@ -510,8 +716,21 @@ def main(argv=None):
         default=True,
         help="Enable built-in FP-fix stage (default behavior).",
     )
-    parser.add_argument("--no_fp_fix", "--no-fp-fix", dest="apply_fp_fix", action="store_false", help="Disable built-in FP-fix stage.")
-    parser.add_argument("--fp_fix_dem_res", "--fp-fix-dem-res", dest="fp_fix_dem_res", type=float, default=0.25, help="Temporary DEM resolution for FP-fix residual checks.")
+    parser.add_argument(
+        "--no_fp_fix",
+        "--no-fp-fix",
+        dest="apply_fp_fix",
+        action="store_false",
+        help="Disable built-in FP-fix stage.",
+    )
+    parser.add_argument(
+        "--fp_fix_dem_res",
+        "--fp-fix-dem-res",
+        dest="fp_fix_dem_res",
+        type=float,
+        default=0.25,
+        help="Temporary DEM resolution for FP-fix residual checks.",
+    )
     parser.add_argument(
         "--fp_fix_nonground_to_ground_max_z",
         "--fp-fix-nonground-to-ground-max-z",
@@ -528,7 +747,13 @@ def main(argv=None):
         default=0.06,
         help="Demote ground to non-ground when residual z > this threshold.",
     )
-    parser.add_argument("--keep_fp_fix_temp", "--keep-fp-fix-temp", dest="keep_fp_fix_temp", action="store_true", help="Keep provisional _temp_fp_fix workspace for inspection.")
+    parser.add_argument(
+        "--keep_fp_fix_temp",
+        "--keep-fp-fix-temp",
+        dest="keep_fp_fix_temp",
+        action="store_true",
+        help="Keep provisional _temp_fp_fix workspace for inspection.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -586,6 +811,23 @@ def main(argv=None):
         change_lod_mode=args.change_lod_mode,
         itd_method=args.itd_method,
         itd_source_chm=args.itd_source_chm,
+        itd_min_height=args.itd_min_height,
+        itd_crown_window_m=args.itd_crown_window_m,
+        itd_min_peak_separation_m=args.itd_min_peak_separation_m,
+        itd_angle_threshold_deg=args.itd_angle_threshold_deg,
+        itd_screen_max_pair_distance_m=args.itd_screen_max_pair_distance_m,
+        itd_banded_neighborhood_px=args.itd_banded_neighborhood_px,
+        itd_min_crown_area_m2=args.itd_min_crown_area_m2,
+        structure_products=args.structure_products,
+        structure_res=args.structure_res,
+        structure_min_h=args.structure_min_h,
+        structure_bin_size=args.structure_bin_size,
+        canopy_thr=args.canopy_thr,
+        canopy_mode=args.canopy_mode,
+        structure_na_fill=args.structure_na_fill,
+        treeclouds_las_source=args.treeclouds_las_source,
+        treeclouds_min_height=args.treeclouds_min_height,
+        treeclouds_write_individual=args.treeclouds_write_individual,
         workflow=args.workflow,
         tile_size_m=args.tile_size_m,
         buffer_m=args.buffer_m,

@@ -41,13 +41,6 @@ def _safe_token(name: str) -> str:
 
 
 def _extract_sort_key(fp: Path):
-    """
-    Sort by numbers in filename when available:
-      DEM_2018.tif
-      DEM_2020_07_15.tif
-      dem1.tif, dem2.tif
-    Otherwise fallback to lowercase name.
-    """
     nums = re.findall(r"\d+", fp.stem)
     if nums:
         return tuple(int(n) for n in nums)
@@ -177,13 +170,10 @@ def _compute_lod(
 
     if lod_mode == "threshold_only":
         return thr
-
     if lod_mode == "rss":
         return max(thr, math.sqrt(s1 * s1 + s2 * s2))
-
     if lod_mode == "max":
         return max(thr, s1, s2)
-
     return thr
 
 
@@ -254,16 +244,6 @@ def _resolve_input_groups(
     change_input_type: str,
     source_subdir: str | None = None,
 ) -> dict[str, list[Path]]:
-    """
-    Returns groups of rasters.
-    Each group is processed independently and gets its own FAST_CHANGE output branch.
-
-    Supported layouts:
-    1) processed_root is a direct folder of rasters
-    2) processed_root/FAST_DEM or FAST_DSM contains rasters
-    3) processed_root/FAST_CHM/<method> contains rasters
-    4) processed_root/FAST_TERRAIN/<product> contains rasters
-    """
     change_input_type = str(change_input_type).strip()
 
     direct_rasters = _list_rasters(processed_root)
@@ -291,27 +271,31 @@ def _resolve_input_groups(
 
     if change_input_type == "FAST_CHM":
         root = processed_root / "FAST_CHM"
-        if not root.exists():
-            raise FileNotFoundError(f"FAST_CHM folder not found: {root}")
+        if root.exists():
+            if source_subdir:
+                sub = root / source_subdir
+                if not sub.exists():
+                    raise FileNotFoundError(f"Requested CHM subfolder not found: {sub}")
+                rasters = _list_rasters(sub)
+                if not rasters:
+                    raise FileNotFoundError(f"No CHM rasters found in: {sub}")
+                return {source_subdir: rasters}
 
-        if source_subdir:
-            sub = root / source_subdir
-            if not sub.exists():
-                raise FileNotFoundError(f"Requested CHM subfolder not found: {sub}")
-            rasters = _list_rasters(sub)
-            if not rasters:
-                raise FileNotFoundError(f"No CHM rasters found in: {sub}")
-            return {source_subdir: rasters}
+            groups: dict[str, list[Path]] = {}
+            for method_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
+                rasters = _list_rasters(method_dir)
+                if rasters:
+                    groups[method_dir.name] = rasters
 
-        groups: dict[str, list[Path]] = {}
-        for method_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
-            rasters = _list_rasters(method_dir)
-            if rasters:
-                groups[method_dir.name] = rasters
+            if groups:
+                return groups
 
-        if not groups:
-            raise FileNotFoundError(f"No CHM rasters found under: {root}")
-        return groups
+        direct_rasters = _list_rasters(processed_root)
+        if direct_rasters:
+            group_name = source_subdir if source_subdir else "FAST_CHM"
+            return {group_name: direct_rasters}
+
+        raise FileNotFoundError(f"No CHM rasters found under: {root if root.exists() else processed_root}")
 
     if change_input_type == "FAST_TERRAIN":
         root = processed_root / "FAST_TERRAIN"
@@ -441,6 +425,47 @@ def _pair_task_name(pair: tuple[int, int], series: list[Path]) -> str:
     return f"{token1}__to__{token2}"
 
 
+def _extract_ok_records(summary) -> list:
+    """
+    Handle multiple possible StageSummary layouts.
+    Some repo versions expose:
+      - summary.results_ok -> iterable
+      - summary.ok_results -> iterable
+      - summary.records_ok -> iterable
+      - summary.ok -> count integer
+    """
+    for attr in ("results_ok", "ok_results", "records_ok", "ok_records", "successes"):
+        value = getattr(summary, attr, None)
+        if isinstance(value, (list, tuple)):
+            return list(value)
+    return []
+
+
+def _payload_from_record(rec):
+    if isinstance(rec, dict):
+        payload = rec.get("payload")
+        if isinstance(payload, dict):
+            return payload
+        result_obj = rec.get("result")
+        if isinstance(result_obj, dict):
+            payload = result_obj.get("payload")
+            if isinstance(payload, dict):
+                return payload
+        return None
+
+    payload = getattr(rec, "payload", None)
+    if isinstance(payload, dict):
+        return payload
+
+    result_obj = getattr(rec, "result", None)
+    if isinstance(result_obj, dict):
+        payload = result_obj.get("payload")
+        if isinstance(payload, dict):
+            return payload
+
+    return None
+
+
 def _process_change_pair(
     task_name: str,
     *,
@@ -531,28 +556,6 @@ def run_change_from_processed_root(
     joblib_batch_size: int | str = "auto",
     joblib_pre_dispatch: str = "2*n_jobs",
 ) -> str:
-    """
-    Robust change detection on raster series.
-
-    Parameters
-    ----------
-    processed_root : path
-        Either:
-        - Processed_<SENSOR> root, or
-        - a direct folder of rasters.
-    change_input_type : FAST_DEM | FAST_DSM | FAST_CHM | FAST_TERRAIN
-    change_mode : pairwise | sequential | baseline
-    change_threshold : float
-        Minimum change threshold.
-    baseline_index : int
-        Used when change_mode='baseline'.
-    source_subdir : optional str
-        For FAST_CHM, select one CHM method subfolder.
-        For FAST_TERRAIN, select one terrain subfolder.
-    sigma1, sigma2 : float
-        Optional uncertainty terms used in LOD.
-    lod_mode : threshold_only | rss | max
-    """
     _require_rasterio()
 
     processed_root = Path(processed_root)
@@ -610,26 +613,57 @@ def run_change_from_processed_root(
             )
 
         summary = run_stage(
-            task_names,
-            stage=f"FAST-GC derive FAST_CHANGE [{family}/{group_name}/{mode}]",
-            worker=_worker,
-            unit="pair",
-            backend=joblib_backend,
-            n_jobs=n_jobs,
-            batch_size=joblib_batch_size,
-            pre_dispatch=joblib_pre_dispatch,
-            show_progress=True,
-            show_stage_banner=True,
+            stage_name=f"FAST-GC derive CHANGE [{family}/{group_name}/{mode}]",
             source=str(out_root),
+            items=task_names,
+            worker=_worker,
+            n_jobs=n_jobs,
+            unit="pair",
+            joblib_backend=joblib_backend,
+            joblib_batch_size=joblib_batch_size,
+            joblib_pre_dispatch=joblib_pre_dispatch,
         )
 
         summary_rows: list[dict] = []
-        for rec in summary.get("ok", []):
-            payload = rec.get("payload")
+        ok_records = _extract_ok_records(summary)
+
+        for rec in ok_records:
+            payload = _payload_from_record(rec)
             if isinstance(payload, dict):
-                payload = payload.copy()
-                payload.update({"group": group_name, "mode": mode})
-                summary_rows.append(payload)
+                row = payload.copy()
+                row.update({"group": group_name, "mode": mode})
+                summary_rows.append(row)
+
+        if not summary_rows and len(task_names) == 1:
+            # Fallback for repo variants where StageSummary stores only counts.
+            fp1, fp2 = task_map[task_names[0]]
+            a, b, profile, nodata = _align_pair(str(fp1), str(fp2))
+            valid = _valid_mask(a, b, nodata, np.nan)
+            lod_value = _compute_lod(
+                change_threshold=change_threshold,
+                sigma1=sigma1,
+                sigma2=sigma2,
+                lod_mode=lod_mode,
+            )
+            delta = np.full_like(a, np.nan, dtype=np.float32)
+            d = b - a
+            delta[valid] = d[valid]
+            row = _pair_stats(
+                delta=delta,
+                valid=valid,
+                lod_value=lod_value,
+                transform=profile["transform"],
+            )
+            row.update(
+                {
+                    "source_1": str(fp1),
+                    "source_2": str(fp2),
+                    "pair_name": task_names[0],
+                    "group": group_name,
+                    "mode": mode,
+                }
+            )
+            summary_rows.append(row)
 
         _write_summary_csv(out_root, summary_rows)
 
