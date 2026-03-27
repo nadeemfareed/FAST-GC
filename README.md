@@ -157,30 +157,62 @@ The following placeholders assume all figures are stored in:
 docs/images/
 ```
 
-## Example figure placeholders
+# Example Outputs
 
-  Product                  Placeholder path
-  ------------------------ -----------------------------------
-  Ground classification    `docs/images/FAST_GC.png`
-  DEM                      `docs/images/FAST_DEM.png`
-  DSM                      `docs/images/FAST_DSM.png`
-  Normalized point cloud   `docs/images/FAST_NORMALIZED.png`
-  CHM                      `docs/images/FAST_CHM.png`
-  Hillshade                `docs/images/FAST_HILLSHADE.png`
-  Slope                    `docs/images/FAST_SLOPE.png`
-  Curvature                `docs/images/CURVATURE.png`
-  TWI                      `docs/images/TWI.png`
-  TPI                      `docs/images/TPI.png`
-  TCI                      `docs/images/TCI.png`
-  ITD                      `docs/images/ITD.png`
-  Change detection         `docs/images/FAST_CHANGE.png`
+## Ground Classification
+![Ground classification](docs/images/FAST_GC.png)
 
-### Ground Classification
+## DEM
+![DEM](docs/images/FAST_DEM.png)
 
--   Original point cloud → `docs/images/original_pointcloud.png`
--   FAST-GC classified point cloud → `docs/images/FAST_GC.png`
+## DSM
+![DSM](docs/images/FAST_DSM.png)
 
-Color legend: - Green → Ground points - Blue → Non-ground points
+## Normalized Point Cloud
+![Normalized](docs/images/FAST_NORMALIZED.png)
+
+## CHM
+![CHM](docs/images/FAST_CHM.png)
+
+## Terrain Products
+
+### Hillshade
+![Hillshade](docs/images/FAST_HILLSHADE.png)
+
+### Slope
+![Slope](docs/images/FAST_SLOPE.png)
+
+### Curvature
+![Curvature](docs/images/CURVATURE.png)
+
+### TWI
+![TWI](docs/images/TWI.png)
+
+### TPI
+![TPI](docs/images/TPI.png)
+
+### TCI
+![TCI](docs/images/TCI.png)
+
+## Tree Detection (ITD)
+![ITD](docs/images/ITD.png)
+
+## Change Detection
+![Change](docs/images/FAST_CHANGE.png)
+
+---
+
+# Ground Classification Comparison
+
+## Original Point Cloud
+![Original point cloud](docs/images/FAST_NORMALIZED.png)
+
+## FAST-GC Classified Point Cloud
+![FAST-GC classified](docs/images/FAST_GC.png)
+
+**Color legend:**
+- Green → Ground points  
+- Blue → Non-ground points
 
 ------------------------------------------------------------------------
 
