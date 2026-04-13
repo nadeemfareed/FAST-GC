@@ -72,13 +72,10 @@ class StageSummary:
         }
 
 
-# ---------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------
-
 def format_seconds(seconds: float | int | None) -> str:
     if seconds is None:
         return "n/a"
+
     seconds = float(seconds)
     if not math.isfinite(seconds):
         return "n/a"
@@ -93,10 +90,6 @@ def format_seconds(seconds: float | int | None) -> str:
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-
-# ---------------------------------------------------------
-# Logging
-# ---------------------------------------------------------
 
 def log_info(message: str) -> None:
     print(f"[INFO] {message}")
@@ -114,10 +107,6 @@ def log_tile_stage(message: str) -> None:
     print(f"    [tile-stage] {message}")
 
 
-# ---------------------------------------------------------
-# Stage banner
-# ---------------------------------------------------------
-
 def stage_banner(
     stage_name: str,
     *,
@@ -126,7 +115,6 @@ def stage_banner(
     unit: str = "item",
     **_: Any,
 ) -> None:
-
     log_info(f"Stage: {stage_name}")
 
     if source:
@@ -143,7 +131,6 @@ def stage_banner(
         try:
             vm = psutil.virtual_memory()
             cpu = psutil.cpu_percent(interval=None)
-
             log_info(
                 "Resources: "
                 f"cpu={cpu:.1f}% | "
@@ -154,25 +141,18 @@ def stage_banner(
             pass
 
 
-# ---------------------------------------------------------
-# CPU helpers
-# ---------------------------------------------------------
-
 def resolve_n_jobs(
     n_jobs: int | None = None,
     *,
     reserve_cores: int = 1,
     max_jobs: int | None = None,
 ) -> int:
-
     cpu_total = os.cpu_count() or 1
 
     if n_jobs is None or n_jobs == 0:
         jobs = max(1, cpu_total - max(0, reserve_cores))
-
     elif n_jobs < 0:
         jobs = max(1, cpu_total + 1 + n_jobs)
-
     else:
         jobs = int(n_jobs)
 
@@ -181,10 +161,6 @@ def resolve_n_jobs(
 
     return max(1, min(jobs, cpu_total))
 
-
-# ---------------------------------------------------------
-# Execution helpers
-# ---------------------------------------------------------
 
 def _infer_status(result: Any) -> str:
     if isinstance(result, dict):
@@ -195,7 +171,6 @@ def _infer_status(result: Any) -> str:
 
 
 def _extract_name(item: Any, item_name_fn: Callable[[Any], str] | None = None) -> str:
-
     if item_name_fn is not None:
         try:
             return str(item_name_fn(item))
@@ -219,16 +194,12 @@ def _execute_callable(
     func: Callable[[Any], Any],
     item_name_fn: Callable[[Any], str] | None = None,
 ) -> StageRecord:
-
     name = _extract_name(item, item_name_fn=item_name_fn)
-
     t0 = time.perf_counter()
 
     try:
         result = func(item)
-
         status = _infer_status(result)
-
         elapsed = time.perf_counter() - t0
 
         return StageRecord(
@@ -241,9 +212,7 @@ def _execute_callable(
         )
 
     except Exception as exc:
-
         elapsed = time.perf_counter() - t0
-
         tb = traceback.format_exc(limit=10)
 
         return StageRecord(
@@ -256,12 +225,7 @@ def _execute_callable(
         )
 
 
-# ---------------------------------------------------------
-# Progress bar
-# ---------------------------------------------------------
-
 def _make_progress_bar(stage_name: str, total: int, unit: str):
-
     if tqdm is None:
         return None
 
@@ -283,24 +247,24 @@ def _update_bar(
     elapsed_item_sec: float,
     start_time: float,
     unit: str,
+    ok_count: int,
+    skipped_count: int,
+    failed_count: int,
 ) -> None:
-
     if bar is None:
         return
 
     elapsed_total = time.perf_counter() - start_time
-
     avg = elapsed_total / max(1, idx_done)
-
     remaining = max(0, total - idx_done)
-
     eta = avg * remaining
 
     postfix = (
         f"{idx_done}/{total} | "
         f"{elapsed_item_sec:.2f}s/{unit} | "
         f"eta={format_seconds(eta)} | "
-        f"current={current_name}"
+        f"current={current_name} | "
+        f"ok={ok_count} | skip={skipped_count} | fail={failed_count}"
     )
 
     try:
@@ -311,24 +275,15 @@ def _update_bar(
     bar.update(1)
 
 
-# ---------------------------------------------------------
-# Summary
-# ---------------------------------------------------------
-
 def summarize_stage(
     stage_name: str,
     records: Sequence[StageRecord],
     elapsed_sec: float,
 ) -> StageSummary:
-
     total = len(records)
-
     ok = sum(1 for r in records if r.status == "ok")
-
     skipped = sum(1 for r in records if r.status == "skipped")
-
     failed = sum(1 for r in records if r.status == "failed")
-
     avg = elapsed_sec / total if total else 0.0
 
     return StageSummary(
@@ -344,7 +299,6 @@ def summarize_stage(
 
 
 def finish_stage(stage_name: str, summary: StageSummary, *, unit: str = "tile") -> None:
-
     print(
         f"[TIME] {stage_name}: {summary.total} {unit}s | "
         f"total={format_seconds(summary.elapsed_sec)} | "
@@ -353,9 +307,63 @@ def finish_stage(stage_name: str, summary: StageSummary, *, unit: str = "tile") 
     )
 
 
-# ---------------------------------------------------------
-# MAIN EXECUTION ENGINE
-# ---------------------------------------------------------
+def _make_parallel_iterator(
+    *,
+    jobs: int,
+    backend: str,
+    batch_size: int | str,
+    pre_dispatch: str | int,
+    item_list: list[Any],
+    callable_fn: Callable[[Any], Any],
+    item_name_fn: Callable[[Any], str] | None,
+):
+    parallel_backend = "loky" if backend == "multiprocessing" else backend
+
+    # Best: as-completed streaming
+    try:
+        parallel = Parallel(
+            n_jobs=jobs,
+            backend=parallel_backend,
+            batch_size=batch_size,
+            pre_dispatch=pre_dispatch,
+            return_as="generator_unordered",
+        )
+        return parallel(
+            delayed(_execute_callable)(i, item, callable_fn, item_name_fn)
+            for i, item in enumerate(item_list, start=1)
+        )
+    except TypeError:
+        pass
+
+    # Good: ordered streaming
+    try:
+        parallel = Parallel(
+            n_jobs=jobs,
+            backend=parallel_backend,
+            batch_size=batch_size,
+            pre_dispatch=pre_dispatch,
+            return_as="generator",
+        )
+        return parallel(
+            delayed(_execute_callable)(i, item, callable_fn, item_name_fn)
+            for i, item in enumerate(item_list, start=1)
+        )
+    except TypeError:
+        pass
+
+    # Fallback: blocking collection
+    parallel = Parallel(
+        n_jobs=jobs,
+        backend=parallel_backend,
+        batch_size=batch_size,
+        pre_dispatch=pre_dispatch,
+    )
+    outputs = parallel(
+        delayed(_execute_callable)(i, item, callable_fn, item_name_fn)
+        for i, item in enumerate(item_list, start=1)
+    )
+    return iter(outputs)
+
 
 def run_stage(
     stage_name: str,
@@ -374,9 +382,6 @@ def run_stage(
     show_progress: bool = True,
     **_: Any,
 ) -> StageSummary:
-
-    # ---- backwards compatibility ----
-
     if func is None and worker is None:
         raise TypeError("run_stage requires 'func' or 'worker'")
 
@@ -384,11 +389,7 @@ def run_stage(
         raise TypeError("Provide only one of 'func' or 'worker'")
 
     callable_fn = func if func is not None else worker
-
-    # ---------------------------------
-
     item_list = list(items)
-
     total = len(item_list)
 
     if show_banner:
@@ -400,13 +401,14 @@ def run_stage(
         return summary
 
     start_time = time.perf_counter()
-
     records: list[StageRecord] = []
-
     bar = _make_progress_bar(stage_name, total, unit) if show_progress else None
 
-    jobs = resolve_n_jobs(n_jobs)
+    ok_count = 0
+    skipped_count = 0
+    failed_count = 0
 
+    jobs = resolve_n_jobs(n_jobs)
     backend = (backend or DEFAULT_BACKEND).lower()
 
     if backend not in BACKEND_CHOICES:
@@ -419,25 +421,66 @@ def run_stage(
         and delayed is not None
     )
 
-    if use_parallel:
+    if not use_parallel:
+        try:
+            for idx, item in enumerate(item_list, start=1):
+                rec = _execute_callable(idx, item, callable_fn, item_name_fn=item_name_fn)
+                records.append(rec)
 
-        parallel_backend = "loky" if backend == "multiprocessing" else backend
+                if rec.status == "ok":
+                    ok_count += 1
+                elif rec.status == "skipped":
+                    skipped_count += 1
+                else:
+                    failed_count += 1
 
-        parallel = Parallel(
-            n_jobs=jobs,
-            backend=parallel_backend,
-            batch_size=batch_size,
-            pre_dispatch=pre_dispatch,
-        )
+                _update_bar(
+                    bar,
+                    current_name=rec.name,
+                    idx_done=idx,
+                    total=total,
+                    elapsed_item_sec=rec.elapsed_sec,
+                    start_time=start_time,
+                    unit=unit,
+                    ok_count=ok_count,
+                    skipped_count=skipped_count,
+                    failed_count=failed_count,
+                )
 
-        outputs = parallel(
-            delayed(_execute_callable)(i, item, callable_fn, item_name_fn)
-            for i, item in enumerate(item_list, start=1)
-        )
+                if rec.status == "failed" and rec.error:
+                    log_fail(f"{rec.name}: {rec.error.splitlines()[0]}")
+        finally:
+            if bar is not None:
+                try:
+                    bar.close()
+                except Exception:
+                    pass
 
-        for idx_done, rec in enumerate(outputs, start=1):
+        elapsed = time.perf_counter() - start_time
+        summary = summarize_stage(stage_name, records, elapsed)
+        finish_stage(stage_name, summary, unit=unit)
+        return summary
 
+    iterator = _make_parallel_iterator(
+        jobs=jobs,
+        backend=backend,
+        batch_size=batch_size,
+        pre_dispatch=pre_dispatch,
+        item_list=item_list,
+        callable_fn=callable_fn,
+        item_name_fn=item_name_fn,
+    )
+
+    try:
+        for idx_done, rec in enumerate(iterator, start=1):
             records.append(rec)
+
+            if rec.status == "ok":
+                ok_count += 1
+            elif rec.status == "skipped":
+                skipped_count += 1
+            else:
+                failed_count += 1
 
             _update_bar(
                 bar,
@@ -447,44 +490,23 @@ def run_stage(
                 elapsed_item_sec=rec.elapsed_sec,
                 start_time=start_time,
                 unit=unit,
+                ok_count=ok_count,
+                skipped_count=skipped_count,
+                failed_count=failed_count,
             )
 
             if rec.status == "failed" and rec.error:
                 log_fail(f"{rec.name}: {rec.error.splitlines()[0]}")
-
-    else:
-
-        for idx, item in enumerate(item_list, start=1):
-
-            rec = _execute_callable(idx, item, callable_fn, item_name_fn)
-
-            records.append(rec)
-
-            _update_bar(
-                bar,
-                current_name=rec.name,
-                idx_done=idx,
-                total=total,
-                elapsed_item_sec=rec.elapsed_sec,
-                start_time=start_time,
-                unit=unit,
-            )
-
-            if rec.status == "failed" and rec.error:
-                log_fail(f"{rec.name}: {rec.error.splitlines()[0]}")
-
-    if bar is not None:
-        try:
-            bar.close()
-        except Exception:
-            pass
+    finally:
+        if bar is not None:
+            try:
+                bar.close()
+            except Exception:
+                pass
 
     elapsed = time.perf_counter() - start_time
-
     summary = summarize_stage(stage_name, records, elapsed)
-
     finish_stage(stage_name, summary, unit=unit)
-
     return summary
 
 

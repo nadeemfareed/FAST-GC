@@ -7,7 +7,7 @@ name = "fastgc"
 version = "0.2.0"
 description = "FAST-GC: Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification for LiDAR point clouds"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 
 authors = [
@@ -24,7 +24,8 @@ keywords = [
   "terrain",
   "als",
   "uls",
-  "tls"
+  "tls",
+  "itd"
 ]
 
 classifiers = [
@@ -35,7 +36,6 @@ classifiers = [
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -44,11 +44,13 @@ classifiers = [
 ]
 
 dependencies = [
-  "numpy>=1.22",
-  "scipy>=1.9",
+  "numpy>=1.22,<2.0",
+  "scipy>=1.9,<1.14",
   "laspy>=2.4",
   "lazrs>=0.6",
   "rasterio>=1.3",
+  "fiona>=1.9",
+  "shapely>=2.0",
   "tqdm>=4.64",
   "joblib>=1.3",
   "psutil>=5.9"
@@ -64,17 +66,18 @@ dev = [
   "build>=1.2",
   "twine>=5.0",
   "pytest>=8.0",
-  "ruff>=0.6"
-]
-
-treeclouds = [
-  "fiona>=1.9",
-  "shapely>=2.0"
+  "ruff>=0.6",
+  "black>=24.0",
+  "pre-commit>=3.0"
 ]
 
 all = [
-  "fiona>=1.9",
-  "shapely>=2.0"
+  "build>=1.2",
+  "twine>=5.0",
+  "pytest>=8.0",
+  "ruff>=0.6",
+  "black>=24.0",
+  "pre-commit>=3.0"
 ]
 
 [project.scripts]
@@ -85,3 +88,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

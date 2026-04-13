@@ -206,6 +206,7 @@ def _ensure_tiles_for_raw_input(
     recursive: bool,
     overwrite_tiles: bool,
     small_tile_merge_frac: float,
+    use_existing_tiles: bool = False,
 ) -> dict:
     return tile_las_dataset(
         in_path=in_path,
@@ -216,7 +217,136 @@ def _ensure_tiles_for_raw_input(
         recursive=recursive,
         overwrite_tiles=overwrite_tiles,
         small_tile_merge_frac=small_tile_merge_frac,
+        use_existing_tiles=use_existing_tiles,
     )
+
+
+def _format_chm_value(v: float | int | None) -> str:
+    if v is None:
+        return "none"
+    try:
+        fv = float(v)
+        if fv.is_integer():
+            return str(int(fv))
+        return str(fv).replace(".", "p")
+    except Exception:
+        return str(v).replace(".", "p").replace(" ", "_")
+
+
+def _parse_chm_spec(spec: str, default_surface_method: str) -> dict:
+    """
+    Supported examples:
+      pitfree
+      p99
+      spikefree
+      percentile_top:pitfree:low=5
+      percentile:pitfree:pct=5
+      percentile_band:pitfree:low=2:high=8
+    """
+    raw = str(spec).strip()
+    if not raw:
+        raise ValueError("Empty CHM spec in --chm_methods")
+
+    parts = [p.strip().lower() for p in raw.split(":") if str(p).strip()]
+    method = parts[0]
+
+    if method in _CHM_ALGORITHMS:
+        return {
+            "method": method,
+            "surface_method": None,
+            "label": chm_output_label(method, None),
+            "is_dsm_derived": method in _CHM_DSM_DERIVED,
+            "percentile": None,
+            "percentile_low": None,
+            "percentile_high": None,
+        }
+
+    if method not in _CHM_SELECTORS:
+        raise ValueError(
+            f"Unsupported CHM spec '{raw}'. "
+            f"Expected plain methods from {sorted(_CHM_ALGORITHMS)} or "
+            f"selector specs using {sorted(_CHM_SELECTORS)}."
+        )
+
+    surface_method = default_surface_method
+    idx = 1
+
+    if len(parts) > 1 and "=" not in parts[1]:
+        surface_method = parts[1]
+        idx = 2
+
+    if surface_method not in _CHM_NATIVE:
+        raise ValueError(
+            f"Invalid CHM surface method '{surface_method}' in spec '{raw}'. "
+            f"Expected one of {sorted(_CHM_NATIVE)}."
+        )
+
+    pct = None
+    pct_low = None
+    pct_high = None
+
+    for token in parts[idx:]:
+        if "=" not in token:
+            raise ValueError(
+                f"Invalid selector token '{token}' in CHM spec '{raw}'. "
+                "Use key=value, e.g. pct=5, low=5, high=10."
+            )
+        k, v = token.split("=", 1)
+        k = k.strip().lower()
+        v = float(v.strip())
+
+        if k in {"pct", "percentile"}:
+            pct = v
+        elif k in {"low", "min"}:
+            pct_low = v
+        elif k in {"high", "max"}:
+            pct_high = v
+        else:
+            raise ValueError(
+                f"Unsupported selector key '{k}' in CHM spec '{raw}'. "
+                "Use pct, low, or high."
+            )
+
+    if method == "percentile":
+        if pct is None:
+            raise ValueError(
+                f"Selector spec '{raw}' requires pct=<value>, e.g. percentile:pitfree:pct=5"
+            )
+        label = f"{method}_{surface_method}_pct{_format_chm_value(pct)}"
+
+    elif method == "percentile_top":
+        if pct_low is None and pct is None:
+            raise ValueError(
+                f"Selector spec '{raw}' requires low=<value> or pct=<value>, "
+                "e.g. percentile_top:pitfree:low=5"
+            )
+        if pct_low is None:
+            pct_low = pct
+        label = f"{method}_{surface_method}_low{_format_chm_value(pct_low)}"
+
+    elif method == "percentile_band":
+        if pct_low is None or pct_high is None:
+            raise ValueError(
+                f"Selector spec '{raw}' requires low=<value> and high=<value>, "
+                "e.g. percentile_band:pitfree:low=2:high=8"
+            )
+        label = (
+            f"{method}_{surface_method}_low{_format_chm_value(pct_low)}"
+            f"_high{_format_chm_value(pct_high)}"
+        )
+
+    else:
+        raise ValueError(f"Unsupported selector method in spec '{raw}'")
+
+    return {
+        "method": method,
+        "surface_method": surface_method,
+        "label": label,
+        "is_dsm_derived": False,
+        "percentile": pct,
+        "percentile_low": pct_low,
+        "percentile_high": pct_high,
+    }
 
 
 def _resolve_chm_targets(
@@ -231,20 +361,8 @@ def _resolve_chm_targets(
     targets: list[dict] = []
 
     if chm_methods:
-        for m in chm_methods:
-            mm = str(m).strip().lower()
-            if mm not in _CHM_ALGORITHMS:
-                raise ValueError(
-                    f"--chm_methods supports: {sorted(_CHM_ALGORITHMS | _CHM_SELECTORS)}"
-                )
-            targets.append(
-                {
-                    "method": mm,
-                    "surface_method": None,
-                    "label": chm_output_label(mm, None),
-                    "is_dsm_derived": mm in _CHM_DSM_DERIVED,
-                }
-            )
+        for spec in chm_methods:
+            targets.append(_parse_chm_spec(spec, surface_method))
         return targets
 
     if method in _CHM_ALGORITHMS:
@@ -254,6 +372,9 @@ def _resolve_chm_targets(
                 "surface_method": None,
                 "label": chm_output_label(method, None),
                 "is_dsm_derived": method in _CHM_DSM_DERIVED,
+                "percentile": None,
+                "percentile_low": None,
+                "percentile_high": None,
             }
         )
         return targets
@@ -267,6 +388,9 @@ def _resolve_chm_targets(
                 "surface_method": surface_method,
                 "label": chm_output_label(method, surface_method),
                 "is_dsm_derived": False,
+                "percentile": None,
+                "percentile_low": None,
+                "percentile_high": None,
             }
         )
         return targets
@@ -321,7 +445,7 @@ def derive_chm_from_processed_root(
     dsm_root = processed_root / PRODUCT_DSM
 
     for target in targets:
-        out_root = Path(chm_method_output_dir(processed_root, target["method"], target["surface_method"]))
+        out_root = Path(processed_root) / PRODUCT_CHM / target["label"]
         if skip_existing and _existing_path(out_root) and not overwrite:
             print(f"[SKIP] Existing CHM output found: {out_root}")
             outputs.append(str(out_root))
@@ -356,6 +480,22 @@ def derive_chm_from_processed_root(
 
             raise ValueError(f"Unsupported DSM-derived CHM target: {target['method']}")
 
+        target_percentile = (
+            target["percentile"]
+            if target.get("percentile") is not None
+            else chm_percentile
+        )
+        target_percentile_low = (
+            target["percentile_low"]
+            if target.get("percentile_low") is not None
+            else chm_percentile_low
+        )
+        target_percentile_high = (
+            target["percentile_high"]
+            if target.get("percentile_high") is not None
+            else chm_percentile_high
+        )
+
         out = _call_with_supported_kwargs(
             build_chm_from_normalized_root,
             normalized_root=normalized_root,
@@ -365,9 +505,9 @@ def derive_chm_from_processed_root(
             surface_method=target["surface_method"],
             grid_res=grid_res,
             smooth_method=chm_smooth_method,
-            percentile=chm_percentile,
-            percentile_low=chm_percentile_low,
-            percentile_high=chm_percentile_high,
+            percentile=target_percentile,
+            percentile_low=target_percentile_low,
+            percentile_high=target_percentile_high,
             pitfree_thresholds=chm_pitfree_thresholds,
             use_first_returns=chm_use_first_returns,
             spikefree_freeze_distance=chm_spikefree_freeze_distance,
@@ -687,6 +827,7 @@ def run_fastgc(
     cleanup_tiles: bool = False,
     overwrite_tiles: bool = False,
     small_tile_merge_frac: float = 0.25,
+    use_existing_tiles: bool = False,
     apply_fp_fix: bool = True,
     fp_fix_dem_res: float | None = None,
     fp_fix_nonground_to_ground_max_z: float = 0.0,
@@ -717,6 +858,8 @@ def run_fastgc(
         log_info(f"FP-fix DEM resolution: {grid_res if fp_fix_dem_res is None else fp_fix_dem_res}")
 
     if workflow == "run":
+        if use_existing_tiles:
+            log_info("--use_existing_tiles ignored for workflow=run; processing input path directly.")
         if _contains_downstream_only_products(resolved_products):
             raise ValueError(
                 "FAST_CHANGE, FAST_ITD, and FAST_TREECLOUDS are downstream-only products. "
@@ -842,6 +985,7 @@ def run_fastgc(
                 recursive=recursive,
                 overwrite_tiles=overwrite_tiles,
                 small_tile_merge_frac=small_tile_merge_frac,
+                use_existing_tiles=use_existing_tiles,
             )
             workspace_root = Path(workspace_manifest["workspace_root"])
             processed_root = _resolve_processed_root(workspace_root, sensor_mode)
@@ -1275,6 +1419,7 @@ def run_fastgc(
             recursive=recursive,
             overwrite_tiles=overwrite_tiles,
             small_tile_merge_frac=small_tile_merge_frac,
+            use_existing_tiles=use_existing_tiles,
         )
         workspace_root = Path(manifest["workspace_root"])
         tiles_dir = Path(manifest["tiles_dir"])

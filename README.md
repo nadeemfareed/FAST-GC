@@ -1,27 +1,83 @@
 # FAST-GC
 
-!![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
-![Python](https://img.shields.io/badge/python-3.10+-blue)
+<p align="center">
+  <img src="docs/images/fastgc_banner.png" width="100%">
+</p>
+
+## Fully Adaptive Self-Tuning Sensor-Agnostic LiDAR Ground Classification Framework
+
+![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
-![Conda](https://img.shields.io/badge/conda-supported-green)
-![Colab](https://img.shields.io/badge/Google%20Colab-supported-orange)
-![Cloud](https://img.shields.io/badge/cloud-ready-blue)
-[![USGS 3DEP](https://img.shields.io/badge/USGS-3DEP%20Compatible-blue)](https://www.usgs.gov/3d-elevation-program)
 [![OpenTopography](https://img.shields.io/badge/OpenTopography-LiDAR%20Datasets-orange)](https://opentopography.org)
 
-## Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification for LiDAR Point Clouds
+FAST-GC (Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification) is a Python framework for LiDAR ground classification and downstream terrain and canopy workflows across multiple sensor platforms.
 
-FAST-GC (Fully Adaptive Self-Tuning Sensor-Agnostic Ground
+It currently supports:
+
+- ground classification
+- DEM generation
+- DSM generation
+- normalized point cloud generation
+- CHM generation
+- terrain derivatives
+- ITD workflows
+- raster change workflows
+- automatic tiling and tile merging for large datasets
+
+## Supported sensor modes
+
+- `ALS` — Airborne Laser Scanning
+- `ULS` — UAV Laser Scanning
+- `TLS` — Terrestrial Laser Scanning
+
+## Installation
+
+### Install from PyPI
+
+```bash
+pip install fastgc
+
+### Install from source
+git clone https://github.com/nadeemfareed/FAST-GC.git
+cd FAST-GC
+pip install -e .
+
+### Conda environment
+conda env create -f environment.yml
+conda activate fastgc
+pip install -e .
+
+fastgc \
+  --in_path "F:\lidar_data\USA" \
+  --out_dir "F:\FAST_GC_Test" \
+  --sensor_mode ALS \
+  --workflow tile-run-merge \
+  --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_CHM FAST_TERRAIN \
+  --grid_res 0.25 \
+  --dem_method nearest \
+  --dsm_method max \
+  --chm_methods pitfree \
+  --terrain_products all \
+  --apply_fp_fix \
+  --jobs 8 \
+  --joblib_backend loky \
+  --overwrite \
+  --overwrite_tiles
+  
+# FAST-GC (Fully Adaptive Self-Tuning Sensor-Agnostic Ground
 Classification) is a robust LiDAR processing framework designed for
 **automated ground classification and terrain modeling** across multiple
-LiDAR acquisition systems.
+LiDAR acquisition systems. The algorithm is designed from user experience perspective.
+100% Python: can be run on multiple operating systems using command-line
 
 The algorithm is designed to be:
 
 -   **Parameter-free**
 -   **Sensor-agnostic**
--   **Computationally scalable**
--   **Suitable for large LiDAR datasets**
+-   **Computationally scalable - therefore most effficent tiling workflow is implimented**
+-   **Suitable for large LiDAR datasets - input Terabites (TB) of pointclouds (LAS/LAZ)**
+-   **For faster processing and efficent use of compututional resources - supported by joblib_backend**
 
 FAST-GC automatically adapts its processing pipeline according to sensor
 modality and point cloud characteristics, enabling consistent ground
@@ -30,27 +86,26 @@ classification across diverse environments and survey configurations.
 FAST-GC currently supports:
 
 -   ground classification
--   optional false-positive correction (**FP-Fix**)
--   digital elevation model generation
--   digital surface model generation
--   canopy height model generation
+-   digital elevation model/digital terrain model (DEM/DTM) generation
+-   digital surface model generation -spikefree 
+-   canopy height model generation - multiple variants
 -   DEM-normalized LiDAR point clouds
--   terrain derivative generation
--   individual tree detection (**ITD**) workflow scaffold
--   change-analysis workflow scaffold
+-   terrain derivative generation: slope, aspect, curvalture, hillshade,
+-   individual tree detection (**ITD**) - CHM based approaches 
+-   change-analysis: change detection in multiple rasters
 -   automatic tiling and tile merging for large datasets
 
 ------------------------------------------------------------------------
 
 # Article Title
 
-## FAST-GC: Fully Adaptive Self-Tuning Sensor-Agnostic LiDAR Ground Classification Algorithm for forestry, wildfire fuel mapping, and terrain analysis
+## FAST-GC: Fully Adaptive Self-Tuning Sensor-Platform Agnostic Ground Classification Algorithm for Terrestrial Ecosystem
 
 **Authors**\
 Nadeem Fareed et al.
 
 **Manuscript status**\
-Manuscript in preparation.
+Manuscript documenting the FAST-GC will be available soon - check for the updates
 
 ------------------------------------------------------------------------
 
@@ -73,7 +128,7 @@ and acquisition characteristics.
 
 Ground classification is one of the most critical preprocessing steps in
 LiDAR analysis because it directly affects the quality of downstream
-terrain and canopy products.
+terrain and canopy products e.g., CHMs, DEM, 
 
 FAST-GC is designed to provide a unified workflow for:
 
@@ -93,7 +148,6 @@ sensor-adaptive** manner.
 
 -   Sensor-agnostic ground classification
 -   Parameter-free processing pipeline
--   Built-in False Positive correction (**FP-Fix**)
 -   Automatic tiling for massive datasets
 -   Batch processing support
 -   Tile merging for seamless final outputs
@@ -103,38 +157,22 @@ sensor-adaptive** manner.
 -   Support for large wall-to-wall LiDAR processing
 -   Compatible with local, Conda, Colab, and cloud-based workflows
 
-**Outputs include:**
-
-  Output              Description
-  ------------------- -----------------------------------
-  `FAST_GC`           Classified LiDAR point cloud
-  `FAST_DEM`          Digital Elevation Model
-  `FAST_DSM`          Digital Surface Model
-  `FAST_CHM`          Canopy Height Model
-  `FAST_NORMALIZED`   DEM-normalized LiDAR point cloud
-  `FAST_TERRAIN`      Terrain derivatives
-  `FAST_ITD`          Individual tree detection outputs
-  `FAST_CHANGE`       Change detection outputs
-  'FAST_STRUCTURE'    Structural variables for Forest from point clouds
-
-------------------------------------------------------------------------
-
 # FAST-GC Processing Workflow
 
 ``` text
 Input LiDAR
 ↓
-Automatic Tiling (optional)
+Automatic Tiling (optional yet useful for wide area mapping )
 ↓
 Ground Classification
 ↓
-FP-Fix Correction (optional)
+FP-Fix Correction
 ↓
 Final Ground Points
 ↓
 DEM Generation
 ↓
-DSM Generation
+DSM Generation (Can be directly processed on raw point clouds - ground classification is not required for DSM)
 ↓
 Point Cloud Normalization
 ↓
@@ -211,8 +249,9 @@ docs/images/
 ![FAST-GC classified](docs/images/FAST_GC.png)
 
 **Color legend:**
-- Green → Ground points  
-- Blue → Non-ground points
+- Yellow → Ground points  
+- Green → Objects above the terrain (OT): trees, shrubs, buildings
+                                                                   powerlines, electric poles
 
 ------------------------------------------------------------------------
 
@@ -297,11 +336,11 @@ Typical arguments include:
   `tile-run`                     Tile and process in one workflow
 
   `derive-only`                  Derive missing products from existing
-                                 processed outputs
+                                 processed outputs e.g, from FAST_GC tiles with ground points - CHMs can be generated
 
-  `merge`                        Merge tile outputs into mosaics
+  `merge`                        Merge tile outputs into mosaics - combine all tiles into a single raster
 
-  `tile-run-merge`               Full end-to-end tiled workflow
+  `tile-run-merge`               Full end-to-end tiled workflow 
   -----------------------------------------------------------------------
 
 ------------------------------------------------------------------------
@@ -315,16 +354,16 @@ Large LiDAR datasets should be tiled for efficient processing.
   -----------------------------------------------------------------------
   Parameter                        Description
   -------------------------------- --------------------------------------
-  `tile_size_m`                    Size of processing tiles
+  `tile_size_m`                    Size of processing tiles (meters)
 
-  `buffer_m`                       Overlap between tiles
+  `buffer_m`                       Overlap between tiles (meters) - to fix if any tile boundary artefacts
 
-  `sensor_mode`                    ALS / ULS / TLS
+  `sensor_mode`                    ALS / ULS / TLS - User must know which sensor was used.
 
   `small_tile_merge_frac`          Merge very small planned tiles into
-                                   neighbors
+                                   neighbors: when a planned tile is too small for processing
 
-  `overwrite_tiles`                Force tile rebuild
+  `overwrite_tiles`                Force tile rebuild - to overwrite the existing tiles in the output dir.
   -----------------------------------------------------------------------
 ## Example: set working directory or repo paths
 ## if not installed through pip or conda
@@ -397,6 +436,12 @@ FAST-GC can generate terrain products directly from the DEM.
   `FAST_CHM`          Canopy Height Model
   `FAST_NORMALIZED`   DEM-normalized point cloud
   `FAST_TERRAIN`      Terrain derivatives
+   `FAST_STRUCTURE`      Forest canopy derivatives
+   `FAST_ITD`      Individual trees detection using CHM/DSM
+    `FAST_Pointclouds`      segmenting pointclouds to individual trees 
+	                                    using crown.shp or FAST_ITD
+    `FAST_CHANGE`      Algorithms to find the change between mulitple raster
+	                                e.g., CHMs, DSMs, DEM (temporal change analysis)
 
 ## Terrain product abbreviations
 
@@ -473,28 +518,29 @@ Default:
 
 # CHM Algorithms
 
-FAST-GC supports multiple canopy height model algorithms.
+FAST-GC supports multiple CHM algorithms.
 
   -----------------------------------------------------------------------
   Method                      Description
   --------------------------- -------------------------------------------
   `p2r`                       Point-to-raster canopy surface
-
+                                 (transform highest points in the grid to create CHM)
   `p99`                       99th percentile canopy surface
+                                (use only the 99th percentile to create CHM)
 
   `tin`                       Triangulated canopy surface
 
-  `pitfree`                   Pit-free canopy model
+  `pitfree`                   Pit-free canopy model (Khosravipour et al., 2014)
 
   `spikefree`                 Spike-filtered canopy model
 
-  `percentile`                Selector-based CHM workflow
+  `percentile`                Selector-based CHM workflow (Fareed et al., 2026)
 
-  `percentile_top`            Selector-based CHM workflow using upper
+  `percentile_top`            Selector-based CHM workflow using upper (Fareed et al., 2026)
                               canopy heights
 
   `percentile_band`           Selector-based CHM workflow using a
-                              selected canopy-height band
+                              selected canopy-height band (Fareed et al., 2026)
   -----------------------------------------------------------------------
 
 ### CHM selectors
@@ -749,8 +795,8 @@ ALS_tiles/
 
 If you use FAST-GC in research please cite:
 
-**FAST-GC: Fully Adaptive Self-Tuning Sensor-Agnostic Ground
-Classification Algorithm for LiDAR Point Clouds**
+**FAST-GC: Fully Adaptive Self-Tuning Sensor-Platform Agnostic
+Ground Classification Algorithm for Terrestrial Ecosystem **
 
 **Authors**\
 Nadeem Fareed et al.
@@ -761,16 +807,6 @@ Nadeem Fareed et al.
 
 FAST-GC is released under the Apache License 2.0. See the `LICENSE` file
 for details.
-
-------------------------------------------------------------------------
-
-# Acknowledgements
-
-FAST-GC development builds upon advances in:
-
--   LiDAR terrain analysis
--   point-cloud processing
--   open-source geospatial computing
 
 ------------------------------------------------------------------------
 
@@ -878,4 +914,15 @@ fastgc \
   --overwrite
 ```
 
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+
+# Acknowledgements
+
+Funding source during the development of FAST-GC:
+
+The Strategic Environmental Research and Development Program (SERDP) 
+and the Environmental Security Technology Certification Program (ESTCP) – FuelsCraft: 
+An innovative wildland fuel mapping tool for prescribed fire decision support
+ on Department of Defense (DoD) military installations (#RC23-7779)
 ------------------------------------------------------------------------

@@ -1,0 +1,16 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ruff_cache
+.mypy_cache
+dist
+build
+*.egg-info
+_repo_review_*
+tests.zip
+.git.zip
+.github.zip

@@ -1,0 +1,33 @@
+name: Conda Package Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  conda-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+          python-version: "3.10"
+          channels: conda-forge
+          activate-environment: conda-build-env
+
+      - name: Install conda-build
+        shell: bash -l {0}
+        run: |
+          conda install -y conda-build conda-verify anaconda-client
+
+      - name: Build recipe
+        shell: bash -l {0}
+        run: |
+          conda build conda-recipe

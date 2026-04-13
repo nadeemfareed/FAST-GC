@@ -208,7 +208,8 @@ def _safe_window_from_bounds(src, bounds: tuple[float, float, float, float]) -> 
     """
     Build a window safely:
     - intersect requested bounds with src bounds
-    - snap to grid
+    - snap requested bounds to the source pixel grid
+    - use floor for offsets and ceil for ends
     - clamp to raster extent
     - return None for empty/degenerate windows
     """
@@ -219,33 +220,37 @@ def _safe_window_from_bounds(src, bounds: tuple[float, float, float, float]) -> 
     if overlap is None:
         return None
 
-    try:
-        win_f = from_bounds(*overlap, transform=src.transform)
-    except Exception:
+    xmin, ymin, xmax, ymax = overlap
+    xres = float(src.transform.a)
+    yres = abs(float(src.transform.e))
+    left = float(src.transform.c)
+    top = float(src.transform.f)
+
+    # snap outward to the source raster grid
+    xmin_s = left + math.floor((xmin - left) / xres) * xres
+    xmax_s = left + math.ceil((xmax - left) / xres) * xres
+    ymax_s = top - math.floor((top - ymax) / yres) * yres
+    ymin_s = top - math.ceil((top - ymin) / yres) * yres
+
+    xmin_s = max(xmin_s, src.bounds.left)
+    xmax_s = min(xmax_s, src.bounds.right)
+    ymin_s = max(ymin_s, src.bounds.bottom)
+    ymax_s = min(ymax_s, src.bounds.top)
+
+    if xmax_s <= xmin_s or ymax_s <= ymin_s:
         return None
 
-    col_off = math.floor(float(win_f.col_off))
-    row_off = math.floor(float(win_f.row_off))
-    col_end = math.ceil(float(win_f.col_off + win_f.width))
-    row_end = math.ceil(float(win_f.row_off + win_f.height))
-
-    col_off = max(0, col_off)
-    row_off = max(0, row_off)
-    col_end = min(int(src.width), col_end)
-    row_end = min(int(src.height), row_end)
+    col_off = int(max(0, math.floor((xmin_s - left) / xres)))
+    col_end = int(min(src.width, math.ceil((xmax_s - left) / xres)))
+    row_off = int(max(0, math.floor((top - ymax_s) / yres)))
+    row_end = int(min(src.height, math.ceil((top - ymin_s) / yres)))
 
     width = col_end - col_off
     height = row_end - row_off
-
     if width <= 0 or height <= 0:
         return None
 
-    return Window(
-        col_off=int(col_off),
-        row_off=int(row_off),
-        width=int(width),
-        height=int(height),
-    )
+    return Window(col_off=col_off, row_off=row_off, width=width, height=height)
 
 
 def _snap_window_to_grid(src, core_bounds: list[float]) -> Window | None:
@@ -390,7 +395,12 @@ def merge_raster_product(
 
     datasets = [rasterio.open(fp) for fp in trimmed]
     try:
-        mosaic, transform = rio_merge(datasets, method="first")
+        ub = manifest.get("union_bounds")
+        bounds = None
+        if isinstance(ub, (list, tuple)) and len(ub) == 4:
+            xmin, ymin, xmax, ymax = [float(v) for v in ub]
+            bounds = (xmin, ymin, xmax, ymax)
+        mosaic, transform = rio_merge(datasets, method="first", bounds=bounds)
 
         profile = datasets[0].profile.copy()
         profile.update(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Tuple
 
@@ -73,6 +74,92 @@ _STRUCTURE_DEFAULTS: Dict[str, StructureDefaults] = {
     ),
 }
 
+
+
+def _find_tile_manifest_for_path(src_fp: str) -> Path | None:
+    p = Path(src_fp).resolve()
+    for parent in [p.parent, *p.parents]:
+        cand = parent / "tile_manifest.json"
+        if cand.exists():
+            return cand
+    return None
+
+
+def _load_manifest_json(manifest_fp: Path) -> dict | None:
+    try:
+        with manifest_fp.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _match_tile_record(src_fp: str, manifest: dict) -> dict | None:
+    src_path = str(Path(src_fp).resolve())
+    src_name = Path(src_fp).name
+    for tile in manifest.get("tiles", []):
+        tile_path = tile.get("tile_path")
+        if tile_path:
+            try:
+                if str(Path(tile_path).resolve()) == src_path:
+                    return tile
+            except Exception:
+                if str(tile_path) == src_fp:
+                    return tile
+        if str(tile.get("tile_name", "")) == src_name:
+            return tile
+    return None
+
+
+def _safe_parse_crs_from_las_or_manifest(las: laspy.LasData, fp: str | Path):
+    try:
+        crs = las.header.parse_crs()
+    except Exception:
+        crs = None
+
+    if crs is None:
+        try:
+            manifest_fp = _find_tile_manifest_for_path(str(fp))
+            manifest = _load_manifest_json(manifest_fp) if manifest_fp is not None else None
+            tile = _match_tile_record(str(fp), manifest) if manifest is not None else None
+
+            src_candidates: list[str] = []
+            if tile is not None:
+                for key in ("kept_source_paths", "source_paths"):
+                    vals = tile.get(key)
+                    if isinstance(vals, list):
+                        src_candidates.extend([str(v) for v in vals if v])
+                if tile.get("source_path"):
+                    src_candidates.append(str(tile["source_path"]))
+
+            seen = set()
+            for src_fp in src_candidates:
+                if src_fp in seen:
+                    continue
+                seen.add(src_fp)
+                try:
+                    with laspy.open(src_fp) as reader:
+                        crs = reader.header.parse_crs()
+                    if crs is not None:
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            crs = None
+
+    if crs is None:
+        return None
+
+    try:
+        from rasterio.crs import CRS as RioCRS
+        return RioCRS.from_user_input(crs)
+    except Exception:
+        try:
+            if hasattr(crs, "to_wkt"):
+                from rasterio.crs import CRS as RioCRS
+                return RioCRS.from_wkt(crs.to_wkt())
+        except Exception:
+            pass
+    return crs
 
 # =========================================================
 # Public helpers
@@ -515,7 +602,7 @@ def run_structure_from_root(
             na_fill=structure_na_fill,
         )
         result['metrics'] = _filter_metrics(result['metrics'], structure_products)
-        crs = getattr(getattr(las, 'header', None), 'parse_crs', lambda: None)()
+        crs = _safe_parse_crs_from_las_or_manifest(las, fp)
         written = write_structure_rasters(result, out_dir, crs=crs, prefix=dataset_label)
         return {'status':'ok','output':str(out_dir),'written':{k:str(v) for k,v in written.items()}}
 

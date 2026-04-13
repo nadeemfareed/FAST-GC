@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -64,6 +65,134 @@ def _stage_bar(total: int, desc: str, enabled: bool):
     )
 
 
+def _sample_points_xy_from_las(src_fp: str, max_points: int = 250000) -> tuple[np.ndarray, np.ndarray]:
+    las = laspy.read(src_fp)
+    x = np.asarray(las.x, dtype=np.float64)
+    y = np.asarray(las.y, dtype=np.float64)
+    n = int(x.size)
+    if n == 0:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+    if n > max_points:
+        idx = np.random.default_rng(42).choice(n, size=max_points, replace=False)
+        x = x[idx]
+        y = y[idx]
+    return x, y
+
+
+def _grid_point_count_support_stats_xy(x: np.ndarray, y: np.ndarray, cell_m: float) -> dict[str, float]:
+    if x.size == 0:
+        return {
+            "cell_m": float(cell_m),
+            "occupied_cells": 0.0,
+            "total_cells": 0.0,
+            "occupancy_ratio": 0.0,
+            "pointcount_median": float("nan"),
+        }
+
+    xmin = float(np.min(x))
+    ymin = float(np.min(y))
+    ix = np.floor((x - xmin) / float(cell_m)).astype(np.int64)
+    iy = np.floor((y - ymin) / float(cell_m)).astype(np.int64)
+    nx = int(ix.max()) + 1
+    ny = int(iy.max()) + 1
+    total_cells = float(nx * ny)
+    key = iy * nx + ix
+    _, counts = np.unique(key, return_counts=True)
+    occupied = float(counts.size)
+    return {
+        "cell_m": float(cell_m),
+        "occupied_cells": occupied,
+        "total_cells": total_cells,
+        "occupancy_ratio": occupied / total_cells if total_cells > 0 else 0.0,
+        "pointcount_median": float(np.median(counts.astype(np.float64))) if counts.size else float("nan"),
+    }
+
+
+def _compute_support_stats_for_path(src_fp: str) -> dict[str, float]:
+    x, y = _sample_points_xy_from_las(src_fp)
+    n = int(x.size)
+    if n == 0:
+        return {
+            "density_pts_m2": float("nan"),
+            "grid_2m_pointcount_median": float("nan"),
+            "grid_2m_occupancy_ratio": float("nan"),
+            "grid_4m_pointcount_median": float("nan"),
+        }
+
+    xmin = float(np.min(x)); ymin = float(np.min(y)); xmax = float(np.max(x)); ymax = float(np.max(y))
+    area = max(0.0, xmax - xmin) * max(0.0, ymax - ymin)
+    g2 = _grid_point_count_support_stats_xy(x, y, 2.0)
+    g4 = _grid_point_count_support_stats_xy(x, y, 4.0)
+    return {
+        "density_pts_m2": float(n / area) if area > 0 else float("nan"),
+        "grid_2m_pointcount_median": float(g2["pointcount_median"]),
+        "grid_2m_occupancy_ratio": float(g2["occupancy_ratio"]),
+        "grid_4m_pointcount_median": float(g4["pointcount_median"]),
+    }
+
+
+def _find_tile_manifest_for_path(src_fp: str) -> Path | None:
+    p = Path(src_fp).resolve()
+    for parent in [p.parent, *p.parents]:
+        cand = parent / "tile_manifest.json"
+        if cand.exists():
+            return cand
+    return None
+
+
+def _load_manifest_json(manifest_fp: Path) -> dict | None:
+    try:
+        with manifest_fp.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _match_tile_record(src_fp: str, manifest: dict) -> dict | None:
+    src_path = str(Path(src_fp).resolve())
+    src_name = Path(src_fp).name
+    for tile in manifest.get("tiles", []):
+        tile_path = tile.get("tile_path")
+        if tile_path:
+            try:
+                if str(Path(tile_path).resolve()) == src_path:
+                    return tile
+            except Exception:
+                if str(tile_path) == src_fp:
+                    return tile
+        if str(tile.get("tile_name", "")) == src_name:
+            return tile
+    return None
+
+
+def _adaptive_support_context_for_input(src_fp: str) -> tuple[dict[str, float] | None, dict[str, float] | None]:
+    manifest_fp = _find_tile_manifest_for_path(src_fp)
+    if manifest_fp is not None:
+        manifest = _load_manifest_json(manifest_fp)
+        if manifest is not None:
+            tile = _match_tile_record(src_fp, manifest)
+            dataset_stats = manifest.get("adaptive_support_summary") or {}
+            if tile is not None:
+                tile_stats = {
+                    "density_pts_m2": tile.get("density_pts_m2"),
+                    "grid_2m_pointcount_median": tile.get("grid_2m_pointcount_median"),
+                    "grid_2m_occupancy_ratio": tile.get("grid_2m_occupancy_ratio"),
+                    "grid_4m_pointcount_median": tile.get("grid_4m_pointcount_median"),
+                }
+                return tile_stats, dataset_stats
+            if dataset_stats:
+                return None, dataset_stats
+
+    support = _compute_support_stats_for_path(src_fp)
+    dataset_stats = {
+        "density_pts_m2_median": support.get("density_pts_m2"),
+        "grid_2m_pointcount_median_median": support.get("grid_2m_pointcount_median"),
+        "grid_2m_occupancy_ratio_median": support.get("grid_2m_occupancy_ratio"),
+        "grid_4m_pointcount_median_median": support.get("grid_4m_pointcount_median"),
+    }
+    return support, dataset_stats
+
+
 def _candidate_layer_by_cellmin(
     x: np.ndarray,
     y: np.ndarray,
@@ -101,11 +230,41 @@ def _candidate_layer_by_cellmin(
     return keep
 
 
-def _safe_parse_crs(las):
+def _safe_parse_crs(las, *, fallback_fp: str | None = None):
     try:
         crs = las.header.parse_crs()
     except Exception:
         crs = None
+
+    if crs is None and fallback_fp:
+        try:
+            manifest_fp = _find_tile_manifest_for_path(fallback_fp)
+            manifest = _load_manifest_json(manifest_fp) if manifest_fp is not None else None
+            tile = _match_tile_record(fallback_fp, manifest) if manifest is not None else None
+
+            src_candidates: list[str] = []
+            if tile is not None:
+                for key in ("kept_source_paths", "source_paths"):
+                    vals = tile.get(key)
+                    if isinstance(vals, list):
+                        src_candidates.extend([str(v) for v in vals if v])
+                if tile.get("source_path"):
+                    src_candidates.append(str(tile["source_path"]))
+
+            seen = set()
+            for src_fp in src_candidates:
+                if src_fp in seen:
+                    continue
+                seen.add(src_fp)
+                try:
+                    with laspy.open(src_fp) as reader:
+                        crs = reader.header.parse_crs()
+                    if crs is not None:
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            crs = None
 
     if crs is None:
         return None
@@ -139,7 +298,7 @@ def _read_las(fp: str):
     except Exception:
         pass
 
-    crs = _safe_parse_crs(las)
+    crs = _safe_parse_crs(las, fallback_fp=fp)
     return las, x, y, z, cls, crs
 
 
@@ -1537,8 +1696,25 @@ def classify_ground_file(in_path: str, out_path: str, cfg: dict, show_progress: 
     bar.close()
 
 
-def classify_ground_path(in_path: str, out_dir: str, sensor_mode: str, show_progress: bool = False) -> str:
-    cfg = sensor_defaults(sensor_mode)
+def classify_ground_path(
+    in_path: str,
+    out_dir: str,
+    sensor_mode: str,
+    show_progress: bool = False,
+    *,
+    tile_support_stats: dict[str, float] | None = None,
+    dataset_support_stats: dict[str, float] | None = None,
+    adaptive: bool = True,
+) -> str:
+    if adaptive and (tile_support_stats is None and dataset_support_stats is None):
+        tile_support_stats, dataset_support_stats = _adaptive_support_context_for_input(in_path)
+
+    cfg = sensor_defaults(
+        sensor_mode,
+        tile_support_stats=tile_support_stats,
+        dataset_support_stats=dataset_support_stats,
+        adaptive=adaptive,
+    )
     os.makedirs(out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(in_path))[0]
     out_path = os.path.join(out_dir, f"{base}.las")

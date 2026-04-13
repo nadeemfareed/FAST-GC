@@ -242,8 +242,11 @@ def main(argv=None):
         dest="chm_methods",
         nargs="+",
         default=None,
-        choices=CHM_MULTI_METHOD_CHOICES,
-        help="Optional list of CHM methods to generate in one run, e.g. p2r p99 pitfree csf_chm spikefree.",
+        help=(
+            "Optional list of CHM targets to generate in one run. Supports plain methods "
+            "(e.g. p2r p99 pitfree csf_chm spikefree) and custom selector specs, e.g. "
+            "'percentile_top:pitfree:low=5' or 'percentile:pitfree:pct=5'."
+        ),
     )
     parser.add_argument(
         "--chm_surface_method",
@@ -694,6 +697,14 @@ def main(argv=None):
         help="Merge planned tiles smaller than this fraction into a neighbor.",
     )
     parser.add_argument(
+        "--use_existing_tiles",
+        "--use-existing-tiles",
+        dest="use_existing_tiles",
+        action="store_true",
+        default=False,
+        help="Treat input folder as already tiled data, build a manifest from existing tiles, and reuse them downstream without retiling.",
+    )
+    parser.add_argument(
         "--cleanup_tiles",
         "--cleanup-tiles",
         dest="cleanup_tiles",
@@ -834,6 +845,7 @@ def main(argv=None):
         cleanup_tiles=args.cleanup_tiles,
         overwrite_tiles=args.overwrite_tiles,
         small_tile_merge_frac=args.small_tile_merge_frac,
+        use_existing_tiles=args.use_existing_tiles,
         apply_fp_fix=args.apply_fp_fix,
         fp_fix_dem_res=args.fp_fix_dem_res,
         fp_fix_nonground_to_ground_max_z=args.fp_fix_nonground_to_ground_max_z,

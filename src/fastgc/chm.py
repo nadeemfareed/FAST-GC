@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -63,11 +64,76 @@ def _require_rasterio():
         raise RuntimeError("rasterio is required for CHM GeoTIFF outputs.")
 
 
-def _safe_parse_crs(las: laspy.LasData):
+
+def _find_tile_manifest_for_path(src_fp: str) -> Path | None:
+    p = Path(src_fp).resolve()
+    for parent in [p.parent, *p.parents]:
+        cand = parent / "tile_manifest.json"
+        if cand.exists():
+            return cand
+    return None
+
+
+def _load_manifest_json(manifest_fp: Path) -> dict | None:
+    try:
+        with manifest_fp.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _match_tile_record(src_fp: str, manifest: dict) -> dict | None:
+    src_path = str(Path(src_fp).resolve())
+    src_name = Path(src_fp).name
+    for tile in manifest.get("tiles", []):
+        tile_path = tile.get("tile_path")
+        if tile_path:
+            try:
+                if str(Path(tile_path).resolve()) == src_path:
+                    return tile
+            except Exception:
+                if str(tile_path) == src_fp:
+                    return tile
+        if str(tile.get("tile_name", "")) == src_name:
+            return tile
+    return None
+
+
+def _safe_parse_crs(las: laspy.LasData, *, fallback_fp: str | None = None):
     try:
         crs = las.header.parse_crs()
     except Exception:
         crs = None
+
+    if crs is None and fallback_fp:
+        try:
+            manifest_fp = _find_tile_manifest_for_path(fallback_fp)
+            manifest = _load_manifest_json(manifest_fp) if manifest_fp is not None else None
+            tile = _match_tile_record(fallback_fp, manifest) if manifest is not None else None
+
+            src_candidates: list[str] = []
+            if tile is not None:
+                for key in ("kept_source_paths", "source_paths"):
+                    vals = tile.get(key)
+                    if isinstance(vals, list):
+                        src_candidates.extend([str(v) for v in vals if v])
+                if tile.get("source_path"):
+                    src_candidates.append(str(tile["source_path"]))
+
+            seen = set()
+            for src_fp in src_candidates:
+                if src_fp in seen:
+                    continue
+                seen.add(src_fp)
+                try:
+                    with laspy.open(src_fp) as reader:
+                        crs = reader.header.parse_crs()
+                    if crs is not None:
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            crs = None
 
     if crs is None:
         return None
@@ -93,7 +159,7 @@ def _read_las(fp: str):
     x = np.asarray(las.x, dtype=np.float64)
     y = np.asarray(las.y, dtype=np.float64)
     z = np.asarray(las.z, dtype=np.float64)
-    crs = _safe_parse_crs(las)
+    crs = _safe_parse_crs(las, fallback_fp=fp)
 
     return_number = None
     number_of_returns = None

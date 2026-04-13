@@ -5,7 +5,14 @@ import numpy as np
 from scipy.ndimage import binary_dilation, label
 
 
-def _bilinear_sample(grid: np.ndarray, x: np.ndarray, y: np.ndarray, x0: float, y0: float, cell: float) -> np.ndarray:
+def _bilinear_sample(
+    grid: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    x0: float,
+    y0: float,
+    cell: float,
+) -> np.ndarray:
     ny, nx = grid.shape
 
     gx = (x - x0) / cell
@@ -16,10 +23,10 @@ def _bilinear_sample(grid: np.ndarray, x: np.ndarray, y: np.ndarray, x0: float, 
     fx = gx - ix
     fy = gy - iy
 
-    ix0 = np.clip(ix, 0, nx - 2)
-    iy0 = np.clip(iy, 0, ny - 2)
-    ix1 = ix0 + 1
-    iy1 = iy0 + 1
+    ix0 = np.clip(ix, 0, max(0, nx - 2))
+    iy0 = np.clip(iy, 0, max(0, ny - 2))
+    ix1 = np.clip(ix0 + 1, 0, nx - 1)
+    iy1 = np.clip(iy0 + 1, 0, ny - 1)
 
     g00 = grid[iy0, ix0]
     g10 = grid[iy0, ix1]
@@ -43,7 +50,7 @@ def _bilinear_sample(grid: np.ndarray, x: np.ndarray, y: np.ndarray, x0: float, 
 def _fit_plane(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray):
     """
     Fit z = ax + by + c using least squares.
-    Returns (ok, (a,b,c))
+    Returns (ok, (a, b, c)).
     """
     if xs.size < 3:
         return False, (0.0, 0.0, 0.0)
@@ -55,6 +62,47 @@ def _fit_plane(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray):
         return True, (float(a), float(b), float(c))
     except Exception:
         return False, (0.0, 0.0, 0.0)
+
+
+def _build_support_grids(
+    xw: np.ndarray,
+    yw: np.ndarray,
+    zw: np.ndarray,
+    ground_mask: np.ndarray,
+    *,
+    cell: float,
+):
+    """
+    Build candidate occupancy and final-ground occupancy at parent-grid resolution.
+    Also stores per-cell point indices and minimum ground z.
+    """
+    x0 = float(np.min(xw))
+    y0 = float(np.min(yw))
+
+    ix = np.floor((xw - x0) / cell).astype(np.int32)
+    iy = np.floor((yw - y0) / cell).astype(np.int32)
+    nx = int(ix.max()) + 1
+    ny = int(iy.max()) + 1
+
+    cand_occ = np.zeros((ny, nx), dtype=bool)
+    ground_occ = np.zeros((ny, nx), dtype=bool)
+    ground_zmin = np.full((ny, nx), np.nan, dtype=np.float64)
+    cell_to_points: dict[int, list[int]] = {}
+
+    for p in range(xw.size):
+        cx = int(ix[p])
+        cy = int(iy[p])
+        cand_occ[cy, cx] = True
+        lin = cy * nx + cx
+        cell_to_points.setdefault(lin, []).append(p)
+
+        if ground_mask[p]:
+            ground_occ[cy, cx] = True
+            cur = ground_zmin[cy, cx]
+            if not np.isfinite(cur) or zw[p] < cur:
+                ground_zmin[cy, cx] = zw[p]
+
+    return x0, y0, ix, iy, nx, ny, cand_occ, ground_occ, ground_zmin, cell_to_points
 
 
 def recover_ground_in_voids(
@@ -70,18 +118,16 @@ def recover_ground_in_voids(
     cfg: dict,
 ) -> np.ndarray:
     """
-    Targeted void recovery on candidate-layer points only.
+    Void-aware ground recovery.
 
-    Workflow:
-      1) Build XY occupancy of candidate layer and final ground.
-      2) Find voids where candidate exists but final ground is missing.
-      3) Restrict to slope / slope-break neighborhoods.
-      4) Reject candidate cells with high vertical diversity.
-      5) Compare lowest candidate bin with neighboring final-ground bins.
-      6) Promote only the lowest candidate bin where terrain continuity is likely.
+    Main idea:
+      1) Build a support/void raster from the current final ground using a parent grid.
+      2) Find coherent voids where candidate points exist but final ground support is absent.
+      3) For each void, inspect a small buffer ring (bank) around the void.
+      4) Promote only non-ground points inside the void whose z matches the bank-defined
+         local surface continuation.
 
-    This is designed to patch abrupt transition zones without jeopardizing
-    the existing stable final ground.
+    This is designed for ALS / ULS and avoids promoting canopy points inside big canopy voids.
     """
     sm = str(sensor_mode).upper().strip()
     out_mask = np.asarray(ground_mask, dtype=bool).copy()
@@ -96,125 +142,116 @@ def recover_ground_in_voids(
     if not enabled:
         return out_mask
 
-    cell = float(cfg.get("void_recover_cell_m", surf_cell))
-    ground_buffer_m = float(cfg.get("void_recover_ground_buffer_m", 5.0))
-    slope_thr_deg = float(cfg.get("void_recover_slope_thr_deg", 6.0))
-    slope_break_thr = float(cfg.get("void_recover_slope_break_thr", 0.08))
+    # Parent grid / void controls
+    cell = float(cfg.get("void_recover_cell_m", 2.0))
+    void_buffer_m = float(cfg.get("void_recover_void_buffer_m", 0.5))
     min_component_cells = int(cfg.get("void_recover_min_component_cells", 2))
     max_component_cells = int(cfg.get("void_recover_max_component_cells", 500))
+    min_void_points = int(cfg.get("void_recover_min_void_points", 1))
+
+    # Compactness rejection for candidate points in a cell
     bin_dz = float(cfg.get("void_recover_bin_dz_m", 0.20))
     max_bins = int(cfg.get("void_recover_max_bins", 2))
     z_std_thr = float(cfg.get("void_recover_z_std_thr_m", 0.12))
     z_span_thr = float(cfg.get("void_recover_z_span_thr_m", 0.35))
-    z_tol = float(cfg.get("void_recover_z_tol_m", 0.18))
+
+    # Bank comparison / interpolation checks
+    min_bank_ground_points = int(cfg.get("void_recover_min_bank_ground_points", 6))
+    bank_match_tol = float(cfg.get("void_recover_bank_match_tol_m", 0.18))
     plane_tol = float(cfg.get("void_recover_plane_tol_m", 0.18))
-    neighbor_radius_cells = int(cfg.get("void_recover_neighbor_radius_cells", 2))
-    min_neighbor_ground_cells = int(cfg.get("void_recover_min_neighbor_ground_cells", 4))
+    surface_tol = float(cfg.get("void_recover_surface_tol_m", 0.18))
+    use_surface_anchor = bool(cfg.get("void_recover_use_surface_anchor", True))
 
-    x0 = float(np.min(xw))
-    y0 = float(np.min(yw))
+    # Promotion selection
+    above_tol = float(cfg.get("void_recover_above_tol_m", 0.04))
+    max_abs_resid = float(cfg.get("void_recover_max_abs_resid_m", 0.18))
+    promote_cluster_dz = float(cfg.get("void_recover_promote_cluster_dz_m", 0.05))
+    promote_one_per_void_cell = bool(cfg.get("void_recover_promote_one_per_void_cell", False))
 
-    ix = np.floor((xw - x0) / cell).astype(np.int32)
-    iy = np.floor((yw - y0) / cell).astype(np.int32)
+    (
+        x0,
+        y0,
+        ix,
+        iy,
+        nx,
+        ny,
+        cand_occ,
+        ground_occ,
+        ground_zmin,
+        cell_to_points,
+    ) = _build_support_grids(
+        xw,
+        yw,
+        zw,
+        out_mask,
+        cell=cell,
+    )
 
-    nx = int(ix.max()) + 1
-    ny = int(iy.max()) + 1
-
-    cand_occ = np.zeros((ny, nx), dtype=bool)
-    ground_occ = np.zeros((ny, nx), dtype=bool)
-    ground_zmin = np.full((ny, nx), np.nan, dtype=np.float64)
-
-    # cell -> candidate point indices
-    cell_to_points: dict[int, list[int]] = {}
-
-    for p in range(xw.size):
-        cx = int(ix[p])
-        cy = int(iy[p])
-
-        cand_occ[cy, cx] = True
-        lin = cy * nx + cx
-        if lin not in cell_to_points:
-            cell_to_points[lin] = [p]
-        else:
-            cell_to_points[lin].append(p)
-
-        if out_mask[p]:
-            ground_occ[cy, cx] = True
-            cur = ground_zmin[cy, cx]
-            if not np.isfinite(cur) or zw[p] < cur:
-                ground_zmin[cy, cx] = zw[p]
-
-    # Candidate cells where final ground is missing
+    # Void = candidate points exist but final ground support absent
     void = cand_occ & (~ground_occ)
-
     if not np.any(void):
         return out_mask
 
-    # Must be near existing final ground
-    buffer_cells = max(1, int(math.ceil(ground_buffer_m / cell)))
-    ground_near = binary_dilation(ground_occ, iterations=buffer_cells)
-    void &= ground_near
-
-    if not np.any(void):
-        return out_mask
-
-    # Slope / slope-break mask from the existing voted surface
-    gy, gx = np.gradient(surf_z.astype(np.float64), float(surf_cell), float(surf_cell))
-    slope_mag = np.sqrt(gx * gx + gy * gy)
-    lap = np.zeros_like(surf_z, dtype=np.float64)
-    lap[1:-1, 1:-1] = (
-        surf_z[1:-1, :-2] + surf_z[1:-1, 2:]
-        + surf_z[:-2, 1:-1] + surf_z[2:, 1:-1]
-        - 4.0 * surf_z[1:-1, 1:-1]
-    ) / max(float(surf_cell), 1e-6)
-
-    cx_coords = x0 + (np.arange(nx, dtype=np.float64) + 0.5) * cell
-    cy_coords = y0 + (np.arange(ny, dtype=np.float64) + 0.5) * cell
-    XX, YY = np.meshgrid(cx_coords, cy_coords)
-
-    slope_here = _bilinear_sample(slope_mag, XX.ravel(), YY.ravel(), sx0, sy0, float(surf_cell)).reshape(ny, nx)
-    lap_here = _bilinear_sample(lap, XX.ravel(), YY.ravel(), sx0, sy0, float(surf_cell)).reshape(ny, nx)
-
-    slope_thr = math.tan(math.radians(slope_thr_deg))
-    slope_zone = (slope_here >= slope_thr) | (np.abs(lap_here) >= slope_break_thr)
-
-    void &= slope_zone
-
-    if not np.any(void):
-        return out_mask
-
-    # Keep only connected systematic voids
+    # Connected voids
     structure = np.ones((3, 3), dtype=np.int32)
     labels, nlab = label(void, structure=structure)
 
-    keep_void = np.zeros_like(void, dtype=bool)
-    for lab_id in range(1, nlab + 1):
-        comp = labels == lab_id
-        n = int(np.count_nonzero(comp))
-        if min_component_cells <= n <= max_component_cells:
-            keep_void |= comp
-
-    void = keep_void
-    if not np.any(void):
+    if nlab == 0:
         return out_mask
 
-    # Promotion pass
-    for cy in range(ny):
-        for cx in range(nx):
-            if not void[cy, cx]:
-                continue
+    buffer_cells = max(1, int(math.ceil(void_buffer_m / max(cell, 1e-6))))
 
+    for lab_id in range(1, nlab + 1):
+        comp = labels == lab_id
+        n_cells = int(np.count_nonzero(comp))
+        if n_cells < min_component_cells or n_cells > max_component_cells:
+            continue
+
+        # ring around the void = bank
+        comp_buffer = binary_dilation(comp, iterations=buffer_cells)
+        bank = comp_buffer & (~comp)
+
+        if not np.any(bank):
+            continue
+
+        bank_ground_cells = bank & ground_occ
+        if not np.any(bank_ground_cells):
+            continue
+
+        bank_ground_z = ground_zmin[bank_ground_cells]
+        bank_ground_z = bank_ground_z[np.isfinite(bank_ground_z)]
+        if bank_ground_z.size < min_bank_ground_points:
+            continue
+
+        # robust local bank-defined surface
+        bank_med = float(np.median(bank_ground_z))
+        bank_q10 = float(np.percentile(bank_ground_z, 10.0))
+
+        # collect bank ground cell centers for optional plane fit
+        by, bx = np.where(bank_ground_cells)
+        bank_x = x0 + (bx.astype(np.float64) + 0.5) * cell
+        bank_y = y0 + (by.astype(np.float64) + 0.5) * cell
+        ok_plane, plane = _fit_plane(bank_x, bank_y, bank_ground_z)
+
+        comp_cells_y, comp_cells_x = np.where(comp)
+        for cy, cx in zip(comp_cells_y.tolist(), comp_cells_x.tolist()):
             lin = cy * nx + cx
             pts = cell_to_points.get(lin, None)
             if not pts:
                 continue
 
             pts_idx = np.asarray(pts, dtype=np.int32)
-            zc = zw[pts_idx]
-            if zc.size == 0:
+            if pts_idx.size < min_void_points:
                 continue
 
-            # Vertical diversity rejection
+            # only consider currently non-ground points for recovery
+            pts_idx = pts_idx[~out_mask[pts_idx]]
+            if pts_idx.size == 0:
+                continue
+
+            zc = zw[pts_idx]
+
+            # reject vertically diverse cell contents - likely vegetation
             z0 = float(np.min(zc))
             bins = np.floor((zc - z0) / max(bin_dz, 1e-6)).astype(np.int32)
             nbins = int(np.unique(bins).size)
@@ -228,50 +265,66 @@ def recover_ground_in_voids(
             if zspan > z_span_thr:
                 continue
 
-            lowest_bin = int(np.min(bins))
-            low_sel = bins == lowest_bin
-            low_pts = pts_idx[low_sel]
-            if low_pts.size == 0:
-                continue
+            cx0 = x0 + (cx + 0.5) * cell
+            cy0 = y0 + (cy + 0.5) * cell
 
-            z_low = float(np.median(zw[low_pts]))
+            target_parts = [bank_med, bank_q10]
 
-            # Surrounding ground cells
-            n_z = []
-            n_x = []
-            n_y = []
-            for yy in range(max(0, cy - neighbor_radius_cells), min(ny, cy + neighbor_radius_cells + 1)):
-                for xx in range(max(0, cx - neighbor_radius_cells), min(nx, cx + neighbor_radius_cells + 1)):
-                    if yy == cy and xx == cx:
-                        continue
-                    zv = ground_zmin[yy, xx]
-                    if np.isfinite(zv):
-                        n_z.append(float(zv))
-                        n_x.append(x0 + (xx + 0.5) * cell)
-                        n_y.append(y0 + (yy + 0.5) * cell)
-
-            if len(n_z) < min_neighbor_ground_cells:
-                continue
-
-            n_z = np.asarray(n_z, dtype=np.float64)
-            n_x = np.asarray(n_x, dtype=np.float64)
-            n_y = np.asarray(n_y, dtype=np.float64)
-
-            # Compare to surrounding ground bins
-            z_med = float(np.median(n_z))
-            if abs(z_low - z_med) > z_tol:
-                continue
-
-            ok_plane, plane = _fit_plane(n_x, n_y, n_z)
             if ok_plane:
                 a, b, c = plane
-                cx0 = x0 + (cx + 0.5) * cell
-                cy0 = y0 + (cy + 0.5) * cell
-                z_pred = a * cx0 + b * cy0 + c
-                if abs(z_low - z_pred) > plane_tol:
-                    continue
+                z_plane = a * cx0 + b * cy0 + c
+                target_parts.append(float(z_plane))
+            else:
+                z_plane = np.nan
 
-            # Passed all tests: promote only the lowest-bin candidate points
-            out_mask[low_pts] = True
+            if use_surface_anchor:
+                z_surf = float(
+                    _bilinear_sample(
+                        surf_z,
+                        np.array([cx0], dtype=np.float64),
+                        np.array([cy0], dtype=np.float64),
+                        sx0,
+                        sy0,
+                        float(surf_cell),
+                    )[0]
+                )
+                if np.isfinite(z_surf):
+                    target_parts.append(z_surf)
+            else:
+                z_surf = np.nan
+
+            z_target = float(np.median(np.asarray(target_parts, dtype=np.float64)))
+
+            # consistency checks against bank / plane / surface
+            if abs(z_target - bank_med) > bank_match_tol:
+                continue
+            if np.isfinite(z_plane) and abs(z_target - z_plane) > plane_tol:
+                continue
+            if np.isfinite(z_surf) and abs(z_target - z_surf) > surface_tol:
+                continue
+
+            resid = zc - z_target
+            valid = np.abs(resid) <= max_abs_resid
+            valid &= resid <= above_tol
+
+            if not np.any(valid):
+                continue
+
+            cand_idx = pts_idx[valid]
+            cand_resid = resid[valid]
+            cand_z = zw[cand_idx]
+
+            best_local = int(np.argmin(np.abs(cand_resid)))
+            best_idx = int(cand_idx[best_local])
+            best_z = float(zw[best_idx])
+
+            if promote_one_per_void_cell:
+                out_mask[best_idx] = True
+            else:
+                promote_sel = np.abs(cand_z - best_z) <= promote_cluster_dz
+                if not np.any(promote_sel):
+                    out_mask[best_idx] = True
+                else:
+                    out_mask[cand_idx[promote_sel]] = True
 
     return out_mask

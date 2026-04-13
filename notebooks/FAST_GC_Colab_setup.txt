@@ -1,0 +1,16 @@
+FAST-GC Google Colab setup
+
+1. Clone the repository
+   !git clone https://github.com/nadeemfareed/FAST-GC.git
+
+2. Change into the repo
+   %cd FAST-GC
+
+3. Install the package
+   !pip install -e .
+
+4. Check the CLI
+   !fastgc --help
+
+5. Example command
+   !fastgc --in_path "/content/sample.las" --out_dir "/content/out" --sensor_mode ALS --workflow tile-run-merge --products FAST_GC FAST_DEM

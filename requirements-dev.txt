@@ -1,7 +1,6 @@
 pytest>=8.0
 build>=1.2
 twine>=5.0
-
 ruff>=0.6
-black
-pre-commit
+black>=24.0
+pre-commit>=3.0

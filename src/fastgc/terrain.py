@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 try:
     import rasterio
@@ -61,10 +62,6 @@ def _resolve_terrain_products(products: list[str] | None) -> list[str]:
     return out
 
 
-def _existing_output(path: Path) -> bool:
-    return path.exists() and path.is_file()
-
-
 def _read_dem(dem_fp: str):
     _require_rasterio()
     with rasterio.open(dem_fp) as src:
@@ -116,10 +113,10 @@ def _apply_valid_mask(arr: np.ndarray, valid_mask: np.ndarray, nodata) -> np.nda
 
 def _nanmean_filter(arr: np.ndarray, radius: int) -> np.ndarray:
     if radius <= 0:
-        return arr.copy()
+        return arr.astype(np.float32, copy=True)
 
     h, w = arr.shape
-    out = np.full_like(arr, np.nan, dtype=np.float32)
+    out = np.full((h, w), np.nan, dtype=np.float32)
 
     for r in range(h):
         r0 = max(0, r - radius)
@@ -135,37 +132,17 @@ def _nanmean_filter(arr: np.ndarray, radius: int) -> np.ndarray:
 
 
 def _fill_nan_with_nearest(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    valid = np.isfinite(arr)
+    if np.all(valid):
+        return arr.copy()
+    if not np.any(valid):
+        return np.zeros_like(arr, dtype=np.float32)
+
+    _, inds = distance_transform_edt(~valid, return_indices=True)
     out = arr.copy()
-    if not np.any(~np.isfinite(out)):
-        return out
-
-    mask = ~np.isfinite(out)
-    if np.all(mask):
-        return np.zeros_like(out, dtype=np.float32)
-
-    for _ in range(max(out.shape)):
-        if not np.any(mask):
-            break
-
-        updated = out.copy()
-        h, w = out.shape
-        for r in range(h):
-            r0 = max(0, r - 1)
-            r1 = min(h, r + 2)
-            for c in range(w):
-                if not mask[r, c]:
-                    continue
-                c0 = max(0, c - 1)
-                c1 = min(w, c + 2)
-                win = out[r0:r1, c0:c1]
-                valid = win[np.isfinite(win)]
-                if valid.size:
-                    updated[r, c] = float(valid[0])
-        out = updated
-        mask = ~np.isfinite(out)
-
-    out[~np.isfinite(out)] = 0.0
-    return out.astype(np.float32)
+    out[~valid] = arr[inds[0][~valid], inds[1][~valid]]
+    return out.astype(np.float32, copy=False)
 
 
 def _gradients(dem: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray]:
@@ -174,9 +151,106 @@ def _gradients(dem: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.nd
     return dzdx.astype(np.float32), dzdy.astype(np.float32)
 
 
+def _cellsize_mean(dx: float, dy: float) -> float:
+    return 0.5 * (float(dx) + float(dy))
+
+
+def _d8_flow_receivers(dem: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray]:
+    dem_fill = _fill_nan_with_nearest(dem).astype(np.float64, copy=False)
+    h, w = dem_fill.shape
+    pad = np.pad(dem_fill, 1, mode="edge")
+
+    offsets = [
+        (-1, -1, (dx * dx + dy * dy) ** 0.5),
+        (-1,  0, dy),
+        (-1,  1, (dx * dx + dy * dy) ** 0.5),
+        ( 0, -1, dx),
+        ( 0,  1, dx),
+        ( 1, -1, (dx * dx + dy * dy) ** 0.5),
+        ( 1,  0, dy),
+        ( 1,  1, (dx * dx + dy * dy) ** 0.5),
+    ]
+
+    center = dem_fill
+    best_slope = np.zeros((h, w), dtype=np.float64)
+    best_dir = np.full((h, w), -1, dtype=np.int8)
+
+    for k, (oy, ox, dist) in enumerate(offsets):
+        neigh = pad[1 + oy:1 + oy + h, 1 + ox:1 + ox + w]
+        slope = (center - neigh) / max(dist, 1e-9)
+        better = slope > best_slope
+        best_slope[better] = slope[better]
+        best_dir[better] = k
+
+    flat = np.arange(h * w, dtype=np.int64).reshape(h, w)
+    recv = np.full((h, w), -1, dtype=np.int64)
+
+    for k, (oy, ox, _dist) in enumerate(offsets):
+        mask = best_dir == k
+        if not np.any(mask):
+            continue
+        yy, xx = np.where(mask)
+        ry = yy + oy
+        rx = xx + ox
+        inside = (ry >= 0) & (ry < h) & (rx >= 0) & (rx < w)
+        if np.any(inside):
+            recv[yy[inside], xx[inside]] = flat[ry[inside], rx[inside]]
+
+    return recv, best_slope.astype(np.float32)
+
+
+def _flow_accumulation_d8(dem: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray]:
+    dem_fill = _fill_nan_with_nearest(dem).astype(np.float64, copy=False)
+    recv, best_slope = _d8_flow_receivers(dem_fill, dx, dy)
+
+    n = dem_fill.size
+    recv_flat = recv.ravel()
+    elev_flat = dem_fill.ravel()
+
+    acc = np.ones(n, dtype=np.float64)
+    order = np.argsort(elev_flat)[::-1]  # high to low
+
+    for idx in order:
+        r = recv_flat[idx]
+        if r >= 0 and r != idx:
+            acc[r] += acc[idx]
+
+    return acc.reshape(dem_fill.shape).astype(np.float32), best_slope
+
+
+def _specific_catchment_area(dem: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray]:
+    acc_cells, best_slope = _flow_accumulation_d8(dem, dx, dy)
+    contour_width = _cellsize_mean(dx, dy)
+    sca = acc_cells * contour_width
+    return sca.astype(np.float32), best_slope.astype(np.float32)
+
+
+def _channel_mask_from_sca(sca: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    valid = np.isfinite(sca)
+    if not np.any(valid):
+        return np.zeros_like(sca, dtype=bool)
+
+    cell_area = float(dx) * float(dy)
+    # Approximate drainage initiation threshold of ~1000 m² upslope area,
+    # but never lower than 50 cells for stability on small rasters.
+    thr_cells = max(50.0, 1000.0 / max(cell_area, 1e-9))
+    contour_width = _cellsize_mean(dx, dy)
+    thr_sca = thr_cells * contour_width
+
+    channels = valid & (sca >= thr_sca)
+    if np.any(channels):
+        return channels
+
+    # Fallback: top 1% of contributing area if threshold is too strict.
+    q = np.nanpercentile(sca[valid], 99.0)
+    channels = valid & (sca >= q)
+    return channels
+
+
 def compute_slope_percent(dem: np.ndarray, dx: float, dy: float) -> np.ndarray:
     dzdx, dzdy = _gradients(dem, dx, dy)
     slope = np.sqrt(dzdx**2 + dzdy**2)
+    # Percent rise is not capped at 100. A 45° slope is 100%, and steeper slopes exceed 100%.
     return (slope * 100.0).astype(np.float32)
 
 
@@ -190,10 +264,12 @@ def compute_aspect(dem: np.ndarray, dx: float, dy: float) -> np.ndarray:
     dzdx, dzdy = _gradients(dem, dx, dy)
     aspect = np.degrees(np.arctan2(dzdy, -dzdx))
     aspect = 90.0 - aspect
-    aspect = np.where(aspect < 0, aspect + 360.0, aspect)
+    aspect = np.where(aspect < 0.0, aspect + 360.0, aspect)
     aspect = np.where(aspect >= 360.0, aspect - 360.0, aspect)
-    slope = np.sqrt(dzdx**2 + dzdy**2)
-    aspect = np.where(slope > 0, aspect, 0.0)
+
+    slope_mag = np.sqrt(dzdx**2 + dzdy**2)
+    # Flat cells should not be encoded as north (0°). Use NaN.
+    aspect = np.where(slope_mag > 1e-8, aspect, np.nan)
     return aspect.astype(np.float32)
 
 
@@ -223,6 +299,7 @@ def compute_curvature(dem: np.ndarray, dx: float, dy: float) -> np.ndarray:
     dzdy, dzdx = np.gradient(dem_fill, dy, dx)
     d2zdx2 = np.gradient(dzdx, dx, axis=1)
     d2zdy2 = np.gradient(dzdy, dy, axis=0)
+    # Simple generalized curvature (Laplacian-style proxy).
     curvature = d2zdx2 + d2zdy2
     return curvature.astype(np.float32)
 
@@ -234,28 +311,54 @@ def compute_tpi(dem: np.ndarray, radius: int = 3) -> np.ndarray:
 
 
 def compute_twi(dem: np.ndarray, dx: float, dy: float, eps: float = 1e-6) -> np.ndarray:
+    sca, _best_slope = _specific_catchment_area(dem, dx, dy)
     slope_deg = compute_slope_degrees(dem, dx, dy)
     slope_rad = np.radians(np.maximum(slope_deg, 0.001))
     tan_beta = np.tan(slope_rad)
-    curv = compute_curvature(dem, dx, dy)
-    acc_proxy = np.maximum(0.0, -curv) + 1.0
-    twi = np.log((acc_proxy + float(eps)) / np.maximum(tan_beta, float(eps)))
+    twi = np.log((sca + float(eps)) / np.maximum(tan_beta, float(eps)))
     return twi.astype(np.float32)
 
 
 def compute_tci(dem: np.ndarray, dx: float, dy: float) -> np.ndarray:
-    curv = compute_curvature(dem, dx, dy)
-    slope = compute_slope_percent(dem, dx, dy)
-    tci = (-curv) / (1.0 + slope / 100.0)
+    dzdx, dzdy = _gradients(dem, dx, dy)
+    gx = -dzdx
+    gy = -dzdy
+    mag = np.sqrt(gx**2 + gy**2)
+
+    ux = np.divide(gx, mag, out=np.zeros_like(gx, dtype=np.float32), where=mag > 1e-8)
+    uy = np.divide(gy, mag, out=np.zeros_like(gy, dtype=np.float32), where=mag > 1e-8)
+
+    duxdx = np.gradient(ux, dx, axis=1)
+    duydy = np.gradient(uy, dy, axis=0)
+
+    # Positive = convergent, negative = divergent.
+    tci = -(duxdx + duydy)
+    tci = np.where(mag > 1e-8, tci, np.nan)
     return tci.astype(np.float32)
 
 
 def compute_dtw(dem: np.ndarray, dx: float, dy: float, max_distance: float | None = None) -> np.ndarray:
     dem_fill = _fill_nan_with_nearest(dem)
-    local_min = _nanmean_filter(dem_fill, radius=3)
-    dtw = np.maximum(0.0, dem_fill - np.minimum(dem_fill, local_min))
+    sca, _best_slope = _specific_catchment_area(dem_fill, dx, dy)
+    channels = _channel_mask_from_sca(sca, dx, dy)
+
+    if not np.any(channels):
+        return np.full_like(dem_fill, np.nan, dtype=np.float32)
+
+    # Distance to nearest channel cell; also retrieve nearest-channel indices.
+    dist, inds = distance_transform_edt(
+        ~channels,
+        sampling=(float(dy), float(dx)),
+        return_indices=True,
+    )
+
+    ch_z = dem_fill[inds[0], inds[1]]
+    dtw = dem_fill - ch_z
+    dtw = np.maximum(dtw, 0.0)
+
     if max_distance is not None:
-        dtw = np.minimum(dtw, float(max_distance))
+        dtw = np.where(dist <= float(max_distance), dtw, np.nan)
+
     return dtw.astype(np.float32)
 
 
