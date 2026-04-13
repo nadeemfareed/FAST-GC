@@ -15,8 +15,9 @@ requirements:
   host:
     - python >=3.10
     - pip
-
-    run:
+    - setuptools >=68
+    - wheel
+  run:
     - python >=3.10
     - numpy >=1.22,<2.0
     - scipy >=1.9,<1.14
