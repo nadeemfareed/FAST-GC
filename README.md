@@ -214,29 +214,12 @@ docs/images/
 
 ## Terrain Products
 
-### Hillshade
-![Hillshade](docs/images/FAST_HILLSHADE.png)
 
 ### Slope
 ![Slope](docs/images/FAST_SLOPE.png)
 
-### Curvature
-![Curvature](docs/images/CURVATURE.png)
-
 ### TWI
 ![TWI](docs/images/TWI.png)
-
-### TPI
-![TPI](docs/images/TPI.png)
-
-### TCI
-![TCI](docs/images/TCI.png)
-
-## Tree Detection (ITD)
-![ITD](docs/images/ITD.png)
-
-## Change Detection
-![Change](docs/images/FAST_CHANGE.png)
 
 ---
 
