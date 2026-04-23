@@ -233,33 +233,6 @@ docs/images/
                                                                    powerlines, electric poles
 
 ------------------------------------------------------------------------
-
-# Installation
-
-FAST-GC can be installed using pip, Conda, or from source.
-
-## Install with pip
-
-``` bash
-pip install fastgc
-```
-
-## Install from source
-
-``` bash
-git clone https://github.com/nadeemfareed/FAST-GC.git
-cd FAST-GC
-pip install -e .
-```
-
-## Conda environment (recommended)
-
-``` bash
-conda create -n fastgc python=3.10
-conda activate fastgc
-pip install fastgc
-```
-
 ------------------------------------------------------------------------
 
 # Cloud and Notebook Support
