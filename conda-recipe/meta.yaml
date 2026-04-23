@@ -3,7 +3,8 @@ package:
   version: "0.2.0"
 
 source:
-  path: ..
+  url: https://files.pythonhosted.org/packages/source/f/fastgc/fastgc-0.2.0.tar.gz
+  sha256: d2e6c09aeeda0f82a08ff86557a60133929f5a561ab2a982dc273ac249398980
 
 build:
   noarch: python
@@ -22,8 +23,6 @@ requirements:
     - numpy >=1.22,<2.0
     - scipy >=1.9,<1.14
     - rasterio >=1.3
-    - fiona >=1.9
-    - shapely >=2.0
     - laspy >=2.4
     - lazrs >=0.6
     - tqdm >=4.64
@@ -31,11 +30,17 @@ requirements:
     - psutil >=5.9
 
 test:
+  imports:
+    - fastgc
   commands:
     - fastgc --help
-    - python -c "import fastgc"
 
 about:
   home: https://github.com/nadeemfareed/FAST-GC
   summary: FAST-GC LiDAR ground classification framework
   license: Apache-2.0
+  license_file: LICENSE
+
+extra:
+  recipe-maintainers:
+    - nadeemfareed
