@@ -196,10 +196,6 @@ Automatic Tiling (optional yet useful for wide area mapping )
 ↓
 Ground Classification
 ↓
-FP-Fix Correction
-↓
-Final Ground Points
-↓
 DEM Generation
 ↓
 DSM Generation (Can be directly processed on raw point clouds - ground classification is not required for DSM)
