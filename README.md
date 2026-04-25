@@ -47,7 +47,34 @@ pip install -e .
 conda env create -f environment.yml
 conda activate fastgc
 pip install -e .
+## Google Colab Quick Start
 
+FAST-GC can also be run directly in Google Colab for small to medium LAS/LAZ files stored in Google Drive.
+
+### 1. Install FAST-GC
+
+```python
+!pip install fastgc
+### 2. mount drive
+from google.colab import drive
+drive.mount('/content/drive')
+### Example run
+!fastgc \
+  --in_path "/content/drive/MyDrive/ABC.las" \
+  --out_dir "/content/drive/MyDrive/ALS_fastgc_output" \
+  --sensor_mode ALS \
+  --workflow tile-run-merge \
+  --tile_size_m 250 \
+  --buffer_m 5 \
+  --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_CHM FAST_TERRAIN \
+  --grid_res 0.5 \
+  --dem_method nearest \
+  --dsm_method nearest \
+  --chm_method pitfree \
+  --jobs 2 \
+  --joblib_backend loky \
+  --overwrite
+### Run on you local machine
 fastgc \
   --in_path "F:\lidar_data\USA" \
   --out_dir "F:\FAST_GC_Test" \
