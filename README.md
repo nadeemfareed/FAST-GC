@@ -49,6 +49,9 @@ conda activate fastgc
 pip install -e .
 ## Google Colab Quick Start
 
+
+
+
 FAST-GC can also be run directly in Google Colab for small to medium LAS/LAZ files stored in Google Drive.
 
 ### 1. Install FAST-GC
