@@ -257,6 +257,9 @@ docs/images/
 ## FAST-GC Classified Point Cloud
 ![FAST-GC classified](docs/images/FAST_GC.png)
 
+## FAST-GC Classified Point Cloud
+![FAST-GC CSF comparison](docs/images/FASTGC.png)
+
 **Color legend:**
 - Red → Ground points  
 - Green → Objects above the terrain (OT): trees, shrubs, buildings
