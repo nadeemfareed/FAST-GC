@@ -1,13 +1,17 @@
+{% set name = "fastgc" %}
+{% set version = "0.2.0" %}
+
 package:
-  name: fastgc
-  version: "0.2.0"
+  name: {{ name|lower }}
+  version: {{ version }}
 
 source:
   path: ..
 
 build:
   noarch: python
-  script: "{{ PYTHON }} -m pip install . --no-deps -vv"
+  number: 0
+  script: "{{ PYTHON }} -m pip install . --no-deps --ignore-installed -vv"
   entry_points:
     - fastgc=fastgc.cli:main
 
@@ -17,6 +21,7 @@ requirements:
     - pip
     - setuptools >=68
     - wheel
+    - setuptools-scm
   run:
     - python >=3.10
     - numpy >=1.22,<2.0
@@ -31,11 +36,17 @@ requirements:
     - psutil >=5.9
 
 test:
+  imports:
+    - fastgc
   commands:
     - fastgc --help
-    - python -c "import fastgc"
 
 about:
   home: https://github.com/nadeemfareed/FAST-GC
   summary: FAST-GC LiDAR ground classification framework
   license: Apache-2.0
+  license_file: LICENSE
+
+extra:
+  recipe-maintainers:
+    - nadeemfareed
