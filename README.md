@@ -4,7 +4,7 @@
   <img src="docs/images/fastgc_banner.png" width="100%">
 </p>
 
-## Fully Adaptive Self-Tuning Sensor-Agnostic LiDAR Ground Classification Framework for Forest Ecosystems and Analysis
+## Fully Adaptive Self-Tuning Sensor-Agnostic LiDAR Ground Classification Framework for Forest Ecosystems Analysis
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
