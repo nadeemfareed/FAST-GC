@@ -642,20 +642,6 @@ Advanced options are available for CHM generation, terrain products,
 ITD, forest structure, tree-cloud extraction, raster change analysis,
 tiling, and parallel processing.
 
-# Validation
-
-The FAST-GC ground-classification methodology has been evaluated across
-multi-platform LiDAR observations including ALS, ULS, and TLS data.
-
-Scientific methodology, benchmark design, accuracy assessment,
-density-sensitivity analysis, and cross-platform evaluation are
-documented in the associated FAST-GC manuscript:
-
-**Fareed, N.; Numata, I.; Silva, C. A.; Prichard, S. J. (2026).**\
-*FAST-GC: A Fully Adaptive Self-Tuning Ground Classification Algorithm
-for Multi-Platform LiDAR Sensors.*
-
-https://www.preprints.org/manuscript/202609.1631
 
 # Citation
 
@@ -678,9 +664,8 @@ citation and DOI when the peer-reviewed article is published.
 **Issues and feature requests:**
 https://github.com/nadeemfareed/FAST-GC/issues
 
-# Author and Software Ownership
+# Author
 
-**Nadeem Fareed**
 
 FAST-GC was conceived, developed, implemented, and is maintained by
 **Nadeem Fareed**.
