@@ -674,7 +674,7 @@ Copyright © 2026 Nadeem Fareed.
 
 # License
 
-FAST-GC is Copyright © 2026 Nadeem Fareed and is licensed under the
+ licensed under the
 **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**.
 
 See `LICENSE` for the complete license terms.
