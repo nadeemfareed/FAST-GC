@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  />
+  <title>FAST-GC Viewer</title>
+</head>
+
+<body>
+<div id="app">
+
+  <aside id="sidebar">
+
+    <header>
+      <h1>FAST-GC Viewer</h1>
+      <div id="dataset">Loading dataset...</div>
+      <div id="metadata"></div>
+    </header>
+
+    <section>
+      <h2>Products</h2>
+      <div id="products"></div>
+    </section>
+
+    <section>
+      <h2>Active display</h2>
+
+      <label>
+        Layer
+        <select id="active-layer"></select>
+      </label>
+
+      <div id="point-controls" hidden>
+
+        <label>
+          Color by
+          <select id="point-attribute"></select>
+        </label>
+
+        <div id="attribute-info" class="hint"></div>
+
+        <div id="scalar-controls" hidden>
+          <label>
+            Palette
+            <select id="point-palette">
+              <option value="terrain">Terrain</option>
+              <option value="viridis">Viridis</option>
+              <option value="turbo">Turbo</option>
+              <option value="inferno">Inferno</option>
+              <option value="gray">Gray</option>
+            </select>
+
+<div
+  id="classification-palette-row"
+  hidden
+>
+  <label for="classification-palette">
+    Classification palette
+  </label>
+
+  <select id="classification-palette">
+    <option value="ASPRS">
+      ASPRS
+    </option>
+    <option value="Ground emphasis">
+      Ground emphasis
+    </option>
+    <option value="High contrast">
+      High contrast
+    </option>
+    <option value="Forest">
+      Forest
+    </option>
+  </select>
+</div>
+
+          </label>
+        </div>
+
+        <label>
+          Point size
+          <input
+            id="point-size"
+            type="range"
+            min="0"
+            max="8"
+            step="0.25"
+            value="0"
+          />
+          <span id="point-size-value">Auto</span>
+        </label>
+
+        <div id="classification-note" class="hint" hidden>
+          Classification uses Giro3D categorical classification colors.
+        </div>
+
+      </div>
+
+      <div id="raster-controls" hidden>
+
+        <label>
+          Palette
+          <select id="raster-palette">
+            <option value="terrain">Terrain</option>
+            <option value="chm">CHM green</option>
+            <option value="viridis">Viridis</option>
+            <option value="turbo">Turbo</option>
+            <option value="inferno">Inferno</option>
+            <option value="gray">Gray</option>
+          </select>
+        </label>
+
+        <label>
+          Stretch
+          <select id="raster-stretch">
+            <option value="auto">Auto 2–98%</option>
+            <option value="full">Full range</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+
+        <div id="raster-custom" hidden>
+          <label>
+            Min
+            <input id="raster-min" type="number" step="any" />
+          </label>
+          <label>
+            Max
+            <input id="raster-max" type="number" step="any" />
+          </label>
+        </div>
+
+        <label>
+          Opacity
+          <input
+            id="raster-opacity"
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value="1"
+          />
+          <span id="raster-opacity-value">100%</span>
+        </label>
+
+        <div id="raster-info" class="hint"></div>
+
+      </div>
+    </section>
+
+    <section>
+      <h2>Point cloud</h2>
+
+      <label>
+        Point budget
+        <input
+          id="point-budget"
+          type="range"
+          min="250000"
+          max="30000000"
+          step="1000000"
+          value="10000000"
+        />
+        <span id="point-budget-value">5,000,000</span>
+      </label>
+
+      <label class="inline">
+        <input id="edl" type="checkbox" checked />
+        Eye-dome lighting
+      </label>
+    </section>
+
+    <section>
+      <h2>View</h2>
+
+      <div id="view-grid">
+        <button data-view="top">Top</button>
+        <button data-view="bottom">Bottom</button>
+        <button data-view="front">Front</button>
+        <button data-view="back">Back</button>
+        <button data-view="left">Left</button>
+        <button data-view="right">Right</button>
+        <button data-view="iso">Isometric</button>
+        <button data-view="fit">Fit</button>
+      </div>
+
+      <div class="hint mouse-help">
+        Left: rotate · Middle: pan · Wheel: zoom · Right: inspect
+      </div>
+    </section>
+
+    <section>
+      <h2>Inspect</h2>
+      <pre id="inspect">Right-click the scene.</pre>
+    </section>
+
+    <section>
+      <h2>Status</h2>
+      <pre id="status">Starting...</pre>
+    </section>
+
+  </aside>
+
+  <main id="viewer">
+    <div id="giro3d-view"></div>
+  </main>
+
+</div>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

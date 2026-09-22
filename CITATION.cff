@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use FAST-GC in research, please cite the software release and the associated FAST-GC publication when available."
+title: "FAST-GC: Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification for LiDAR point clouds"
+type: software
+authors:
+  - family-names: Fareed
+    given-names: Nadeem
+version: 0.2.1
+date-released: 2026-08-08
+repository-code: "https://github.com/nadeemfareed/FAST-GC"
+url: "https://pypi.org/project/fastgc/"
+license: Apache-2.0
+keywords:
+  - LiDAR
+  - ground classification
+  - ALS
+  - ULS
+  - TLS
+  - DEM
+  - CHM

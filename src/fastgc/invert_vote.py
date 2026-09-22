@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import numpy as np
+from scipy.ndimage import median_filter
 
 
 @dataclass
@@ -75,6 +76,36 @@ def _conv1d_nan(a: np.ndarray, k1: np.ndarray, axis: int):
     return out
 
 
+def _fill_nan_median_step(grid: np.ndarray) -> np.ndarray:
+    """One exact 3x3 NaN-median propagation step, vectorized.
+
+    This is mathematically identical to the former nested Python j/i loops:
+    finite cells are frozen; each NaN cell receives the median of finite values
+    in its truncated 3x3 neighborhood; cells with no finite neighbor stay NaN.
+    NaN padding reproduces the old edge truncation exactly.
+    """
+    a=np.asarray(grid,dtype=np.float32)
+    ny,nx=a.shape
+    p=np.pad(a,((1,1),(1,1)),mode='constant',constant_values=np.nan)
+    stack=np.stack([p[dy:dy+ny,dx:dx+nx] for dy in range(3) for dx in range(3)],axis=0)
+    finite=np.isfinite(stack)
+    # Avoid all-NaN warnings while preserving all-NaN cells as NaN.
+    work=np.where(finite,stack,np.inf)
+    count=np.sum(finite,axis=0)
+    # Sort only 9 values per cell; median of finite values is exact, including
+    # the average of the two central values when the support count is even.
+    work.sort(axis=0)
+    lo=np.maximum((count-1)//2,0)
+    hi=count//2
+    yy,xx=np.indices((ny,nx))
+    med=(work[lo,yy,xx]+work[hi,yy,xx])*0.5
+    med[count==0]=np.nan
+    out=a.copy()
+    missing=~np.isfinite(a)
+    out[missing]=med[missing].astype(np.float32,copy=False)
+    return out
+
+
 def _build_point_bins(ix: np.ndarray, iy: np.ndarray, nx: int, ny: int):
     bins = [[] for _ in range(nx * ny)]
     for p in range(ix.size):
@@ -97,62 +128,44 @@ def _initial_surface_from_swipe(
     x_offset: float = 0.0,
     y_offset: float = 0.0,
 ):
+    """Vectorized published lower-support swipe.
+
+    Semantics are unchanged: each offset cell contributes its lowest observed
+    point, which is then mapped back to the base grid and lower-envelope merged.
     """
-    Provisional scalar support surface in inverted space:
-      - invert z -> zp
-      - keep highest zp (lowest z) per swipe cell
-      - map the selected point back to the base grid
-      - merge to one scalar value per base-grid cell
-    """
-    zp = -z
     x0 = x0_base + x_offset
     y0 = y0_base + y_offset
-
     ix = np.floor((x - x0) / cell).astype(np.int32)
     iy = np.floor((y - y0) / cell).astype(np.int32)
-
     valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
-    if not np.any(valid):
-        return np.full((ny, nx), np.nan, dtype=np.float32)
-
-    ixv = ix[valid]
-    iyv = iy[valid]
-    xv = x[valid]
-    yv = y[valid]
-    zv = z[valid]
-    zpv = zp[valid]
-
-    lin = iyv * nx + ixv
-    order = np.argsort(lin, kind="mergesort")
-    lin_s = lin[order]
-    z_s = zv[order]
-    zp_s = zpv[order]
-    x_s = xv[order]
-    y_s = yv[order]
-
     surf = np.full((ny, nx), np.nan, dtype=np.float32)
+    if not np.any(valid):
+        return surf
 
-    p = 0
-    while p < lin_s.size:
-        c = int(lin_s[p])
-        q = p + 1
-        while q < lin_s.size and int(lin_s[q]) == c:
-            q += 1
+    ixv = ix[valid]; iyv = iy[valid]
+    xv = x[valid]; yv = y[valid]; zv = z[valid]
+    lin = iyv.astype(np.int64) * int(nx) + ixv.astype(np.int64)
 
-        loc = p + int(np.argmax(zp_s[p:q]))  # max inverted z == min original z
-        xs = x_s[loc]
-        ys = y_s[loc]
-        zs = z_s[loc]
+    # Sort by swipe-cell then z so the first member of each cell is the
+    # published max-inverted/min-original support point.
+    order = np.lexsort((zv, lin))
+    lin_s = lin[order]
+    first = np.r_[True, lin_s[1:] != lin_s[:-1]]
+    pick = order[first]
 
-        ib = int(np.floor((xs - x0_base) / cell))
-        jb = int(np.floor((ys - y0_base) / cell))
-        if 0 <= ib < nx and 0 <= jb < ny:
-            cur = surf[jb, ib]
-            if not np.isfinite(cur) or zs < cur:
-                surf[jb, ib] = float(zs)
-        p = q
+    xs = xv[pick]; ys = yv[pick]; zs = zv[pick]
+    ib = np.floor((xs - x0_base) / cell).astype(np.int32)
+    jb = np.floor((ys - y0_base) / cell).astype(np.int32)
+    good = (ib >= 0) & (ib < nx) & (jb >= 0) & (jb < ny)
+    if not np.any(good):
+        return surf
 
-    return surf
+    base_lin = jb[good].astype(np.int64) * int(nx) + ib[good].astype(np.int64)
+    vals = zs[good].astype(np.float32, copy=False)
+    flat = np.full(nx * ny, np.inf, dtype=np.float32)
+    np.minimum.at(flat, base_lin, vals)
+    flat[~np.isfinite(flat) | (flat == np.inf)] = np.nan
+    return flat.reshape(ny, nx)
 
 
 def _merge_surfaces_lower(s1: np.ndarray, s2: np.ndarray):
@@ -224,10 +237,28 @@ def _select_surface_snap_points(
     assert x0b == x0 and y0b == y0
 
     ny, nx = provisional.shape
-    bins = _build_point_bins(ix, iy, nx, ny)
     r = int(max(0, cfg.support_snap_radius_cells))
-
     chosen = np.full((ny, nx), np.nan, dtype=np.float32)
+
+    # Published default is radius=0.  Handle that common case without Python
+    # point-bin lists: choose the observed point closest to provisional support
+    # in each occupied base cell.
+    if r == 0:
+        valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+        if np.any(valid):
+            ixv = ix[valid]; iyv = iy[valid]; zv = z[valid]
+            lin = iyv.astype(np.int64) * int(nx) + ixv.astype(np.int64)
+            prov = provisional[iyv, ixv]
+            ok = np.isfinite(prov)
+            if np.any(ok):
+                lin2 = lin[ok]; z2 = zv[ok]; d2 = np.abs(z2 - prov[ok])
+                order = np.lexsort((d2, lin2))
+                ls = lin2[order]
+                first = np.r_[True, ls[1:] != ls[:-1]]
+                chosen.flat[ls[first]] = z2[order[first]].astype(np.float32, copy=False)
+        return chosen
+
+    bins = _build_point_bins(ix, iy, nx, ny)
 
     for j in range(ny):
         for i in range(nx):
@@ -281,6 +312,65 @@ def _select_surface_snap_points(
     return chosen
 
 
+def _robust_quadratic_fit(dx, dy, zz, good0, *, mad_floor: float, max_rz: float):
+    """Compatibility helper retained for the 0.2.1 API; fast backbone does not call it."""
+    if np.count_nonzero(good0) < 10:
+        return None
+    A = np.column_stack((dx, dy, dx*dx, dx*dy, dy*dy, np.ones_like(dx)))
+    try:
+        beta, *_ = np.linalg.lstsq(A[good0], zz[good0], rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    pred = A @ beta
+    rr = zz - pred
+    med = float(np.median(rr[good0]))
+    mad = max(float(np.median(np.abs(rr[good0] - med))), float(mad_floor))
+    scale = max(1.4826 * mad, float(mad_floor))
+    good = np.abs(rr - med) <= float(max_rz) * scale
+    return beta, pred, rr, med, scale, good
+
+
+def _local_plane_vote(snapped, j, i, *, cell, radius_max, min_nei, max_rz, mad_floor):
+    """Compatibility local-plane diagnostic; not used by the fast production path."""
+    ny, nx = snapped.shape
+    for r in range(1, int(max(1, radius_max)) + 1):
+        j0=max(0,j-r); j1=min(ny,j+r+1); i0=max(0,i-r); i1=min(nx,i+r+1)
+        sub=snapped[j0:j1,i0:i1]
+        yy,xx=np.nonzero(np.isfinite(sub))
+        if yy.size < min_nei:
+            continue
+        zz=sub[yy,xx].astype(np.float64,copy=False)
+        dx=(xx+i0-i).astype(np.float64)*float(cell); dy=(yy+j0-j).astype(np.float64)*float(cell)
+        A=np.column_stack((dx,dy,np.ones_like(dx)))
+        try: beta,*_=np.linalg.lstsq(A,zz,rcond=None)
+        except np.linalg.LinAlgError: continue
+        pred=A@beta; rr=zz-pred
+        med=float(np.median(rr)); mad=max(float(np.median(np.abs(rr-med))),float(mad_floor))
+        good=np.abs(rr-med) <= float(max_rz)*1.4826*mad
+        if np.count_nonzero(good) >= min_nei:
+            return float(beta[2]), float(mad), int(np.count_nonzero(good))
+    return None
+
+
+def _normal_vote_surface(snapped: np.ndarray, cfg: InvertVoteConfig) -> np.ndarray:
+    """Published robust scalar vote, exposed as the stable 0.2.1 helper API."""
+    snapped=np.asarray(snapped,dtype=np.float32)
+    ny,nx=snapped.shape
+    grid=np.full((ny,nx),np.nan,dtype=np.float32)
+    r=int(max(1,cfg.neighbor_radius_cells)); min_nei=int(max(1,cfg.min_neighbor_cells))
+    max_rz=float(cfg.max_robust_z); mad_floor=float(cfg.mad_floor)
+    for j in range(ny):
+        j0=max(0,j-r); j1=min(ny,j+r+1)
+        for i in range(nx):
+            i0=max(0,i-r); i1=min(nx,i+r+1)
+            vals=snapped[j0:j1,i0:i1]; vals=vals[np.isfinite(vals)]
+            if vals.size < min_nei: continue
+            med=float(np.median(vals)); mad=max(float(np.median(np.abs(vals-med))),mad_floor)
+            good=vals[np.abs(vals-med) <= max_rz*1.4826*mad]
+            if good.size >= min_nei: grid[j,i]=np.float32(np.median(good))
+    return grid
+
+
 def build_surface_invert_vote(x: np.ndarray, y: np.ndarray, z: np.ndarray, cfg: InvertVoteConfig):
     """
     Global support-layer version:
@@ -318,55 +408,21 @@ def build_surface_invert_vote(x: np.ndarray, y: np.ndarray, z: np.ndarray, cfg: 
 
     snapped = _select_surface_snap_points(x, y, z, provisional, x0, y0, cfg)
 
-    # Robust vote on the snapped scalar surface
-    grid = np.full((ny, nx), np.nan, dtype=np.float32)
-    r = int(max(1, cfg.neighbor_radius_cells))
-    min_nei = int(max(1, cfg.min_neighbor_cells))
-    max_rz = float(cfg.max_robust_z)
-    mad_floor = float(cfg.mad_floor)
+    # Published robust scalar vote; the newer multi-radius plane/quadratic
+    # Alternate implementations are not used by the production path.
+    grid = _normal_vote_surface(snapped, cfg)
 
-    for j in range(ny):
-        j0 = max(0, j - r)
-        j1 = min(ny, j + r + 1)
-        for i in range(nx):
-            i0 = max(0, i - r)
-            i1 = min(nx, i + r + 1)
-
-            vals = snapped[j0:j1, i0:i1]
-            vals = vals[np.isfinite(vals)]
-            if vals.size < min_nei:
-                continue
-
-            med = np.nanmedian(vals)
-            mad = np.nanmedian(np.abs(vals - med))
-            mad = float(max(mad, mad_floor))
-            rz = np.abs(vals - med) / (1.4826 * mad)
-
-            good = vals[rz <= max_rz]
-            if good.size < min_nei:
-                continue
-
-            grid[j, i] = float(np.nanmedian(good))
-
-    # hole fill
+    # hole fill -- exact former semantics, but vectorized over the grid.
     for _ in range(int(max(0, cfg.fill_iters))):
-        nan_mask = ~np.isfinite(grid)
-        if not nan_mask.any():
+        if np.isfinite(grid).all():
             break
-        g2 = grid.copy()
-        for j in range(ny):
-            for i in range(nx):
-                if np.isfinite(grid[j, i]):
-                    continue
-                j0 = max(0, j - 1)
-                j1 = min(ny, j + 2)
-                i0 = max(0, i - 1)
-                i1 = min(nx, i + 2)
-                neigh = grid[j0:j1, i0:i1]
-                neigh = neigh[np.isfinite(neigh)]
-                if neigh.size:
-                    g2[j, i] = float(np.nanmedian(neigh))
-        grid = g2
+        g2=_fill_nan_median_step(grid)
+        # If no frontier cell could be filled, stop rather than repeating the
+        # remaining configured iterations over an unchanged grid.
+        if np.array_equal(np.isfinite(g2),np.isfinite(grid)):
+            grid=g2
+            break
+        grid=g2
 
     # nan-safe smoothing (separable)
     sigma = float(max(0.01, cfg.smooth_sigma_cells))
@@ -418,27 +474,37 @@ def classify_by_surface(
     y0: float,
     cfg: InvertVoteConfig,
 ) -> np.ndarray:
+    """Fast ALS/ULS membership with breakline-aware tolerance.
+
+    The published slope-adaptive gate remains the backbone.  A small additional
+    allowance is activated only where the already-derived terrain surface shows
+    local breakline relief (crest/concavity/slope transition).  This avoids a
+    global threshold increase and therefore leaves smooth terrain behavior
+    unchanged.
     """
-    ALS/ULS classification using a slope-adaptive asymmetric thin-sheet gate.
-    """
-    x = np.asarray(x, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-    z = np.asarray(z, dtype=np.float64)
+    x=np.asarray(x,dtype=np.float64); y=np.asarray(y,dtype=np.float64); z=np.asarray(z,dtype=np.float64)
+    cell=float(cfg.cell); thr0=float(cfg.ground_threshold); slope_k=float(cfg.slope_adapt_k)
+    zhat=_bilinear_sample(surf_z,x,y,x0,y0,cell)
 
-    cell = float(cfg.cell)
-    thr0 = float(cfg.ground_threshold)
-    slope_k = float(cfg.slope_adapt_k)
+    # Fill only for derivative diagnostics; classification still requires a
+    # finite original interpolated surface.
+    sf=np.asarray(surf_z,dtype=np.float32)
+    med0=float(np.nanmedian(sf)) if np.any(np.isfinite(sf)) else 0.0
+    dense=np.where(np.isfinite(sf),sf,med0).astype(np.float32,copy=False)
+    gy,gx=np.gradient(dense,cell,cell)
+    slope_mag=np.sqrt(gx*gx+gy*gy)
+    slope_here=_bilinear_sample(slope_mag,x,y,x0,y0,cell)
 
-    zhat = _bilinear_sample(surf_z, x, y, x0, y0, cell)
+    # Local breakline relief is measured in metres, not a unitless curvature.
+    # On planar/constant slopes this is nearly zero. At convex/concave bends it
+    # rises, providing a bounded local recovery allowance.
+    local_med=median_filter(dense,size=3,mode='nearest')
+    relief=np.abs(dense-local_med)
+    relief_here=_bilinear_sample(relief,x,y,x0,y0,cell)
+    transition_extra=np.clip(1.5*relief_here,0.0,0.25)
 
-    gy, gx = np.gradient(surf_z, cell, cell)
-    slope_mag = np.sqrt(gx * gx + gy * gy)
-    slope_here = _bilinear_sample(slope_mag, x, y, x0, y0, cell)
+    thr=thr0 + slope_k*slope_here + transition_extra
+    thr=np.clip(thr,0.05,0.65)
+    resid=z-zhat
+    return np.isfinite(zhat) & (resid <= thr) & (resid >= -2.0*thr)
 
-    thr = thr0 + slope_k * slope_here
-    thr = np.clip(thr, 0.05, 0.60)
-
-    resid = z - zhat
-
-    # stricter above surface, more tolerant below surface
-    return np.isfinite(zhat) & (resid <= thr) & (resid >= -2.0 * thr)

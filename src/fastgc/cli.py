@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from .core import DEFAULT_WORKFLOW, WORKFLOW_CHOICES, run_fastgc
 from .monster import BACKEND_CHOICES, DEFAULT_BACKEND
+from .backend.compute import configure_sensor_compute_backend
+from . import __version__
 
 PRODUCT_CHOICES = [
     "all",
@@ -27,6 +30,7 @@ CHM_METHOD_CHOICES = [
     "p99",
     "tin",
     "pitfree",
+    "adaptive_pitfree",
     "csf_chm",
     "spikefree",
     "percentile",
@@ -39,6 +43,7 @@ CHM_SURFACE_METHOD_CHOICES = [
     "p99",
     "tin",
     "pitfree",
+    "adaptive_pitfree",
     "csf_chm",
 ]
 
@@ -47,6 +52,7 @@ CHM_MULTI_METHOD_CHOICES = [
     "p99",
     "tin",
     "pitfree",
+    "adaptive_pitfree",
     "csf_chm",
     "spikefree",
 ]
@@ -100,6 +106,7 @@ ITD_METHOD_CHOICES = [
     "placeholder",
     "lmf",
     "watershed",
+    "adaptive_watershed",
     "yun2021",
     "dalponte2016",
     "li2012",
@@ -116,6 +123,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="fastgc",
         description="FAST-GC: sensor-aware ground classification and LiDAR derivative products",
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
 
     parser.add_argument(
@@ -147,12 +160,13 @@ def main(argv=None):
         help="Workflow to execute.",
     )
 
+
     parser.add_argument(
         "--jobs",
         dest="jobs",
         type=int,
-        default=1,
-        help="Number of workers for tile-parallel stages. Use 1 for sequential, 0 for auto, negative values for cpu_count+n+1.",
+        default=0,
+        help="Number of workers for tile-parallel stages. Default 0 automatically uses available CPUs while reserving one core. Use 1 for sequential; negative values mean cpu_count+n+1.",
     )
     parser.add_argument(
         "--joblib_backend",
@@ -719,20 +733,23 @@ def main(argv=None):
         help="Rebuild tiles even if a tile manifest already exists.",
     )
 
+    # Backward-compatible v0.2.0 FP-fix switches.  The refinement remains
+    # internally enabled by default, while established user scripts can still
+    # explicitly enable or disable it with the published option names.
     parser.add_argument(
         "--apply_fp_fix",
         "--apply-fp-fix",
         dest="apply_fp_fix",
         action="store_true",
         default=True,
-        help="Enable built-in FP-fix stage (default behavior).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--no_fp_fix",
         "--no-fp-fix",
         dest="apply_fp_fix",
         action="store_false",
-        help="Disable built-in FP-fix stage.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fp_fix_dem_res",
@@ -740,7 +757,7 @@ def main(argv=None):
         dest="fp_fix_dem_res",
         type=float,
         default=0.25,
-        help="Temporary DEM resolution for FP-fix residual checks.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fp_fix_nonground_to_ground_max_z",
@@ -748,7 +765,7 @@ def main(argv=None):
         dest="fp_fix_nonground_to_ground_max_z",
         type=float,
         default=0.0,
-        help="Promote non-ground to ground when residual z <= this threshold.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fp_fix_ground_to_nonground_min_z",
@@ -756,17 +773,23 @@ def main(argv=None):
         dest="fp_fix_ground_to_nonground_min_z",
         type=float,
         default=0.06,
-        help="Demote ground to non-ground when residual z > this threshold.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--keep_fp_fix_temp",
         "--keep-fp-fix-temp",
         dest="keep_fp_fix_temp",
         action="store_true",
-        help="Keep provisional _temp_fp_fix workspace for inspection.",
+        help=argparse.SUPPRESS,
     )
 
     args = parser.parse_args(argv)
+
+    try:
+        configure_sensor_compute_backend(args.sensor_mode)
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(str(exc)) from exc
+
 
     if isinstance(args.joblib_batch_size, str) and args.joblib_batch_size.strip().lower() != "auto":
         try:
@@ -856,3 +879,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+

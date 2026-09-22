@@ -1,14 +1,23 @@
-FROM continuumio/miniconda3
+﻿FROM python:3.14-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
-COPY environment.yml /app/environment.yml
-RUN conda env create -f /app/environment.yml && conda clean -afy
+# Runtime libraries required by binary geospatial wheels and common CRS/data IO.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libgomp1 \
+      libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
 
-SHELL ["conda", "run", "-n", "fastgc", "/bin/bash", "-c"]
+COPY pyproject.toml README.md LICENSE /app/
+COPY native /app/native
+COPY src /app/src
 
-COPY . /app
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install .
 
-RUN pip install -e .
+ENTRYPOINT ["fastgc"]
 
-ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "fastgc", "fastgc"]

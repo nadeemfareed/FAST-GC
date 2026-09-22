@@ -126,3 +126,8 @@ mkdocs/site/
 .python-version
 Pipfile.lock
 poetry.lock
+# Local FAST-GC development artifacts
+*_backup_*/
+*before_*.py
+patch_payload/
+FASTGC_ALS_*/

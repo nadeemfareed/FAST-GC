@@ -1,0 +1,14 @@
+# FAST-GC 0.2.1 known-good direct runtime set
+# Validated on Windows 11 / Python 3.14.6.
+# Used by install_editable.ps1/.sh to make development installs reproducible.
+numpy==2.4.6
+scipy==1.18.0
+laspy==2.7.0
+lazrs==0.8.2
+rasterio==1.5.1
+pyogrio==0.13.0
+shapely==2.1.2
+tqdm==4.68.2
+joblib==1.5.3
+psutil==7.2.2
+packaging>=24.2,<27.0

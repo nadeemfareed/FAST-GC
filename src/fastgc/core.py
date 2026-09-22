@@ -25,8 +25,8 @@ from .io_las import (
 )
 from .itd import run_itd_from_processed_root
 from .merge import cleanup_tiling_workspace, merge_processed_tiles
+from .viewer.manifest import ViewManifest
 from .monster import log_info, stage_banner
-from .post_fp_fix import apply_fp_fix_to_output_root
 from .preprocess import tile_las_dataset
 from .structure import run_structure_from_root
 from .terrain import run_terrain_from_processed_root
@@ -119,6 +119,94 @@ def _needs_classified_source(products: list[str]) -> bool:
 
 def _needs_raw_dsm(products: list[str]) -> bool:
     return PRODUCT_DSM in set(products)
+
+
+
+def _write_view_registry(
+    root,
+    *,
+    sensor_mode: str,
+    merged_outputs: dict | None = None,
+) -> None:
+    """
+    Best-effort visualization registry.
+
+    This observer runs only after FAST-GC product computation has completed.
+    It performs no classification, terrain, raster, merge, or product
+    computation. Failure to write visualization metadata must never convert
+    a successful FAST-GC scientific run into a failed run.
+    """
+    try:
+        root = Path(root).resolve()
+
+        registry = ViewManifest(
+            dataset=root.name,
+            sensor=str(sensor_mode).upper(),
+        )
+
+        # Exact successful merged outputs returned by FAST-GC.
+        if merged_outputs:
+            registry.register_merged_outputs(merged_outputs)
+
+        # Discovery observes only already-existing files.
+        from .viewer.discovery import discover_product_files
+
+        discovered = discover_product_files(root)
+
+        for product, grouped in discovered.items():
+            if not isinstance(grouped, dict):
+                continue
+
+            # Preserve authoritative merged output returned by the
+            # actual FAST-GC merge operation when one is available.
+            record = registry.products.get(str(product).upper())
+            has_authoritative_merged = bool(
+                record is not None and record.merged
+            )
+
+            if not has_authoritative_merged:
+                for output in grouped.get("merged", []):
+                    p = Path(output)
+
+                    if p.is_file():
+                        registry.register_completed_output(
+                            product=product,
+                            output=p,
+                            source="merged",
+                        )
+
+            for output in grouped.get("tiles", []):
+                p = Path(output)
+
+                if p.is_file():
+                    registry.register_completed_output(
+                        product=product,
+                        output=p,
+                        source="tile",
+                    )
+
+            # Current manifest schema supports merged/tile sources.
+            # Unclassified completed files are retained as completed
+            # file observations in the tile collection.
+            for output in grouped.get("completed", []):
+                p = Path(output)
+
+                if p.is_file():
+                    registry.register_completed_output(
+                        product=product,
+                        output=p,
+                        source="tile",
+                    )
+
+        registry.write(
+            root / "FASTGC_VIEW_MANIFEST.json"
+        )
+
+    except Exception as exc:
+        log_info(
+            "Visualization registry skipped: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _load_manifest_from_workspace(workspace_root: Path) -> dict:
@@ -603,86 +691,27 @@ def _run_processing_with_optional_fpfix(
 
     base_products = [p for p in resolved_products if p in {PRODUCT_GC, PRODUCT_DEM, PRODUCT_NORMALIZED, PRODUCT_DSM}]
 
-    if not apply_fp_fix:
-        out_root = process_fastgc_path(
-            in_path=in_path,
-            out_dir=out_dir,
-            sensor_mode=sensor_mode,
-            products=base_products,
-            grid_res=grid_res,
-            dem_method=dem_method,
-            dsm_method=dsm_method,
-            recursive=recursive,
-            n_jobs=n_jobs,
-            joblib_backend=joblib_backend,
-            joblib_batch_size=joblib_batch_size,
-            joblib_pre_dispatch=joblib_pre_dispatch,
-            spikefree_freeze_distance=chm_spikefree_freeze_distance,
-            spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
-        )
-    else:
-        out_root = process_fastgc_path(
-            in_path=in_path,
-            out_dir=out_dir,
-            sensor_mode=sensor_mode,
-            products=[PRODUCT_GC],
-            grid_res=grid_res,
-            dem_method=dem_method,
-            dsm_method=dsm_method,
-            recursive=recursive,
-            n_jobs=n_jobs,
-            joblib_backend=joblib_backend,
-            joblib_batch_size=joblib_batch_size,
-            joblib_pre_dispatch=joblib_pre_dispatch,
-            spikefree_freeze_distance=chm_spikefree_freeze_distance,
-            spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
-        )
-
-        fix_summary = _call_with_supported_kwargs(
-            apply_fp_fix_to_output_root,
-            out_root=out_root,
-            sensor_mode=sensor_mode,
-            dem_res=grid_res if fp_fix_dem_res is None else fp_fix_dem_res,
-            nonground_to_ground_max_z=fp_fix_nonground_to_ground_max_z,
-            ground_to_nonground_min_z=fp_fix_ground_to_nonground_min_z,
-            keep_temp=keep_fp_fix_temp,
-            n_jobs=n_jobs,
-            joblib_backend=joblib_backend,
-            joblib_batch_size=joblib_batch_size,
-            joblib_pre_dispatch=joblib_pre_dispatch,
-        )
-        print(f"[INFO] FP-FIX changed points: {int(fix_summary.get('total_changed_points', 0))}")
-
-        downstream_from_gc = [p for p in resolved_products if p in {PRODUCT_DEM, PRODUCT_NORMALIZED}]
-        if downstream_from_gc:
-            derive_products_from_classified_root(
-                classified_root=Path(out_root) / PRODUCT_GC,
-                out_root=out_root,
-                products=downstream_from_gc,
-                grid_res=grid_res,
-                dem_method=dem_method,
-                n_jobs=n_jobs,
-                joblib_backend=joblib_backend,
-                joblib_batch_size=joblib_batch_size,
-                joblib_pre_dispatch=joblib_pre_dispatch,
-            )
-
-        if need_dsm:
-            derive_products_from_raw_root(
-                raw_root=in_path,
-                out_root=out_root,
-                sensor_mode=sensor_mode,
-                products=[PRODUCT_DSM],
-                grid_res=grid_res,
-                dsm_method=dsm_method,
-                recursive=recursive,
-                n_jobs=n_jobs,
-                joblib_backend=joblib_backend,
-                joblib_batch_size=joblib_batch_size,
-                joblib_pre_dispatch=joblib_pre_dispatch,
-                spikefree_freeze_distance=chm_spikefree_freeze_distance,
-                spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
-            )
+    # False-positive suppression is now part of the internal terrain-manifold
+    # classification path. Legacy Python arguments remain accepted only for
+    # compatibility; no second DEM/reclassification stage is executed.
+    out_root = process_fastgc_path(
+        in_path=in_path,
+        out_dir=out_dir,
+        sensor_mode=sensor_mode,
+        products=base_products,
+        grid_res=grid_res,
+        dem_method=dem_method,
+        dsm_method=dsm_method,
+        recursive=recursive,
+        n_jobs=n_jobs,
+        joblib_backend=joblib_backend,
+        joblib_batch_size=joblib_batch_size,
+        joblib_pre_dispatch=joblib_pre_dispatch,
+        spikefree_freeze_distance=chm_spikefree_freeze_distance,
+        spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
+        skip_existing=skip_existing,
+        overwrite=overwrite,
+    )
 
     if PRODUCT_CHM in resolved_products:
         derive_chm_from_processed_root(
@@ -840,22 +869,13 @@ def run_fastgc(
 
     if grid_res <= 0:
         raise ValueError("grid_res must be > 0")
-    if fp_fix_dem_res is not None and fp_fix_dem_res <= 0:
-        raise ValueError("fp_fix_dem_res must be > 0 when provided")
 
     requested_products = _requested_products(products)
     resolved_products = _resolve_products(products)
     total_t0 = perf_counter()
 
-    stage_banner("WORKFLOW", source=str(in_path), total=len(resolved_products), unit="stage")
-    log_info(f"Workflow: {workflow}")
-    log_info(f"Sensor mode: {sensor_mode}")
-    log_info(f"Requested products: {requested_products}")
-    log_info(f"Resolved products: {resolved_products}")
-    log_info(f"Joblib: jobs={n_jobs} | backend={joblib_backend} | batch_size={joblib_batch_size} | pre_dispatch={joblib_pre_dispatch}")
-    log_info(f"Grid resolution: {grid_res}")
-    if apply_fp_fix:
-        log_info(f"FP-fix DEM resolution: {grid_res if fp_fix_dem_res is None else fp_fix_dem_res}")
+    # Do not emit a synthetic outer progress stage. Real progress is reported by
+    # TILING, each requested FAST product, and each product-specific MERGE stage.
 
     if workflow == "run":
         if use_existing_tiles:
@@ -917,7 +937,11 @@ def run_fastgc(
             skip_existing=skip_existing,
             overwrite=overwrite,
         )
-        print(f"[TIME] WORKFLOW run     : {perf_counter() - total_t0:.2f}s")
+        log_info(f"[TIME] WORKFLOW run     : {perf_counter() - total_t0:.2f}s")
+        _write_view_registry(
+            out,
+            sensor_mode=sensor_mode,
+        )
         return out
 
     if workflow == "merge":
@@ -964,8 +988,14 @@ def run_fastgc(
             if tiles_dir.exists():
                 cleanup_tiling_workspace(tiles_dir)
 
-        print(f"[TIME] WORKFLOW merge   : {perf_counter() - total_t0:.2f}s")
-        return str(merge_root if merged_outputs else processed_root)
+        log_info(f"[TIME] WORKFLOW merge   : {perf_counter() - total_t0:.2f}s")
+        final_root = merge_root if merged_outputs else processed_root
+        _write_view_registry(
+            final_root,
+            sensor_mode=sensor_mode,
+            merged_outputs=merged_outputs,
+        )
+        return str(final_root)
 
     if workflow == "derive-only":
         p = Path(in_path)
@@ -1018,9 +1048,6 @@ def run_fastgc(
         dem_root = processed_root / PRODUCT_DEM
         dsm_root = processed_root / PRODUCT_DSM
 
-        print(f"[INFO] derive-only root: {processed_root}")
-        if normalized_root.exists():
-            print(f"[INFO] Existing FAST_NORMALIZED found: {normalized_root}")
 
         if PRODUCT_DEM in explicitly_requested and not (_has_raster_outputs(dem_root) and skip_existing and not overwrite):
             if not classified_root.exists():
@@ -1400,7 +1427,11 @@ def run_fastgc(
                 overwrite=overwrite,
             )
 
-        print(f"[TIME] WORKFLOW derive-only: {perf_counter() - total_t0:.2f}s")
+        log_info(f"[TIME] WORKFLOW derive-only: {perf_counter() - total_t0:.2f}s")
+        _write_view_registry(
+            processed_root,
+            sensor_mode=sensor_mode,
+        )
         return str(processed_root)
 
     if workflow in {"tile-only", "tile-run", "tile-run-merge"}:
@@ -1425,7 +1456,7 @@ def run_fastgc(
         tiles_dir = Path(manifest["tiles_dir"])
 
         if workflow == "tile-only":
-            print(f"[TIME] WORKFLOW total  : {perf_counter() - total_t0:.2f}s")
+            log_info(f"[TIME] WORKFLOW total  : {perf_counter() - total_t0:.2f}s")
             return str(workspace_root)
 
         processed_root = Path(
@@ -1483,7 +1514,11 @@ def run_fastgc(
         )
 
         if workflow == "tile-run":
-            print(f"[TIME] WORKFLOW total  : {perf_counter() - total_t0:.2f}s")
+            log_info(f"[TIME] WORKFLOW total  : {perf_counter() - total_t0:.2f}s")
+            _write_view_registry(
+                processed_root,
+                sensor_mode=sensor_mode,
+            )
             return str(processed_root)
 
         merge_root = workspace_root / f"Merged_{sensor_mode.upper()}"
@@ -1524,7 +1559,15 @@ def run_fastgc(
             if tiles_dir.exists():
                 cleanup_tiling_workspace(tiles_dir)
 
-        print(f"[TIME] WORKFLOW total   : {perf_counter() - total_t0:.2f}s")
-        return str(merge_root if merged_outputs else processed_root)
+        log_info(f"[TIME] WORKFLOW total   : {perf_counter() - total_t0:.2f}s")
+        final_root = merge_root if merged_outputs else processed_root
+        _write_view_registry(
+            final_root,
+            sensor_mode=sensor_mode,
+            merged_outputs=merged_outputs,
+        )
+        return str(final_root)
 
     raise ValueError(f"Unsupported workflow: {workflow}")
+
+

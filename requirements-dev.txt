@@ -1,6 +1,11 @@
-pytest>=8.0
+-r requirements.txt
+pytest>=8.3
+pytest-cov>=6.0
 build>=1.2
-twine>=5.0
-ruff>=0.6
-black>=24.0
-pre-commit>=3.0
+twine>=6.0
+ruff>=0.9
+black>=25.0
+pre-commit>=4.0
+packaging>=24.2
+matplotlib>=3.9,<4.0
+plotly>=6.0,<7.0

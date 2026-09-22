@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import copy
 import os
 from pathlib import Path
 from time import perf_counter
@@ -10,17 +11,32 @@ from typing import Callable, Iterable
 import laspy
 import numpy as np
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
-from scipy.ndimage import binary_closing, binary_dilation, binary_fill_holes
+from scipy.ndimage import binary_closing, binary_dilation, binary_fill_holes, distance_transform_edt
 from scipy.spatial import Delaunay, QhullError, cKDTree
-from tqdm import tqdm
-
-from .monster import log_info, run_stage
+from .monster import ProgressDashboard, log_info, progress_bar, run_stage
 from .invert_vote import InvertVoteConfig, build_surface_invert_vote, classify_by_surface
 from .sensors import sensor_defaults
-from .tls_vote import TlsInvertDsmVoteConfig, build_tls_surface_invert_dsm_vote, classify_tls_by_surface
+from .tls_vote import TlsInvertDsmVoteConfig, build_tls_surface_invert_dsm_vote, classify_tls_by_surface, get_tls_surface_diagnostics
+from .tls_final_ground_vote import refine_tls_final_ground_vote
+from .tls_voxel_reduce import reduce_tls_terrain_domain, select_tls_active_evidence
+from .tls_membrane_refine import TlsMembraneConfig, refine_tls_ground_membrane
+from .tls_terrain_recover import TlsTerrainRecoveryConfig, recover_tls_microtopography
 from .utils import as_f64
 from .void_recover import recover_ground_in_voids
-
+from .als_statistical_sheet_cleaner import clean_statistical_ground_sheet
+from .als_facet_support_guard import clean_als_facet_support_consistency
+from .als_ground_vertical_profile_guard import refine_als_ground_vertical_profile
+from .als_detached_ground_guard import apply_detached_ground_guard
+from .als_surface_impurity_guard import apply_surface_impurity_guard
+from .als_multiscale_canopy_blob_guard import apply_multiscale_canopy_blob_guard
+from .als_terrain_blob_guard import apply_terrain_blob_guard, apply_hard_airborne_ground_guard
+from .als_final_surface_vote import apply_final_surface_vote
+from .als_d2_reverse_context_vote import apply_d2_reverse_context_vote
+from .vertical_support_final_guard import apply_vertical_support_final_guard
+from .depression_sweeper import sweep_ground_depressions
+from .als_postfinal_surface import recover_postfinal_surface
+from .surface_consensus_guard import build_surface_consensus_workspace, recover_surface_false_negatives, two_way_surface_classification_swipe
+from .prederive_seam import finalize_fastgc_seams_in_place
 try:
     import rasterio
     from rasterio.transform import from_origin
@@ -54,15 +70,67 @@ ALL_PRODUCTS = {
 RASTER_METHOD_CHOICES = {"min", "max", "mean", "nearest", "idw", "spikefree"}
 
 
+class _StepDashboard:
+    def __init__(self, total: int, desc: str, enabled: bool):
+        self._dash = ProgressDashboard(desc, total, unit="step", enabled=enabled)
+        self._enabled = enabled
+        self._step = 0
+
+    def update(self, n: int = 1):
+        if not self._enabled:
+            return
+        self._step += int(n)
+        self._dash.update(
+            n,
+            current_file="-",
+            current_item=f"step {min(self._step, self._dash.total)}/{self._dash.total}",
+        )
+
+    def set_description(self, desc: str):
+        if self._enabled:
+            self._dash.stage_name = str(desc)
+            self._dash.set_context(current_item=f"step {self._step}/{self._dash.total}")
+
+    def close(self):
+        self._dash.close()
+
+
 def _stage_bar(total: int, desc: str, enabled: bool):
-    return tqdm(
-        total=total,
-        desc=desc,
-        unit="step",
-        dynamic_ncols=True,
-        leave=False,
-        disable=not enabled,
-    )
+    if 'ProgressDashboard' in globals():
+        class _StepDashboard:
+            def __init__(self, total: int, desc: str, enabled: bool):
+                self._dash = ProgressDashboard(desc, total, unit='step', enabled=enabled)
+                self._enabled = bool(enabled)
+                self._step = 0
+                self.total = int(total)
+
+            def update(self, n: int = 1):
+                if not self._enabled:
+                    return
+                self._step += int(n)
+                self._dash.update(int(n), current_file='-', current_item=f'step {min(self._step, self.total)}/{self.total}')
+
+            def set_description(self, value: str, refresh: bool = True):
+                if self._enabled:
+                    self._dash.stage_name = str(value)
+
+            def set_description_str(self, value: str, refresh: bool = True):
+                self.set_description(value, refresh=refresh)
+
+            def set_postfix_str(self, value: str, refresh: bool = True):
+                if self._enabled and refresh:
+                    self._dash.set_context(current_item=str(value))
+
+            def refresh(self):
+                if self._enabled:
+                    self._dash.set_context(current_item=f'step {min(self._step, self.total)}/{self.total}')
+
+            def close(self):
+                self._dash.close()
+
+        return _StepDashboard(total, desc, enabled)
+
+    return progress_bar(total=total, desc=desc, unit='step', dynamic_ncols=True, leave=False, disable=not enabled)
 
 
 def _sample_points_xy_from_las(src_fp: str, max_points: int = 250000) -> tuple[np.ndarray, np.ndarray]:
@@ -193,6 +261,111 @@ def _adaptive_support_context_for_input(src_fp: str) -> tuple[dict[str, float] |
     return support, dataset_stats
 
 
+def _nearest_fill_grid(a: np.ndarray) -> np.ndarray:
+    """Nearest-value fill used only to estimate local terrain orientation."""
+    a = np.asarray(a, dtype=np.float64)
+    finite = np.isfinite(a)
+    if not np.any(finite):
+        return a.copy()
+    if np.all(finite):
+        return a.copy()
+    # distance_transform_edt returns indices of the closest zero in the mask;
+    # use ~finite so zeros correspond to valid cells.
+    _, inds = distance_transform_edt(~finite, return_indices=True)
+    return a[tuple(inds)]
+
+
+def _candidate_mask_one_origin(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    *,
+    cell: float,
+    dz: float,
+    x0: float,
+    y0: float,
+) -> np.ndarray:
+    """
+    Terrain-oriented lower-layer candidate mask for one XY grid origin.
+
+    The published rule uses z <= zmin(cell) + dz, i.e. a horizontal slab.
+    Here zmin is retained as the lower-envelope anchor, but the slab is
+    rotated using the local gradient of the lower-envelope grid.  For a
+    planar terrain patch, zmin is interpreted as the minimum of a local
+    plane over the cell, which gives the plane elevation at cell centre as
+
+        zc = zmin + 0.5*cell*(|gx| + |gy|).
+
+    This removes the orientation-dependent clipping that creates rectangular
+    omissions on slopes while preserving the original flat-terrain rule.
+    """
+    ix = np.floor((x - x0) / cell).astype(np.int64)
+    iy = np.floor((y - y0) / cell).astype(np.int64)
+    valid = (ix >= 0) & (iy >= 0)
+    if not np.any(valid):
+        return np.zeros(x.shape, dtype=bool)
+
+    nx = int(ix[valid].max()) + 1
+    ny = int(iy[valid].max()) + 1
+    key = iy[valid] * nx + ix[valid]
+
+    zmin_flat = np.full(nx * ny, np.inf, dtype=np.float64)
+    np.minimum.at(zmin_flat, key, z[valid])
+    zmin = zmin_flat.reshape(ny, nx)
+    zmin[~np.isfinite(zmin)] = np.nan
+
+    finite = np.isfinite(zmin)
+    # 3x3 support count without an additional scipy filter dependency.
+    pad = np.pad(finite.astype(np.uint8), 1, mode="constant")
+    support = np.zeros_like(zmin, dtype=np.uint8)
+    for dj in range(3):
+        for di in range(3):
+            support += pad[dj:dj + ny, di:di + nx]
+
+    zfill = _nearest_fill_grid(zmin)
+    if ny > 1 and nx > 1:
+        gy, gx = np.gradient(zfill, float(cell), float(cell))
+    elif ny > 1:
+        gy = np.gradient(zfill, float(cell), axis=0)
+        gx = np.zeros_like(zfill)
+    elif nx > 1:
+        gx = np.gradient(zfill, float(cell), axis=1)
+        gy = np.zeros_like(zfill)
+    else:
+        gx = np.zeros_like(zfill)
+        gy = np.zeros_like(zfill)
+
+    out = np.zeros(x.shape, dtype=bool)
+    ids = np.flatnonzero(valid)
+    i = ix[valid]
+    j = iy[valid]
+    z0 = zmin[j, i]
+
+    # Published horizontal rule is always available as a conservative fallback.
+    base_keep = z[valid] <= (z0 + float(dz))
+
+    well_supported = support[j, i] >= 4
+    if np.any(well_supported):
+        xc = x0 + (i.astype(np.float64) + 0.5) * float(cell)
+        yc = y0 + (j.astype(np.float64) + 0.5) * float(cell)
+        gxi = gx[j, i]
+        gyi = gy[j, i]
+
+        # Reconstruct the local planar sheet from its within-cell minimum.
+        zc = z0 + 0.5 * float(cell) * (np.abs(gxi) + np.abs(gyi))
+        zpred = zc + gxi * (x[valid] - xc) + gyi * (y[valid] - yc)
+
+        # The residual is converted approximately to normal distance so the
+        # physical candidate thickness does not inflate with terrain slope.
+        norm = np.sqrt(1.0 + gxi * gxi + gyi * gyi)
+        dperp = (z[valid] - zpred) / norm
+        oriented_keep = dperp <= float(dz)
+        base_keep = np.where(well_supported, oriented_keep, base_keep)
+
+    out[ids] = base_keep
+    return out
+
+
 def _candidate_layer_by_cellmin(
     x: np.ndarray,
     y: np.ndarray,
@@ -200,35 +373,32 @@ def _candidate_layer_by_cellmin(
     cell: float,
     dz: float,
 ) -> np.ndarray:
+    """High-recall, slope-aware ALS/ULS lower-layer candidate mask.
+
+    The older horizontal ``z <= zmin(cell) + dz`` slab is orientation dependent:
+    on a steep cell, legitimate terrain at the uphill side can sit more than
+    ``dz`` above the cell minimum and is discarded before FAST-GC ever sees it.
+
+    Two half-cell-offset, locally oriented lower-envelope masks are unioned.
+    This preserves a thin terrain sheet through slopes, rounded crests, and
+    concave/convex breaks while retaining the original cell-minimum anchor.
+    """
     if x.size == 0:
         return np.zeros(0, dtype=bool)
 
+    cell = float(cell)
+    dz = float(dz)
     x0 = float(np.min(x))
     y0 = float(np.min(y))
-    ix = np.floor((x - x0) / cell).astype(np.int64)
-    iy = np.floor((y - y0) / cell).astype(np.int64)
 
-    nx = int(ix.max()) + 1
-    key = iy * nx + ix
-
-    order = np.lexsort((z, key))
-    key_s = key[order]
-    z_s = z[order]
-
-    starts = np.r_[0, 1 + np.flatnonzero(key_s[1:] != key_s[:-1])]
-    zmin = z_s[starts]
-
-    gid = np.zeros_like(key_s, dtype=np.int64)
-    gid[starts] = 1
-    gid = np.cumsum(gid) - 1
-
-    zmin_per = zmin[gid]
-    keep_s = z_s <= (zmin_per + dz)
-
-    keep = np.zeros_like(keep_s, dtype=bool)
-    keep[order] = keep_s
-    return keep
-
+    m0 = _candidate_mask_one_origin(
+        x, y, z, cell=cell, dz=dz, x0=x0, y0=y0
+    )
+    m1 = _candidate_mask_one_origin(
+        x, y, z, cell=cell, dz=dz,
+        x0=x0 - 0.5 * cell, y0=y0 - 0.5 * cell,
+    )
+    return m0 | m1
 
 def _safe_parse_crs(las, *, fallback_fp: str | None = None):
     try:
@@ -303,11 +473,378 @@ def _read_las(fp: str):
 
 
 def _write_full_cloud_with_classification(template: laspy.LasData, fp_out: str, classification: np.ndarray):
-    out = laspy.LasData(template.header)
+    # Never share the template header with an output LAS.  Diagnostic
+    # Extra Bytes dimensions must not mutate the production header.
+    out = laspy.LasData(copy.deepcopy(template.header))
     out.points = template.points.copy()
     out.classification = classification.astype(np.uint8, copy=False)
     os.makedirs(os.path.dirname(fp_out), exist_ok=True)
     out.write(fp_out)
+
+
+def _ensure_tls_diag_extra_dim(
+    las: laspy.LasData,
+    name: str,
+    dtype,
+    description: str,
+) -> None:
+    """Ensure a TLS diagnostic Extra Bytes dimension exists."""
+    names = {dim.name for dim in las.point_format.extra_dimensions}
+
+    if name not in names:
+        las.add_extra_dim(
+            laspy.ExtraBytesParams(
+                name=name,
+                type=np.dtype(dtype),
+                description=description[:32],
+            )
+        )
+
+
+def _write_tls_diagnostic_cloud(
+    template: laspy.LasData,
+    fp_out: str,
+    classification: np.ndarray,
+    *,
+    work_indices: np.ndarray,
+    xw: np.ndarray,
+    yw: np.ndarray,
+    zw: np.ndarray,
+    surf_z: np.ndarray,
+    sx0: float,
+    sy0: float,
+    cell: float,
+    diagnostics: dict[str, np.ndarray],
+) -> str:
+    """Write a separate TLS diagnostic LAS.
+
+    Classification is copied from the final FAST-GC result.
+    Diagnostic values do not alter classification.
+    """
+    # Diagnostics add Extra Bytes dimensions.  Work on an independent
+    # header so those dimensions cannot leak back into the source LAS
+    # or the subsequent production output.
+    out = laspy.LasData(copy.deepcopy(template.header))
+    out.points = template.points.copy()
+    out.classification = np.asarray(
+        classification,
+        dtype=np.uint8,
+    )
+
+    work_indices = np.asarray(
+        work_indices,
+        dtype=np.int64,
+    )
+
+    xw = np.asarray(xw, dtype=np.float64)
+    yw = np.asarray(yw, dtype=np.float64)
+    zw = np.asarray(zw, dtype=np.float64)
+
+    if not (
+        work_indices.size
+        == xw.size
+        == yw.size
+        == zw.size
+    ):
+        raise ValueError(
+            "TLS diagnostic point mapping mismatch: "
+            f"indices={work_indices.size}, "
+            f"x={xw.size}, "
+            f"y={yw.size}, "
+            f"z={zw.size}"
+        )
+
+    n = len(out.points)
+    ny, nx = surf_z.shape
+
+    # --------------------------------------------------------
+    # Grid-cell lookup for cell diagnostics.
+    # --------------------------------------------------------
+
+    gx = np.floor(
+        (xw - float(sx0)) / float(cell)
+    ).astype(np.int64)
+
+    gy = np.floor(
+        (yw - float(sy0)) / float(cell)
+    ).astype(np.int64)
+
+    valid = (
+        (gx >= 0)
+        & (gx < nx)
+        & (gy >= 0)
+        & (gy < ny)
+    )
+
+    def sample_grid(name: str, default=np.nan):
+        result = np.full(
+            xw.size,
+            default,
+            dtype=np.float64,
+        )
+
+        arr = diagnostics.get(name)
+
+        if arr is None:
+            return result
+
+        arr = np.asarray(arr)
+
+        if arr.shape != surf_z.shape:
+            return result
+
+        result[valid] = arr[
+            gy[valid],
+            gx[valid],
+        ]
+
+        return result
+
+    # --------------------------------------------------------
+    # Surface residual.
+    #
+    # Use bilinear interpolation where all four surrounding
+    # surface cells are finite.
+    # --------------------------------------------------------
+
+    fx = (xw - float(sx0)) / float(cell)
+    fy = (yw - float(sy0)) / float(cell)
+
+    ix = np.floor(fx).astype(np.int64)
+    iy = np.floor(fy).astype(np.int64)
+
+    tx = fx - ix
+    ty = fy - iy
+
+    surf_point = np.full(
+        xw.size,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    bvalid = (
+        (ix >= 0)
+        & (iy >= 0)
+        & (ix + 1 < nx)
+        & (iy + 1 < ny)
+    )
+
+    ids = np.flatnonzero(bvalid)
+
+    if ids.size:
+        bx = ix[ids]
+        by = iy[ids]
+
+        z00 = surf_z[by, bx]
+        z10 = surf_z[by, bx + 1]
+        z01 = surf_z[by + 1, bx]
+        z11 = surf_z[by + 1, bx + 1]
+
+        finite = (
+            np.isfinite(z00)
+            & np.isfinite(z10)
+            & np.isfinite(z01)
+            & np.isfinite(z11)
+        )
+
+        good = ids[finite]
+
+        if good.size:
+            gx0 = ix[good]
+            gy0 = iy[good]
+
+            txx = tx[good]
+            tyy = ty[good]
+
+            zz00 = surf_z[gy0, gx0]
+            zz10 = surf_z[gy0, gx0 + 1]
+            zz01 = surf_z[gy0 + 1, gx0]
+            zz11 = surf_z[gy0 + 1, gx0 + 1]
+
+            surf_point[good] = (
+                (1.0 - txx) * (1.0 - tyy) * zz00
+                + txx * (1.0 - tyy) * zz10
+                + (1.0 - txx) * tyy * zz01
+                + txx * tyy * zz11
+            )
+
+    surf_dz = zw - surf_point
+
+    # --------------------------------------------------------
+    # Extract grid diagnostics.
+    # --------------------------------------------------------
+
+    seed = sample_grid(
+        "seed_mask",
+        default=0.0,
+    )
+
+    prop = sample_grid(
+        "propagation_distance"
+    )
+
+    support = sample_grid(
+        "support_count"
+    )
+
+    candconf = sample_grid(
+        "candidate_confidence"
+    )
+
+    colspan = sample_grid(
+        "column_span"
+    )
+
+    surfconf = sample_grid(
+        "confidence"
+    )
+
+    # --------------------------------------------------------
+    # Allocate full-cloud arrays.
+    # --------------------------------------------------------
+
+    tls_seed = np.zeros(
+        n,
+        dtype=np.uint8,
+    )
+
+    tls_prop = np.full(
+        n,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    tls_supp = np.full(
+        n,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    tls_cconf = np.full(
+        n,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    tls_cspan = np.full(
+        n,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    tls_sconf = np.full(
+        n,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    tls_surfdz = np.full(
+        n,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    # --------------------------------------------------------
+    # Map TLS working-set values to original point order.
+    # --------------------------------------------------------
+
+    tls_seed[work_indices] = (
+        np.isfinite(seed)
+        & (seed > 0.5)
+    ).astype(np.uint8)
+
+    tls_prop[work_indices] = prop.astype(
+        np.float32
+    )
+
+    tls_supp[work_indices] = support.astype(
+        np.float32
+    )
+
+    tls_cconf[work_indices] = candconf.astype(
+        np.float32
+    )
+
+    tls_cspan[work_indices] = colspan.astype(
+        np.float32
+    )
+
+    tls_sconf[work_indices] = surfconf.astype(
+        np.float32
+    )
+
+    tls_surfdz[work_indices] = surf_dz.astype(
+        np.float32
+    )
+
+    fields = {
+        "tls_seed": (
+            tls_seed,
+            np.uint8,
+            "TLS initial terrain seed",
+        ),
+        "tls_prop": (
+            tls_prop,
+            np.float32,
+            "TLS propagation distance",
+        ),
+        "tls_supp": (
+            tls_supp,
+            np.float32,
+            "TLS candidate support count",
+        ),
+        "tls_cconf": (
+            tls_cconf,
+            np.float32,
+            "TLS candidate confidence",
+        ),
+        "tls_cspan": (
+            tls_cspan,
+            np.float32,
+            "TLS robust column span",
+        ),
+        "tls_sconf": (
+            tls_sconf,
+            np.float32,
+            "TLS surface confidence",
+        ),
+        "tls_surfdz": (
+            tls_surfdz,
+            np.float32,
+            "Z minus TLS terrain surface",
+        ),
+    }
+
+    for name, (
+        values,
+        dtype,
+        description,
+    ) in fields.items():
+
+        _ensure_tls_diag_extra_dim(
+            out,
+            name,
+            dtype,
+            description,
+        )
+
+        setattr(
+            out,
+            name,
+            values,
+        )
+
+    out_dir = os.path.dirname(fp_out)
+
+    if out_dir:
+        os.makedirs(
+            out_dir,
+            exist_ok=True,
+        )
+
+    out.write(fp_out)
+
+    return fp_out
 
 
 def _iter_las_files(in_path: str, recursive: bool) -> list[str]:
@@ -1474,31 +2011,29 @@ def _build_dsm(
     return {"dsm": dsm, "xmin": xmin, "ymax": ymax}
 
 
-def _write_dem(classified_fp: str, product_dirs: dict[str, str], grid_res: float, dem_method: str = "min"):
-    ctx = _load_product_context(classified_fp)
-    try:
-        dem_pack = _build_dem_bundle(ctx, grid_res, dem_method=dem_method)
-    except RuntimeError as e:
-        msg = str(e)
-        if "Too few ground points" in msg:
-            return {"status": "skipped", "product": PRODUCT_DEM, "tile": classified_fp, "output": None, "reason": msg}
-        raise
+def _write_dem_from_context(
+    ctx: dict,
+    dem_pack: dict,
+    product_dirs: dict[str, str],
+    grid_res: float,
+):
+    """Write FAST_DEM from an already-loaded tile context.
 
+    This helper deliberately performs no scientific recomputation.  It exists so
+    coupled downstream products can reuse one LAS/LAZ read and one DEM build.
+    """
     out_fp = os.path.join(product_dirs[PRODUCT_DEM], f"{ctx['base']}.tif")
     _write_tif(dem_pack["dem"], out_fp, dem_pack["xmin"], dem_pack["ymax"], grid_res, crs=ctx["crs"])
-    return {"status": "ok", "product": PRODUCT_DEM, "tile": classified_fp, "output": out_fp, "reason": None}
+    return {"status": "ok", "product": PRODUCT_DEM, "tile": ctx["classified_fp"], "output": out_fp, "reason": None}
 
 
-def _write_normalized(classified_fp: str, product_dirs: dict[str, str], grid_res: float, dem_method: str = "min"):
-    ctx = _load_product_context(classified_fp)
-    try:
-        dem_pack = _build_dem_bundle(ctx, grid_res, dem_method=dem_method)
-    except RuntimeError as e:
-        msg = str(e)
-        if "Too few ground points" in msg:
-            return {"status": "skipped", "product": PRODUCT_NORMALIZED, "tile": classified_fp, "output": None, "reason": msg}
-        raise
-
+def _write_normalized_from_context(
+    ctx: dict,
+    dem_pack: dict,
+    product_dirs: dict[str, str],
+    grid_res: float,
+):
+    """Write FAST_NORMALIZED from a shared tile context and DEM bundle."""
     z_dem = _sample_grid_bilinear_then_nearest(
         dem_pack["dem"],
         ctx["x"],
@@ -1542,7 +2077,72 @@ def _write_normalized(classified_fp: str, product_dirs: dict[str, str], grid_res
 
     out_fp = os.path.join(product_dirs[PRODUCT_NORMALIZED], f"{ctx['base']}.las")
     out.write(out_fp)
-    return {"status": "ok", "product": PRODUCT_NORMALIZED, "tile": classified_fp, "output": out_fp, "reason": None}
+    return {"status": "ok", "product": PRODUCT_NORMALIZED, "tile": ctx["classified_fp"], "output": out_fp, "reason": None}
+
+
+def _load_and_build_dem(
+    classified_fp: str,
+    grid_res: float,
+    dem_method: str,
+):
+    ctx = _load_product_context(classified_fp)
+    try:
+        dem_pack = _build_dem_bundle(ctx, grid_res, dem_method=dem_method)
+    except RuntimeError as e:
+        msg = str(e)
+        if "Too few ground points" in msg:
+            return None, None, msg
+        raise
+    return ctx, dem_pack, None
+
+
+def _write_dem(classified_fp: str, product_dirs: dict[str, str], grid_res: float, dem_method: str = "min"):
+    ctx, dem_pack, reason = _load_and_build_dem(classified_fp, grid_res, dem_method)
+    if reason is not None:
+        return {"status": "skipped", "product": PRODUCT_DEM, "tile": classified_fp, "output": None, "reason": reason}
+    return _write_dem_from_context(ctx, dem_pack, product_dirs, grid_res)
+
+
+def _write_normalized(classified_fp: str, product_dirs: dict[str, str], grid_res: float, dem_method: str = "min"):
+    ctx, dem_pack, reason = _load_and_build_dem(classified_fp, grid_res, dem_method)
+    if reason is not None:
+        return {"status": "skipped", "product": PRODUCT_NORMALIZED, "tile": classified_fp, "output": None, "reason": reason}
+    return _write_normalized_from_context(ctx, dem_pack, product_dirs, grid_res)
+
+
+def _write_dem_and_normalized_shared(
+    classified_fp: str,
+    product_dirs: dict[str, str],
+    grid_res: float,
+    dem_method: str = "min",
+):
+    """Derive DEM + normalized cloud with one LAS read and one DEM build.
+
+    Output calculations are delegated to the same writers used by the independent
+    product paths; only redundant I/O and DEM reconstruction are removed.
+    """
+    ctx, dem_pack, reason = _load_and_build_dem(classified_fp, grid_res, dem_method)
+    if reason is not None:
+        return {
+            "status": "skipped",
+            "product": f"{PRODUCT_DEM}+{PRODUCT_NORMALIZED}",
+            "tile": classified_fp,
+            "outputs": {},
+            "reason": reason,
+        }
+
+    dem_result = _write_dem_from_context(ctx, dem_pack, product_dirs, grid_res)
+    norm_result = _write_normalized_from_context(ctx, dem_pack, product_dirs, grid_res)
+    return {
+        "status": "ok",
+        "product": f"{PRODUCT_DEM}+{PRODUCT_NORMALIZED}",
+        "tile": classified_fp,
+        "outputs": {
+            PRODUCT_DEM: dem_result["output"],
+            PRODUCT_NORMALIZED: norm_result["output"],
+        },
+        "reason": None,
+    }
 
 
 def _write_dsm_from_raw(
@@ -1614,7 +2214,91 @@ def classify_ground_file(in_path: str, out_path: str, cfg: dict, show_progress: 
     z1 = z[keep]
 
     if sm == "TLS":
-        m1 = np.ones_like(z1, dtype=bool)
+        if bool(cfg.get("tls_voxel_reduce_enabled", True)):
+            tls_voxel_result = reduce_tls_terrain_domain(
+                x1,
+                y1,
+                z1,
+                fine_cell_m=float(cfg.get("tls_voxel_fine_cell_m", 0.50)),
+                support_window_m=float(cfg.get("tls_voxel_support_window_m", 5.0)),
+                low_quantile=float(cfg.get("tls_voxel_low_quantile", 0.05)),
+                min_points_per_cell=int(cfg.get("tls_voxel_min_points_per_cell", 3)),
+                min_support_cells=int(cfg.get("tls_voxel_min_support_cells", 5)),
+                vertical_voxel_m=float(cfg.get("tls_voxel_vertical_m", 0.25)),
+                safe_height_m=float(cfg.get("tls_voxel_safe_height_m", 2.0)),
+            )
+            # V3 terrain-first TLS contract:
+            #
+            # domain_mask:
+            #     conservative V2 terrain-domain eligibility.
+            #
+            # active_mask:
+            #     density-normalized representatives used ONLY to build
+            #     the TLS terrain surface.
+            #
+            # Points omitted from active_mask are not vegetation and are
+            # not removed from final classification.
+            tls_domain_mask = np.asarray(
+                tls_voxel_result.keep_mask,
+                dtype=bool,
+            )
+
+            tls_evidence = select_tls_active_evidence(
+                x1,
+                y1,
+                z1,
+                tls_domain_mask,
+                xy_voxel_m=float(
+                    cfg.get(
+                        "tls_evidence_xy_voxel_m",
+                        0.20,
+                    )
+                ),
+                z_voxel_m=float(
+                    cfg.get(
+                        "tls_evidence_z_voxel_m",
+                        0.10,
+                    )
+                ),
+                max_points_per_voxel=int(
+                    cfg.get(
+                        "tls_evidence_max_points_per_voxel",
+                        8,
+                    )
+                ),
+            )
+
+            m1 = np.asarray(
+                tls_evidence.active_mask,
+                dtype=bool,
+            )
+
+            # Safety fallback:
+            # if evidence normalization becomes unexpectedly aggressive,
+            # use the complete V2 domain rather than risking terrain loss.
+            if np.count_nonzero(m1) < max(
+                1000,
+                int(0.05 * np.count_nonzero(tls_domain_mask)),
+            ):
+                m1 = tls_domain_mask.copy()
+
+            # Second safety fallback:
+            # V2 itself must never collapse the TLS working domain.
+            if np.count_nonzero(m1) < max(
+                1000,
+                int(0.05 * z1.size),
+            ):
+                tls_domain_mask = np.ones_like(
+                    z1,
+                    dtype=bool,
+                )
+                m1 = tls_domain_mask.copy()
+        else:
+            tls_domain_mask = np.ones_like(
+                z1,
+                dtype=bool,
+            )
+            m1 = tls_domain_mask.copy()
     else:
         cand_cell = float(cfg.get("cand_cell_m", cfg.get("base_cell_m", 1.5)))
         cand_dz = float(cfg.get("cand_dz_m", 0.60))
@@ -1646,9 +2330,162 @@ def classify_ground_file(in_path: str, out_path: str, cfg: dict, show_progress: 
             smooth_sigma_cells=float(cfg["vote_smooth_sigma_cells"]),
             ground_threshold=float(cfg["vote_ground_threshold_m"]),
             slope_adapt_k=float(cfg["vote_slope_adapt_k"]),
+            candidate_cluster_gap=float(cfg.get("tls_candidate_cluster_gap_m", 0.08)),
+            candidate_cluster_span=float(cfg.get("tls_candidate_cluster_span_m", 0.14)),
+            candidate_min_cluster_points=int(cfg.get("tls_candidate_min_cluster_points", 3)),
+            below_ground_gap_threshold=float(cfg.get("tls_below_ground_gap_m", 0.16)),
+            below_ground_max_cluster_points=int(cfg.get("tls_below_ground_max_cluster_points", 2)),
+            use_offset_grid=bool(cfg.get("tls_use_offset_grid", True)),
+            radius_min_cells=int(cfg.get("tls_radius_min_cells", 2)),
+            radius_max_cells=int(cfg.get("tls_radius_max_cells", 12)),
+            min_support_sectors=int(cfg.get("tls_min_support_sectors", 3)),
+            seed_confidence=float(cfg.get("tls_seed_confidence", 0.68)),
+            seed_max_vertical_span=float(cfg.get("tls_seed_max_vertical_span_m", 0.35)),
+            propagation_iters=int(cfg.get("tls_propagation_iters", 24)),
+            max_extrapolation_cells=int(cfg.get("tls_max_extrapolation_cells", 5)),
+            plane_min_support=int(cfg.get("tls_plane_min_support", 6)),
+            plane_max_residual=float(cfg.get("tls_plane_max_residual_m", 0.14)),
+            fill_min_bank_fraction=float(cfg.get("tls_fill_min_bank_fraction", 0.50)),
+            fill_max_distance_cells=int(cfg.get("tls_fill_max_distance_cells", 5)),
+            reject_edge_connected_voids=bool(cfg.get("tls_reject_edge_connected_voids", True)),
+            smooth_iters=int(cfg.get("tls_smooth_iters", 2)),
+            bilateral_height_sigma=float(cfg.get("tls_bilateral_height_sigma_m", 0.18)),
+            bilateral_slope_sigma=float(cfg.get("tls_bilateral_slope_sigma", 0.60)),
+            curvature_adapt_k=float(cfg.get("tls_curvature_adapt_k", 0.05)),
+            roughness_adapt_k=float(cfg.get("tls_roughness_adapt_k", 0.30)),
+            threshold_min=float(cfg.get("tls_threshold_min_m", 0.03)),
+            threshold_max=float(cfg.get("tls_threshold_max_m", 0.28)),
+            lower_threshold_factor=float(cfg.get("tls_lower_threshold_factor", 1.75)),
+            min_surface_confidence=float(cfg.get("tls_min_surface_confidence", 0.28)),
+            min_classification_confidence=float(cfg.get("tls_min_classification_confidence", 0.34)),
+            weak_confidence_tighten=float(cfg.get("tls_weak_confidence_tighten", 0.45)),
         )
-        surf_z, sx0, sy0 = build_tls_surface_invert_dsm_vote(xw, yw, zw, vcfg)
-        ground_mask = np.asarray(classify_tls_by_surface(xw, yw, zw, surf_z, sx0, sy0, vcfg), dtype=bool)
+        # ACTIVE evidence constructs the TLS terrain surface.
+        surf_z, sx0, sy0 = build_tls_surface_invert_dsm_vote(
+            xw,
+            yw,
+            zw,
+            vcfg,
+        )
+        tls_surface_diagnostics = get_tls_surface_diagnostics(
+            surf_z
+        )
+
+        # --------------------------------------------------------
+        # TERRAIN-FIRST TLS CONTRACT
+        # --------------------------------------------------------
+        # ACTIVE points are only support for surface construction.
+        #
+        # Once the surface exists, classify the complete conservative
+        # V2 terrain domain against it.  A point is therefore never
+        # non-ground merely because V3 marked it redundant.
+        #
+        # Clearly V2-deferred points remain outside the TLS terrain
+        # domain by design.
+        domain_indices = np.flatnonzero(tls_domain_mask)
+
+        xd = x1[tls_domain_mask]
+        yd = y1[tls_domain_mask]
+        zd = z1[tls_domain_mask]
+
+        ground_mask = np.asarray(
+            classify_tls_by_surface(
+                xd,
+                yd,
+                zd,
+                surf_z,
+                sx0,
+                sy0,
+                vcfg,
+            ),
+            dtype=bool,
+        )
+
+        tls_candidate_ground = ground_mask.copy()
+
+        # From this point through membrane/recovery/final TLS QC,
+        # xw/yw/zw intentionally represent the complete V2 terrain
+        # domain, not only the ACTIVE surface-building evidence.
+        xw, yw, zw = xd, yd, zd
+
+        # m1 is the mapping from x1/y1/z1 into the working TLS domain.
+        m1 = tls_domain_mask.copy()
+
+        # Preserve the TLS-v2 high-recall candidate layer, then purify it into
+        # a geometrically coherent, paper-thin terrain membrane.
+        if bool(cfg.get("tls_membrane_enabled", False)):
+            membrane_cfg = TlsMembraneConfig(
+                enabled=True,
+                cell=float(cfg.get("tls_membrane_cell_m", 0.15)),
+                offset_fraction=float(cfg.get("tls_membrane_offset_fraction", 0.50)),
+                cluster_gap_m=float(cfg.get("tls_membrane_cluster_gap_m", 0.035)),
+                cluster_span_max_m=float(cfg.get("tls_membrane_cluster_span_max_m", 0.040)),
+                cluster_min_points=int(cfg.get("tls_membrane_cluster_min_points", 2)),
+                cluster_max_points_examined=int(cfg.get("tls_membrane_cluster_max_points_examined", 32)),
+                below_noise_gap_m=float(cfg.get("tls_membrane_below_noise_gap_m", 0.12)),
+                below_noise_max_points=int(cfg.get("tls_membrane_below_noise_max_points", 2)),
+                offset_agreement_m=float(cfg.get("tls_membrane_offset_agreement_m", 0.035)),
+                anchor_min_offset_votes=int(cfg.get("tls_membrane_anchor_min_offset_votes", 3)),
+                anchor_min_score=float(cfg.get("tls_membrane_anchor_min_score", 0.58)),
+                anchor_min_local_occupancy=float(cfg.get("tls_membrane_anchor_min_local_occupancy", 0.22)),
+                anchor_density_quantile=float(cfg.get("tls_membrane_anchor_density_quantile", 0.45)),
+                anchor_max_cluster_thickness_m=float(cfg.get("tls_membrane_anchor_max_cluster_thickness_m", 0.035)),
+                propagation_iters=int(cfg.get("tls_membrane_propagation_iters", 60)),
+                propagation_radius_cells=int(cfg.get("tls_membrane_propagation_radius_cells", 2)),
+                max_anchor_distance_cells=int(cfg.get("tls_membrane_max_anchor_distance_cells", 20)),
+                weak_observation_gate_m=float(cfg.get("tls_membrane_weak_observation_gate_m", 0.080)),
+                anchor_lock_weight=float(cfg.get("tls_membrane_anchor_lock_weight", 12.0)),
+                weak_observation_weight=float(cfg.get("tls_membrane_weak_observation_weight", 0.20)),
+                relaxation=float(cfg.get("tls_membrane_relaxation", 0.65)),
+                sheet_thickness_min_m=float(cfg.get("tls_membrane_sheet_thickness_min_m", 0.010)),
+                sheet_thickness_base_m=float(cfg.get("tls_membrane_sheet_thickness_base_m", 0.018)),
+                sheet_thickness_max_m=float(cfg.get("tls_membrane_sheet_thickness_max_m", 0.035)),
+                upper_factor=float(cfg.get("tls_membrane_upper_factor", 1.00)),
+                lower_factor=float(cfg.get("tls_membrane_lower_factor", 1.35)),
+                thickness_regularize_iters=int(cfg.get("tls_membrane_thickness_regularize_iters", 6)),
+                min_keep_confidence=float(cfg.get("tls_membrane_min_keep_confidence", 0.22)),
+                recover_ground=False,
+            )
+            membrane = refine_tls_ground_membrane(
+                x=xw, y=yw, z=zw, candidate_ground=ground_mask, config=membrane_cfg
+            )
+            ground_mask = np.asarray(membrane.final_ground, dtype=bool)
+
+        # Conservative TLS micro-topography recovery.  The membrane remains the
+        # trusted precision layer.  This stage may restore only points that were
+        # already in the pre-membrane TLS-v2 candidate set; raw non-ground points
+        # are never recruited.  No stdout logging is emitted here so the parent
+        # CLASSIFY progress dashboard remains a single dynamic line.
+        if bool(cfg.get("tls_terrain_recovery_enabled", False)):
+            terrain_cfg = TlsTerrainRecoveryConfig(
+                enabled=True,
+                cell=float(cfg.get("tls_terrain_recovery_cell_m", cfg.get("tls_membrane_cell_m", 0.15))),
+                max_passes=int(cfg.get("tls_terrain_recovery_passes", 3)),
+                low_cluster_gap_m=float(cfg.get("tls_terrain_recovery_cluster_gap_m", 0.040)),
+                low_cluster_span_max_m=float(cfg.get("tls_terrain_recovery_cluster_span_m", 0.060)),
+                min_cluster_points=int(cfg.get("tls_terrain_recovery_min_cluster_points", 2)),
+                max_points_examined=int(cfg.get("tls_terrain_recovery_max_points_examined", 48)),
+                detached_low_noise_gap_m=float(cfg.get("tls_terrain_recovery_noise_gap_m", 0.12)),
+                detached_low_noise_max_points=int(cfg.get("tls_terrain_recovery_noise_max_points", 2)),
+                min_directional_support=int(cfg.get("tls_terrain_recovery_min_support_dirs", 2)),
+                bilateral_radius_cells=int(cfg.get("tls_terrain_recovery_bilateral_radius_cells", 4)),
+                base_residual_m=float(cfg.get("tls_terrain_recovery_base_residual_m", 0.050)),
+                slope_residual_k=float(cfg.get("tls_terrain_recovery_slope_k", 0.42)),
+                bilateral_base_residual_m=float(cfg.get("tls_terrain_recovery_bilateral_residual_m", 0.070)),
+                max_residual_m=float(cfg.get("tls_terrain_recovery_max_residual_m", 0.135)),
+                max_neighbor_step_m=float(cfg.get("tls_terrain_recovery_max_step_m", 0.18)),
+                point_lower_m=float(cfg.get("tls_terrain_recovery_point_lower_m", 0.030)),
+                point_upper_m=float(cfg.get("tls_terrain_recovery_point_upper_m", 0.050)),
+            )
+            terrain_recovery = recover_tls_microtopography(
+                x=xw,
+                y=yw,
+                z=zw,
+                trusted_ground=ground_mask,
+                candidate_pool=tls_candidate_ground,
+                config=terrain_cfg,
+            )
+            ground_mask = np.asarray(terrain_recovery.final_ground, dtype=bool)
     elif sm in {"ULS", "ALS"}:
         vcfg = InvertVoteConfig(
             cell=float(cfg["vote_cell_m"]),
@@ -1662,8 +2499,27 @@ def classify_ground_file(in_path: str, out_path: str, cfg: dict, show_progress: 
             ground_threshold=float(cfg["vote_ground_threshold_m"]),
             slope_adapt_k=float(cfg["vote_slope_adapt_k"]),
         )
+
+        # TERRAIN-FIRST CONTRACT
+        # ----------------------
+        # The lower-layer candidate mask is only a robust SUPPORT selector for
+        # construction of the voted terrain surface.  It is NOT an eligibility
+        # gate for the final classification.  On steep/curved terrain an XY cell
+        # can legitimately span a large Z range, so permanently discarding points
+        # outside the candidate band creates unrecoverable holes at ridges,
+        # convex/concave bulges and slope transitions.
         surf_z, sx0, sy0 = build_surface_invert_vote(xw, yw, zw, vcfg)
-        ground_mask = np.asarray(classify_by_surface(xw, yw, zw, surf_z, sx0, sy0, vcfg), dtype=bool)
+
+        # Classify the complete cleaned ALS/ULS cloud against the support surface.
+        # From this point onward xw/yw/zw intentionally refer to the complete
+        # cleaned cloud, allowing every observed return to participate in final
+        # terrain recovery/QC.  No point is invented.
+        ground_mask = np.asarray(
+            classify_by_surface(x1, y1, z1, surf_z, sx0, sy0, vcfg),
+            dtype=bool,
+        )
+        xw, yw, zw = x1, y1, z1
+        m1 = np.ones_like(z1, dtype=bool)
     else:
         bar.close()
         raise ValueError(f"Unsupported sensor mode: {sm}")
@@ -1687,11 +2543,675 @@ def classify_ground_file(in_path: str, out_path: str, cfg: dict, show_progress: 
         cfg=cfg,
     )
 
+    # Post-classification depression/ditch validation.  This does not alter the
+    # primary FAST-GC classifier: it only inspects holes in the trusted ground
+    # support and selectively promotes a coherent low layer when surrounding
+    # ground validates a real concavity.  TLS is a no-op here.
+    ground_mask, ditch_qc = sweep_ground_depressions(
+        x=xw,
+        y=yw,
+        z=zw,
+        ground_mask=ground_mask,
+        sensor_mode=sm,
+        cfg=cfg,
+        return_report=True,
+    )
+    # Keep parallel tile workers silent while the parent process owns the
+    # single live progress dashboard.  Per-tile DITCH-QC messages from loky
+    # workers were interleaving with and breaking the CLASSIFY progress line.
+    # The message remains available for explicit single-file progress runs.
+    if show_progress and int(ditch_qc.get("recovered_points", 0)) > 0:
+        log_info(
+            "DITCH-QC "
+            f"candidates={ditch_qc.get('candidate_components', 0)} | "
+            f"validated={ditch_qc.get('validated_components', 0)} | "
+            f"recovered={ditch_qc.get('recovered_points', 0)}"
+        )
+
     bar.update(1)
 
+
+    # TERRAIN-FIRST FINAL QC
+    # ----------------------
+    # Building/roof removal is deliberately NOT part of core FAST_GC anymore.
+    # A coherent roof may remain class 2 if removing it would risk deleting a
+    # real ridge, convex/concave landform, embankment or other terrain feature.
+    # The core classifier is responsible for terrain-vs-vegetation separation;
+    # anthropogenic-object cleanup belongs in an optional downstream DEM module.
+
+    # Final multi-pass terrain swipe.  The recovery routine is curvature-aware,
+    # uses slope-normal residuals, and promotes only actually observed low-layer
+    # returns supported by nearby trusted terrain.  Multiple conservative passes
+    # let support propagate inward through a large systematic void instead of
+    # repairing only its outermost cell ring.
+    _sc_cell=float(cfg.get('surface_consensus_cell_m', 0.60 if sm == 'ULS' else 1.00))
+    _sc_workspace=build_surface_consensus_workspace(xw,yw,zw,_sc_cell) if sm in {'ALS','ULS'} else None
+    ground_mask, final_swipe_qc = recover_surface_false_negatives(
+        x=xw, y=yw, z=zw, ground_mask=ground_mask,
+        sensor_mode=sm, cfg=cfg, workspace=_sc_workspace,
+    )
+    if show_progress and int(final_swipe_qc.get('recovered_points', 0)) > 0:
+        log_info(
+            'FINAL-TERRAIN-SWIPE '
+            f"passes={final_swipe_qc.get('passes_run',0)} | "
+            f"candidates={final_swipe_qc.get('candidate_cells',0)} | "
+            f"validated={final_swipe_qc.get('validated_cells',0)} | "
+            f"recovered={final_swipe_qc.get('recovered_points',0)}"
+        )
+
+    # TWO-WAY NEAR-SURFACE SWIPE
+    # --------------------------
+    # The mature core terrain result is now treated as the baseline.  This final
+    # tile-local pass does not alter the vote classifier, slope logic or seam QC.
+    # It only reconciles local label inconsistencies around the fitted terrain:
+    #   * class-2 -> non-ground when the point is above the local terrain and its
+    #     same-elevation neighbourhood is dominated by non-ground returns;
+    #   * non-ground -> class-2 only when it lies on the local terrain and its
+    #     same-elevation neighbourhood is strongly ground dominated.
+    # This catches flying ground in high canopy, understory and low shrubs while
+    # keeping steep/curved terrain protected by surface-normal residuals.
+    ground_mask, two_way_qc = two_way_surface_classification_swipe(
+        x=xw, y=yw, z=zw, ground_mask=ground_mask, sensor_mode=sm, cfg=cfg,
+        workspace=_sc_workspace,
+    )
+    # Release the tile-local QC index before LAS serialization.
+    _sc_workspace=None
+    if show_progress and (int(two_way_qc.get('demoted_points', 0)) > 0 or int(two_way_qc.get('promoted_points', 0)) > 0):
+        log_info(
+            'TWO-WAY-SURFACE-SWIPE '
+            f"ground_candidates={two_way_qc.get('candidate_ground_points',0)} | "
+            f"nonground_candidates={two_way_qc.get('candidate_nonground_points',0)} | "
+            f"demoted={two_way_qc.get('demoted_points',0)} | "
+            f"promoted={two_way_qc.get('promoted_points',0)} | "
+            f"surface_impurity_cells={two_way_qc.get('surface_impurity_candidate_cells',0)} | "
+            f"surface_impurity_confirmed={two_way_qc.get('surface_impurity_confirmed_cells',0)} | "
+            f"surface_impurity_demoted={two_way_qc.get('surface_impurity_demoted_points',0)}"
+        )
+
+    # ALS POST-FINAL SURFACE COMPLETION V5
+    # ------------------------------------
+    # Runs AFTER all existing final terrain/two-way QC and immediately
+    # BEFORE Classification is serialized. Promotion only.
+    ground_mask, postfinal_qc = recover_postfinal_surface(
+        x=xw,
+        y=yw,
+        z=zw,
+        ground_mask=ground_mask,
+        sensor_mode=sm,
+        cfg=cfg,
+        return_report=True,
+    )
+    if show_progress and sm != "TLS":
+        log_info(
+            'POSTFINAL-SURFACE '
+            f"before={postfinal_qc.get('ground_before',0)} | "
+            f"candidates={postfinal_qc.get('candidate_points',0)} | "
+            f"recovered={postfinal_qc.get('recovered_points',0)} | "
+            f"cells={postfinal_qc.get('recovered_cells',0)} | "
+            f"after={postfinal_qc.get('ground_after',0)}"
+        )
+
+    # ALS STATISTICAL GROUND-SHEET CLEANER V9
+    # DEMOTION ONLY: 1 m raw XYZ statistics + lowest current-ground support.
+    ground_mask, statsheet_qc = clean_statistical_ground_sheet(
+        x=xw, y=yw, z=zw, ground_mask=ground_mask, sensor_mode=sm, cfg=cfg, return_report=True,
+    )
+    if show_progress and sm != "TLS":
+        log_info(
+            'POSTFINAL-STATSHEET '
+            f"before={statsheet_qc.get('ground_before',0)} | "
+            f"demoted={statsheet_qc.get('demoted_points',0)} | "
+            f"per_iter={statsheet_qc.get('demoted_per_iteration',[])} | "
+            f"thin={statsheet_qc.get('thin_cells',0)} | "
+            f"moderate={statsheet_qc.get('moderate_cells',0)} | "
+            f"complex={statsheet_qc.get('complex_cells',0)} | "
+            f"after={statsheet_qc.get('ground_after',0)}"
+        )
+
+
+    # ALS FACET + 3-D SUPPORT CONSISTENCY GUARD V11
+    # -------------------------------------------------
+    # Point-cloud native, ALS-only, DEMOTION-only.
+    # 1) current-ground local facet
+    # 2) coherent lower-ground facet and slope-invariant plane separation
+    # 3) counterpart non-ground facet + non-ground dominance
+    # 4) weak downward ground connectivity
+    if sm != "TLS":
+        ground_mask, facet3d_qc = clean_als_facet_support_consistency(
+            x=xw,
+            y=yw,
+            z=zw,
+            ground_mask=ground_mask,
+            sensor_mode=sm,
+            cfg=cfg,
+            return_report=True,
+        )
+        if show_progress:
+            _iters = facet3d_qc.get("iterations", [])
+            _txt = "; ".join(
+                (
+                    f"iter={r.get('iteration', 0)} "
+                    f"zrange={r.get('zrange_threshold_m', 0.0):.3f} "
+                    f"flagged_cells={r.get('flagged_cells', 0)} "
+                    f"candidates={r.get('candidate_ground_points', 0)} "
+                    f"residual={r.get('sheet_residual_candidates', 0)} "
+                    f"isolated={r.get('spatially_isolated', 0)} "
+                    f"lower_supported={r.get('lower_sheet_supported', 0)} "
+                    f"forced={r.get('forced_sparse_residuals', 0)} "
+                    f"demoted={r.get('reclassified_to_nonground', 0)}"
+                )
+                for r in _iters
+            )
+            log_info(
+                "POSTFINAL-FACET3D "
+                f"before={facet3d_qc.get('ground_before',0)} | "
+                f"demoted={facet3d_qc.get('reclassified_to_nonground',0)} | "
+                f"after={facet3d_qc.get('ground_after',0)} | "
+                f"{_txt}"
+            )
+
+    # ALS GROUND-ONLY VERTICAL PROFILE GUARD V1
+    # ------------------------------------------
+    # Final ALS-only, G->NG-only contamination cleanup.
+    # This stage uses ONLY current ground-labelled points.
+    # It builds vertical point-frequency distributions inside 5/7.5/10 m XY
+    # footprints, protects the supported lowest ground mode, and flags elevated
+    # secondary ground modes/spikes. Where the true low mode is absent because
+    # of canopy occlusion, terrain elevation is propagated from neighboring
+    # trusted ground cells using a small local plane/IDW prediction.
+    ground_mask, ground_profile_qc = refine_als_ground_vertical_profile(
+        x=xw,
+        y=yw,
+        z=zw,
+        ground_mask=ground_mask,
+        sensor_mode=sm,
+        cfg=cfg,
+        return_report=True,
+    )
+    if show_progress and sm != "TLS":
+        log_info(
+            "POSTFINAL-GROUND-PROFILE "
+            f"before={ground_profile_qc.get('ground_before',0)} | "
+            f"scales={ground_profile_qc.get('scales_m',[])} | "
+            f"trusted={ground_profile_qc.get('trusted_cells_per_scale',[])} | "
+            f"unsupported={ground_profile_qc.get('unsupported_cells_per_scale',[])} | "
+            f"spikes={ground_profile_qc.get('spike_candidates_per_scale',[])} | "
+            f"consensus={ground_profile_qc.get('consensus_candidates',0)} | "
+            f"hard={ground_profile_qc.get('hard_candidates',0)} | "
+            f"demoted={ground_profile_qc.get('demoted_points',0)} | "
+            f"after={ground_profile_qc.get('ground_after',0)}"
+        )
+
+    # ========================================================
+    # ALS POINT-FIRST DETACHED GROUND GUARD V1
+    # ========================================================
+    # Runs before the raster/radial V4.1 guard.
+    # Detects suspended class-2 points directly and therefore
+    # does not require a slope-anomaly seed.
+    ground_mask, detached_ground_qc = apply_detached_ground_guard(
+        x=xw,
+        y=yw,
+        z=zw,
+        ground_mask=ground_mask,
+        sensor_mode=sm,
+        cfg=cfg,
+        return_report=True,
+    )
+
+    if show_progress and sm != "TLS":
+        log_info(
+            "POSTFINAL-DETACHED-GROUND "
+            f"before={detached_ground_qc.get('ground_before', 0)} | "
+            f"screen_cells={detached_ground_qc.get('screen_cells', 0)} | "
+            f"modeled_cells={detached_ground_qc.get('modeled_cells', 0)} | "
+            f"candidates={detached_ground_qc.get('candidate_points', 0)} | "
+            f"demoted={detached_ground_qc.get('demoted_points', 0)} | "
+            f"after={detached_ground_qc.get('ground_after', 0)}"
+        )
+
+    # ========================================================
+    # ALS FINAL SURFACE IMPURITY GUARD V4.1
+    # ========================================================
+    # Final demotion-only surface contamination cleanup.
+    # This is deliberately the last classification refinement
+    # before Classification is serialized.
+    ground_mask, surface_impurity_qc = apply_surface_impurity_guard(
+        x=xw,
+        y=yw,
+        z=zw,
+        ground_mask=ground_mask,
+        sensor_mode=sm,
+        cfg=cfg,
+        return_report=True,
+    )
+
+    if show_progress and sm != "TLS":
+        log_info(
+            "POSTFINAL-SURFACE-IMPURITY "
+            f"before={surface_impurity_qc.get('ground_before', 0)} | "
+            f"components={surface_impurity_qc.get('candidate_components', 0)} | "
+            f"modeled={surface_impurity_qc.get('modeled_components', 0)} | "
+            f"candidates={surface_impurity_qc.get('candidate_points', 0)} | "
+            f"demoted={surface_impurity_qc.get('demoted_points', 0)} | "
+            f"after={surface_impurity_qc.get('ground_after', 0)}"
+        )
+
     classification = np.ones(N, dtype=np.uint8)
+    # ========================================================
+    # ========================================================
+    # ALS TERRAIN BLOB / CANOPY IMPOSTOR GUARD V1
+    # ========================================================
+    # Final raster-first / point-confirmed cleanup.
+    #
+    # Independent candidate evidence:
+    #   * 0.5 m MAX-Z DEM positive prominence
+    #   * 1.5 / 3 / 5 m multiscale response
+    #   * slope EXCESS relative to surrounding terrain
+    #   * robust local Z outlier
+    #   * weak ground support / void
+    #   * connected-component morphology
+    #
+    # Final exact-point confirmation:
+    #   * leave-component-out 5 m plane/quadratic terrain
+    #   * terrain-normal residual
+    #   * radial return to terrain
+    #   * neighbor slope/Z disagreement
+    #   * nearby non-ground canopy-layer consistency
+    #
+    # DEMOTION ONLY.
+    ground_mask, terrain_blob_qc = apply_terrain_blob_guard(
+        x=xw,
+        y=yw,
+        z=zw,
+        ground_mask=ground_mask,
+        sensor_mode=sm,
+        cfg=cfg,
+        return_report=True,
+    )
+
+    # ========================================================
+    # VERTICAL SUPPORT FINAL GUARD V2.1
+    # ========================================================
+    # The raw 5 m x 5 m x 1 m profile proposes suspicious upper-ground
+    # locations. Surrounding 3-D terrain geometry independently confirms
+    # each demotion. Handles both smaller patches and larger upper blobs.
+    ground_mask, vertical_support_qc = apply_vertical_support_final_guard(
+        x=xw,
+        y=yw,
+        z=zw,
+        ground_mask=ground_mask,
+        sensor_mode=sm,
+        cfg=cfg,
+        return_report=True,
+    )
+
+    if show_progress and sm != "TLS":
+        log_info(
+            "POSTFINAL-VERTICAL-SUPPORT "
+            f"enabled={vertical_support_qc.get('enabled',False)} | "
+            f"cells={vertical_support_qc.get('support_cells',0)} | "
+            f"weak_cells={vertical_support_qc.get('weak_cells',0)} | "
+            f"canopy_cells={vertical_support_qc.get('canopy_cells',0)} | "
+            f"flagged_cells={vertical_support_qc.get('flagged_cells',0)} | "
+            f"candidates={vertical_support_qc.get('candidate_points',0)} | "
+            f"small={vertical_support_qc.get('small_candidates',0)} | "
+            f"large={vertical_support_qc.get('large_candidates',0)} | "
+            f"modeled={vertical_support_qc.get('modeled_points',0)} | "
+            f"demoted={vertical_support_qc.get('demoted_points',0)} | "
+            f"demoted_small={vertical_support_qc.get('demoted_small',0)} | "
+            f"demoted_large={vertical_support_qc.get('demoted_large',0)} | "
+            f"median_gap={vertical_support_qc.get('median_gap_m',0.0):.3f} | "
+            f"max_gap={vertical_support_qc.get('max_gap_m',0.0):.3f} | "
+            f"after={vertical_support_qc.get('ground_after',0)}"
+        )
+
+    # ========================================================
+    # TLS HARD AIRBORNE / CANOPY-LEAK GUARD
+    # ========================================================
+    # Reuses only the proven point-first ALS airborne detector.
+    # The broader ALS/ULS raster/blob pipeline remains unchanged.
+    # Strictly demotion-only.
+    tls_airborne_qc = {
+        "enabled": False,
+        "ground_before": int(ground_mask.sum()),
+        "ground_after": int(ground_mask.sum()),
+        "screen_candidates": 0,
+        "modeled_candidates": 0,
+        "confirmed_candidates": 0,
+        "demoted_points": 0,
+    }
+
+    if (
+        sm == "TLS"
+        and bool(
+            cfg.get(
+                "tls_hard_airborne_guard_enabled",
+                False,
+            )
+        )
+    ):
+        _tls_before_airborne = ground_mask.copy()
+
+        ground_mask, tls_airborne_qc = (
+            apply_hard_airborne_ground_guard(
+                x=xw,
+                y=yw,
+                z=zw,
+                ground_mask=ground_mask,
+                sensor_mode="TLS",
+                cfg=cfg,
+                return_report=True,
+            )
+        )
+
+        if np.any(
+            ground_mask
+            & ~_tls_before_airborne
+        ):
+            raise RuntimeError(
+                "TLS airborne guard recruited new ground."
+            )
+
+        if show_progress:
+            log_info(
+                "TLS-FINAL-AIRBORNE "
+                f"before={int(_tls_before_airborne.sum())} | "
+                f"screen={tls_airborne_qc.get('screen_candidates',0)} | "
+                f"modeled={tls_airborne_qc.get('modeled_candidates',0)} | "
+                f"confirmed={tls_airborne_qc.get('confirmed_candidates',0)} | "
+                f"demoted={tls_airborne_qc.get('demoted_points',0)} | "
+                f"after={int(ground_mask.sum())}"
+            )
+
+    if show_progress and sm != "TLS":
+        log_info(
+            "POSTFINAL-TERRAIN-BLOB "
+            f"before={terrain_blob_qc.get('ground_before',0)} | "
+            f"components={terrain_blob_qc.get('candidate_components',0)} | "
+            f"modeled={terrain_blob_qc.get('modeled_components',0)} | "
+            f"validated={terrain_blob_qc.get('validated_components',0)} | "
+            f"candidates={terrain_blob_qc.get('candidate_points',0)} | "
+            f"demoted={terrain_blob_qc.get('demoted_points',0)} | "
+            f"after={terrain_blob_qc.get('ground_after',0)}"
+        )
+
+        _nout = terrain_blob_qc.get(
+            "neighbor_outlier",
+            {},
+        )
+
+        log_info(
+            "POSTFINAL-NEIGHBOR-OUTLIER "
+            f"iterations={_nout.get('iterations_run',0)} | "
+            f"tested={_nout.get('tested',0)} | "
+            f"candidates={_nout.get('candidates',0)} | "
+            f"modeled={_nout.get('modeled',0)} | "
+            f"confirmed={_nout.get('confirmed',0)} | "
+            f"demoted={_nout.get('demoted_points',0)} | "
+            f"max_ratio={_nout.get('max_ratio',0.0):.3f} | "
+            f"max_gap={_nout.get('max_gap_m',0.0):.3f} | "
+            f"max_rn={_nout.get('max_rn',0.0):.3f}"
+        )
+
+        for _nop in _nout.get("passes", []):
+            log_info(
+                "POSTFINAL-NEIGHBOR-OUTLIER-PASS "
+                f"pass={_nop.get('iteration',0)} | "
+                f"before={_nop.get('before',0)} | "
+                f"cand={_nop.get('candidates',0)} | "
+                f"model={_nop.get('modeled',0)} | "
+                f"confirm={_nop.get('confirmed',0)} | "
+                f"demote={_nop.get('demoted',0)} | "
+                f"ratio={_nop.get('max_ratio',0.0):.3f} | "
+                f"gap={_nop.get('max_gap_m',0.0):.3f} | "
+                f"rn={_nop.get('max_rn',0.0):.3f} | "
+                f"after={_nop.get('after',0)}"
+            )
+
+        _crg = terrain_blob_qc.get(
+            "canopy_ridge_authorization",
+            {},
+        )
+
+        if _crg:
+            log_info(
+                "POSTFINAL-CANOPY-RIDGE-GATE "
+                f"attempted={_crg.get('attempted_demotions',0)} | "
+                f"components={_crg.get('components',0)} | "
+                f"ridge_keep={_crg.get('ridge_protected_components',0)} | "
+                f"no_canopy_keep={_crg.get('no_canopy_components',0)} | "
+                f"canopy_confirmed={_crg.get('canopy_confirmed_components',0)} | "
+                f"restored={_crg.get('restored_points',0)} | "
+                f"authorized={_crg.get('authorized_demotions',0)}"
+            )
+
+
+        _airborne = terrain_blob_qc.get(
+            "airborne",
+            {},
+        )
+
+        log_info(
+            "POSTFINAL-AIRBORNE "
+            f"screen={_airborne.get('screen_candidates',0)} | "
+            f"modeled={_airborne.get('modeled_candidates',0)} | "
+            f"confirmed={_airborne.get('confirmed_candidates',0)} | "
+            f"demoted={_airborne.get('demoted_points',0)} | "
+            f"max_rn={_airborne.get('max_residual_m',0.0):.3f} | "
+            f"median_rn={_airborne.get('median_residual_m',0.0):.3f} | "
+            f"max_screen_gap={_airborne.get('max_screen_gap_m',0.0):.3f}"
+        )
+
+        for _tb in terrain_blob_qc.get("passes", []):
+            log_info(
+                "POSTFINAL-TERRAIN-BLOB-PASS "
+                f"pass={_tb.get('pass',0)} | "
+                f"occupied={_tb.get('occupied_cells',0)} | "
+                f"p1={_tb.get('prominence_1',0)} | "
+                f"p2={_tb.get('prominence_2',0)} | "
+                f"p3={_tb.get('prominence_3',0)} | "
+                f"strong={_tb.get('strong_prominence',0)} | "
+                f"slope={_tb.get('slope_excess',0)} | "
+                f"outlier={_tb.get('local_outliers',0)} | "
+                f"void={_tb.get('void_support',0)} | "
+                f"seed={_tb.get('seed_cells',0)} | "
+                f"components={_tb.get('components',0)} | "
+                f"modeled={_tb.get('modeled_components',0)} | "
+                f"validated={_tb.get('validated_components',0)} | "
+                f"candidates={_tb.get('candidate_points',0)} | "
+                f"demoted={_tb.get('demoted_points',0)}"
+            )
+
+    # ================================================================
+    # FINAL NORMAL-SPACE OFFSET SURFACE VOTING
+    # ================================================================
+    # Hidden low-density channel: automatically active only below 5 pts/m2.
+    # Existing FAST-GC is completed first; this stage is DEMOTION ONLY.
+    ground_mask, final_surface_vote_qc = apply_final_surface_vote(
+        x=xw, y=yw, z=zw, ground_mask=ground_mask,
+        sensor_mode=sm, cfg=cfg, return_report=True,
+    )
+    if show_progress and sm != "TLS":
+        _ld = bool(final_surface_vote_qc.get('activated', False))
+        log_info(
+            'POSTFINAL-SURFACE-VOTE '
+            f"density={final_surface_vote_qc.get('density_pts_m2',0.0):.3f} | "
+            f"low_density={_ld} | "
+            f"trigger_lt={final_surface_vote_qc.get('density_trigger_pts_m2',5.0):.3f} | "
+            f"passes={final_surface_vote_qc.get('passes',0)} | "
+            f"patches={final_surface_vote_qc.get('patches_tested',0)} | "
+            f"modeled={final_surface_vote_qc.get('patches_modeled',0)} | "
+            f"voted_points={final_surface_vote_qc.get('points_with_votes',0)} | "
+            f"required_votes={final_surface_vote_qc.get('required_votes',0)} | "
+            f"max_votes={final_surface_vote_qc.get('max_votes',0)} | "
+            f"candidate_cells={final_surface_vote_qc.get('candidate_cells',0)} | "
+            f"candidates={final_surface_vote_qc.get('candidate_points',0)} | "
+            f"demoted={final_surface_vote_qc.get('demoted_points',0)} | "
+            f"median_r={final_surface_vote_qc.get('median_candidate_residual_m',0.0):.3f}"
+        )
+    # ================================================================
+    # D2 REVERSE MULTISCALE CONTEXT VOTING
+    # ================================================================
+    # VERY_LOW (<3 pts/m2) only. Existing forward Z voting is retained.
+    # Reverse audit uses external Z prominence + slope distribution + normals.
+    # Genuine coarse terrain complexity can veto removal. DEMOTION ONLY.
+    ground_mask, d2_reverse_qc = apply_d2_reverse_context_vote(
+        x=xw, y=yw, z=zw, ground_mask=ground_mask,
+        sensor_mode=sm, cfg=cfg, return_report=True,
+    )
+    if show_progress and sm != "TLS":
+        log_info(
+            'D2-REVERSE-CONTEXT '
+            f"density={d2_reverse_qc.get('density_pts_m2',0.0):.3f} | "
+            f"activated={d2_reverse_qc.get('activated',False)} | "
+            f"components={d2_reverse_qc.get('candidate_components',0)} | "
+            f"audited={d2_reverse_qc.get('audited_components',0)} | "
+            f"approved={d2_reverse_qc.get('approved_components',0)} | "
+            f"terrain_veto={d2_reverse_qc.get('terrain_veto_components',0)} | "
+            f"z_votes={d2_reverse_qc.get('z_votes',0)} | "
+            f"slope_votes={d2_reverse_qc.get('slope_votes',0)} | "
+            f"normal_votes={d2_reverse_qc.get('normal_votes',0)} | "
+            f"demoted={d2_reverse_qc.get('demoted_points',0)}"
+        )
+    # BEGIN D2 POST-REVERSE NORMAL/D6 POLISH V2.6B
+    # V2.5 VERY_LOW data only. Reuse the installed NORMAL/D6 one-pass route
+    # after reverse Z+slope+normal cleanup. The real cfg is never modified.
+    d2_polish_real_density = float(d2_reverse_qc.get("density_pts_m2", 999.0))
+    if bool(d2_reverse_qc.get("activated", False)) and d2_polish_real_density < 3.0:
+        d2_polish_cfg = dict(cfg)
+        d2_polish_cfg["adaptive_support_dataset_density_pts_m2"] = 6.0
+        d2_polish_cfg["dataset_density_pts_m2"] = 6.0
+        d2_polish_cfg["density_pts_m2"] = 6.0
+
+        ground_mask, d2_polish_qc = apply_final_surface_vote(
+            x=xw, y=yw, z=zw, ground_mask=ground_mask,
+            sensor_mode=sm, cfg=d2_polish_cfg, return_report=True,
+        )
+
+        if show_progress and sm != "TLS":
+            log_info(
+                "D2-POSTREVERSE-POLISH "
+                f"real_density={d2_polish_real_density:.3f} | "
+                f"forced_density={d2_polish_qc.get('density_pts_m2',0.0):.3f} | "
+                f"regime={d2_polish_qc.get('density_regime','?')} | "
+                f"iterations={d2_polish_qc.get('iterations_completed',0)} | "
+                f"demoted={d2_polish_qc.get('demoted_points',0)} | "
+                f"after={d2_polish_qc.get('ground_after',0)}"
+            )
+    elif show_progress and sm != "TLS":
+        log_info(
+            "D2-POSTREVERSE-POLISH "
+            f"real_density={d2_polish_real_density:.3f} | skipped=True"
+        )
+    # END D2 POST-REVERSE NORMAL/D6 POLISH V2.6B
+    # ================================================================
+    # TLS FINAL HIGH-CONFIDENCE TERRAIN VOTE
+    # ================================================================
+    # This is intentionally the LAST TLS geometry operation.
+    #
+    # It builds a second robust TLS terrain surface using ONLY points
+    # that remain classed as ground after all previous TLS/common QC.
+    # Classification against that surface is intersected with the
+    # incoming mask:
+    #
+    #     final = incoming_ground & voted_ground
+    #
+    # Therefore this stage is strictly DEMOTION ONLY. No subsequent
+    # recovery stage is allowed to add class-2 points back.
+    tls_final_vote_qc = {
+        "enabled": False,
+        "reason": "not_tls",
+        "ground_before": int(np.count_nonzero(ground_mask)),
+        "ground_after": int(np.count_nonzero(ground_mask)),
+        "demoted_points": 0,
+        "support_points": int(np.count_nonzero(ground_mask)),
+    }
+
+    if sm == "TLS":
+        _tls_final_before = np.asarray(
+            ground_mask,
+            dtype=bool,
+        ).copy()
+
+        _tls_final_result = refine_tls_final_ground_vote(
+            x=xw,
+            y=yw,
+            z=zw,
+            ground_mask=_tls_final_before,
+            cfg=cfg,
+        )
+
+        ground_mask = np.asarray(
+            _tls_final_result.final_ground,
+            dtype=bool,
+        )
+
+        if np.any(
+            ground_mask
+            & ~_tls_final_before
+        ):
+            raise RuntimeError(
+                "TLS final vote recruited new ground."
+            )
+
+        if int(np.count_nonzero(ground_mask)) > int(
+            np.count_nonzero(_tls_final_before)
+        ):
+            raise RuntimeError(
+                "TLS final vote increased ground count."
+            )
+
+        tls_final_vote_qc = {
+            "enabled": bool(_tls_final_result.enabled),
+            "reason": str(_tls_final_result.reason),
+            "ground_before": int(_tls_final_result.ground_before),
+            "ground_after": int(_tls_final_result.ground_after),
+            "demoted_points": int(_tls_final_result.demoted_points),
+            "support_points": int(_tls_final_result.support_points),
+        }
+
+        if show_progress:
+            log_info(
+                "TLS-FINAL-VOTE "
+                f"enabled={tls_final_vote_qc['enabled']} | "
+                f"reason={tls_final_vote_qc['reason']} | "
+                f"support={tls_final_vote_qc['support_points']} | "
+                f"before={tls_final_vote_qc['ground_before']} | "
+                f"demoted={tls_final_vote_qc['demoted_points']} | "
+                f"after={tls_final_vote_qc['ground_after']}"
+            )
+
     classification[np.flatnonzero(keep)[m1][ground_mask]] = 2
-    _write_full_cloud_with_classification(las, out_path, classification)
+
+    # TLS diagnostic output is opt-in and separate from production output.
+    if sm == "TLS" and bool(cfg.get("tls_write_diagnostics", False)):
+        tls_diag_path = os.path.splitext(out_path)[0] + "_TLS_DIAG.las"
+
+        _write_tls_diagnostic_cloud(
+            las,
+            tls_diag_path,
+            classification,
+            work_indices=np.flatnonzero(keep)[m1],
+            xw=xw,
+            yw=yw,
+            zw=zw,
+            surf_z=surf_z,
+            sx0=sx0,
+            sy0=sy0,
+            cell=float(vcfg.cell),
+            diagnostics=tls_surface_diagnostics,
+        )
+
+        if show_progress:
+            log_info(
+                f"TLS-DIAG {tls_diag_path}"
+            )
+
+    _write_full_cloud_with_classification(
+        las,
+        out_path,
+        classification,
+    )
     bar.update(1)
     bar.close()
 
@@ -1715,11 +3235,61 @@ def classify_ground_path(
         dataset_support_stats=dataset_support_stats,
         adaptive=adaptive,
     )
+
+    # Reuse the immutable 5 m XY x 1 m Z support product created during
+    # preprocessing.  This lookup is tile-size independent.
+    _vs_manifest_fp = _find_tile_manifest_for_path(in_path)
+    if _vs_manifest_fp is not None:
+        _vs_manifest = _load_manifest_json(_vs_manifest_fp)
+        if _vs_manifest is not None:
+            _vs_tile = _match_tile_record(in_path, _vs_manifest)
+            if _vs_tile is not None:
+                _vs_meta = _vs_tile.get("vertical_support") or {}
+                _vs_file = _vs_meta.get("support_file")
+                if _vs_file:
+                    cfg["vertical_support_file"] = str(_vs_file)
+                    cfg["vertical_support_final_guard_enabled"] = True
+
     os.makedirs(out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(in_path))[0]
     out_path = os.path.join(out_dir, f"{base}.las")
     classify_ground_file(in_path, out_path, cfg, show_progress=show_progress)
     return out_path
+
+
+def _classify_ground_path_resume(
+    in_path: str,
+    out_dir: str,
+    sensor_mode: str,
+    *,
+    skip_existing: bool = False,
+    overwrite: bool = False,
+    show_progress: bool = False,
+):
+    """Restart-safe wrapper used by folder/tile processing.
+
+    Existing classified LAS outputs are skipped only when ``skip_existing`` is
+    explicitly requested and ``overwrite`` is false.  The public
+    ``classify_ground_path`` return contract remains unchanged.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(in_path))[0]
+    out_path = os.path.join(out_dir, f"{base}.las")
+
+    if skip_existing and not overwrite and os.path.isfile(out_path):
+        return {
+            "status": "skipped",
+            "tile": in_path,
+            "output": out_path,
+            "reason": "classified output exists",
+        }
+
+    return classify_ground_path(
+        in_path,
+        out_dir,
+        sensor_mode,
+        show_progress=show_progress,
+    )
 
 
 def list_classified_files(classified_root: str | os.PathLike[str]) -> list[str]:
@@ -1784,12 +3354,6 @@ def _run_phase(
                 }
             )
 
-    if out["skipped"]:
-        print(f"[INFO] {desc} skipped tiles:")
-        for rec in out["skipped"]:
-            tile_name = Path(str(rec.get("tile", ""))).name
-            reason = rec.get("reason", "skipped")
-            print(f"  - {tile_name}: {reason}")
 
     if out["failed"]:
         print(f"[ERROR] {desc} failed tiles:")
@@ -1839,35 +3403,57 @@ def derive_products_from_classified_root(
 
     product_dirs = _make_product_dirs(str(out_root))
 
-    if PRODUCT_DEM in requested_products:
-        dem_summary = _run_phase(
-            classified_files,
-            desc="FAST-GC derive DEM",
-            sensor_mode="POST",
-            worker=lambda gc_fp: _write_dem(gc_fp, product_dirs, grid_res, dem_method=dem_method),
-            n_jobs=n_jobs,
-            joblib_backend=joblib_backend,
-            joblib_batch_size=joblib_batch_size,
-            joblib_pre_dispatch=joblib_pre_dispatch,
-            source=str(classified_root),
-        )
-        if not dem_summary["ok"] and dem_summary["skipped"]:
-            raise RuntimeError("FAST-GC derive DEM skipped all tiles because no valid ground points were available.")
+    derive_dem = PRODUCT_DEM in requested_products
+    derive_norm = PRODUCT_NORMALIZED in requested_products
 
-    if PRODUCT_NORMALIZED in requested_products:
-        norm_summary = _run_phase(
+    if derive_dem and derive_norm:
+        shared_summary = _run_phase(
             classified_files,
-            desc="FAST-GC derive NORMALIZED",
+            desc="FAST-GC derive DEM+NORMALIZED",
             sensor_mode="POST",
-            worker=lambda gc_fp: _write_normalized(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+            worker=lambda gc_fp: _write_dem_and_normalized_shared(
+                gc_fp, product_dirs, grid_res, dem_method=dem_method
+            ),
             n_jobs=n_jobs,
             joblib_backend=joblib_backend,
             joblib_batch_size=joblib_batch_size,
             joblib_pre_dispatch=joblib_pre_dispatch,
             source=str(classified_root),
         )
-        if not norm_summary["ok"] and norm_summary["skipped"]:
-            raise RuntimeError("FAST-GC derive NORMALIZED skipped all tiles because no valid DEM could be built.")
+        if not shared_summary["ok"] and shared_summary["skipped"]:
+            raise RuntimeError(
+                "FAST-GC derive DEM+NORMALIZED skipped all tiles because no valid ground points were available."
+            )
+    else:
+        if derive_dem:
+            dem_summary = _run_phase(
+                classified_files,
+                desc="FAST-GC derive DEM",
+                sensor_mode="POST",
+                worker=lambda gc_fp: _write_dem(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+                n_jobs=n_jobs,
+                joblib_backend=joblib_backend,
+                joblib_batch_size=joblib_batch_size,
+                joblib_pre_dispatch=joblib_pre_dispatch,
+                source=str(classified_root),
+            )
+            if not dem_summary["ok"] and dem_summary["skipped"]:
+                raise RuntimeError("FAST-GC derive DEM skipped all tiles because no valid ground points were available.")
+
+        if derive_norm:
+            norm_summary = _run_phase(
+                classified_files,
+                desc="FAST-GC derive NORMALIZED",
+                sensor_mode="POST",
+                worker=lambda gc_fp: _write_normalized(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+                n_jobs=n_jobs,
+                joblib_backend=joblib_backend,
+                joblib_batch_size=joblib_batch_size,
+                joblib_pre_dispatch=joblib_pre_dispatch,
+                source=str(classified_root),
+            )
+            if not norm_summary["ok"] and norm_summary["skipped"]:
+                raise RuntimeError("FAST-GC derive NORMALIZED skipped all tiles because no valid DEM could be built.")
 
     return str(out_root)
 
@@ -1942,6 +3528,8 @@ def process_fastgc_path(
     joblib_pre_dispatch: str | int = "2*n_jobs",
     spikefree_freeze_distance: float | None = None,
     spikefree_insertion_buffer: float | None = None,
+    skip_existing: bool = False,
+    overwrite: bool = False,
 ) -> str:
     requested_products, compute_products = _resolve_products(products)
     _require_rasterio_for_products(compute_products)
@@ -1963,13 +3551,29 @@ def process_fastgc_path(
 
         gc_fp = None
         if need_classified:
-            gc_fp = classify_ground_path(in_path, product_dirs[PRODUCT_GC], sensor_mode, show_progress=True)
+            gc_result = _classify_ground_path_resume(
+                in_path,
+                product_dirs[PRODUCT_GC],
+                sensor_mode,
+                skip_existing=skip_existing,
+                overwrite=overwrite,
+                show_progress=True,
+            )
+            if isinstance(gc_result, dict):
+                gc_fp = str(gc_result["output"])
+                print(f"[SKIP] {Path(in_path).name}: {gc_result['reason']}")
+            else:
+                gc_fp = str(gc_result)
 
-        if PRODUCT_DEM in requested_products and gc_fp is not None:
-            _write_dem(gc_fp, product_dirs, grid_res, dem_method=dem_method)
-
-        if PRODUCT_NORMALIZED in requested_products and gc_fp is not None:
-            _write_normalized(gc_fp, product_dirs, grid_res, dem_method=dem_method)
+        need_dem = PRODUCT_DEM in requested_products
+        need_norm = PRODUCT_NORMALIZED in requested_products
+        if gc_fp is not None and need_dem and need_norm:
+            _write_dem_and_normalized_shared(gc_fp, product_dirs, grid_res, dem_method=dem_method)
+        else:
+            if need_dem and gc_fp is not None:
+                _write_dem(gc_fp, product_dirs, grid_res, dem_method=dem_method)
+            if need_norm and gc_fp is not None:
+                _write_normalized(gc_fp, product_dirs, grid_res, dem_method=dem_method)
 
         if need_dsm:
             _write_dsm_from_raw(
@@ -1982,7 +3586,7 @@ def process_fastgc_path(
             )
 
         total_dt = perf_counter() - stage_t0
-        print(f"[TIME] FAST-GC {sensor_mode} {Path(in_path).name}: total={total_dt:.2f}s")
+        log_info(f"[TIME] FAST-GC {sensor_mode} {Path(in_path).name}: total={total_dt:.2f}s")
         return out_root
 
     classified_files: list[str] = []
@@ -1993,44 +3597,96 @@ def process_fastgc_path(
             files,
             desc=f"FAST-GC phase 1/3 CLASSIFY {sensor_mode}",
             sensor_mode=sensor_mode,
-            worker=lambda fp: classify_ground_path(fp, product_dirs[PRODUCT_GC], sensor_mode, show_progress=False),
+            worker=lambda fp: _classify_ground_path_resume(
+                fp,
+                product_dirs[PRODUCT_GC],
+                sensor_mode,
+                skip_existing=skip_existing,
+                overwrite=overwrite,
+                show_progress=False,
+            ),
             n_jobs=n_jobs,
             joblib_backend=joblib_backend,
             joblib_batch_size=joblib_batch_size,
             joblib_pre_dispatch=joblib_pre_dispatch,
             source=in_path,
         )
-        classified_files = [str(v) for v in classified_phase["ok"]]
 
-    if PRODUCT_DEM in requested_products:
-        dem_phase = _run_phase(
+        # IMPORTANT FOR RESTARTS:
+        # downstream products must see both newly completed and previously
+        # completed FAST_GC tiles.  Using only classified_phase["ok"] would
+        # discard the skipped-existing tiles from DEM/NORMALIZED processing.
+        classified_files = list_classified_files(classified_root)
+        if not classified_files:
+            raise RuntimeError(
+                f"FAST-GC classification produced no usable outputs in: {classified_root}"
+            )
+
+        # Finalize buffered-neighbor seam decisions IN THE CLASSIFICATION STAGE.
+        # This intentionally occurs before DEM/NORMALIZED/CHM derivation.  Merge
+        # is subsequently a pure core-trim + concatenate operation and never
+        # changes a class label.
+        seam_qc = finalize_fastgc_seams_in_place(out_root)
+        if seam_qc.get("applied"):
+            log_info(
+                "FAST_GC tile-final seam QC: "
+                f"tiles_changed={seam_qc.get('tiles_changed', 0)} | "
+                f"points_changed={seam_qc.get('points_changed', 0)} | "
+                f"report={seam_qc.get('report_path', '')}"
+            )
+        # Re-list after in-place finalization so all downstream phases consume
+        # the finalized tile set, including restart/skipped tiles.
+        classified_files = list_classified_files(classified_root)
+
+    need_dem_product = PRODUCT_DEM in requested_products
+    need_norm_product = PRODUCT_NORMALIZED in requested_products
+
+    if need_dem_product and need_norm_product:
+        shared_phase = _run_phase(
             classified_files,
-            desc=f"FAST-GC phase 2/3 DEM {sensor_mode}",
+            desc=f"FAST-GC phase 2/3 DEM+NORMALIZED {sensor_mode}",
             sensor_mode=sensor_mode,
-            worker=lambda gc_fp: _write_dem(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+            worker=lambda gc_fp: _write_dem_and_normalized_shared(
+                gc_fp, product_dirs, grid_res, dem_method=dem_method
+            ),
             n_jobs=n_jobs,
             joblib_backend=joblib_backend,
             joblib_batch_size=joblib_batch_size,
             joblib_pre_dispatch=joblib_pre_dispatch,
             source=str(classified_root),
         )
-        if not dem_phase["ok"] and dem_phase["skipped"]:
-            raise RuntimeError(f"FAST-GC phase 2/3 DEM {sensor_mode} skipped all tiles.")
+        if not shared_phase["ok"] and shared_phase["skipped"]:
+            raise RuntimeError(f"FAST-GC phase 2/3 DEM+NORMALIZED {sensor_mode} skipped all tiles.")
+    else:
+        if need_dem_product:
+            dem_phase = _run_phase(
+                classified_files,
+                desc=f"FAST-GC phase 2/3 DEM {sensor_mode}",
+                sensor_mode=sensor_mode,
+                worker=lambda gc_fp: _write_dem(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+                n_jobs=n_jobs,
+                joblib_backend=joblib_backend,
+                joblib_batch_size=joblib_batch_size,
+                joblib_pre_dispatch=joblib_pre_dispatch,
+                source=str(classified_root),
+            )
+            if not dem_phase["ok"] and dem_phase["skipped"]:
+                raise RuntimeError(f"FAST-GC phase 2/3 DEM {sensor_mode} skipped all tiles.")
 
-    if PRODUCT_NORMALIZED in requested_products:
-        norm_phase = _run_phase(
-            classified_files,
-            desc=f"FAST-GC phase 3/3 NORMALIZED {sensor_mode}",
-            sensor_mode=sensor_mode,
-            worker=lambda gc_fp: _write_normalized(gc_fp, product_dirs, grid_res, dem_method=dem_method),
-            n_jobs=n_jobs,
-            joblib_backend=joblib_backend,
-            joblib_batch_size=joblib_batch_size,
-            joblib_pre_dispatch=joblib_pre_dispatch,
-            source=str(classified_root),
-        )
-        if not norm_phase["ok"] and norm_phase["skipped"]:
-            raise RuntimeError(f"FAST-GC phase 3/3 NORMALIZED {sensor_mode} skipped all tiles.")
+        if need_norm_product:
+            norm_phase = _run_phase(
+                classified_files,
+                desc=f"FAST-GC phase 3/3 NORMALIZED {sensor_mode}",
+                sensor_mode=sensor_mode,
+                worker=lambda gc_fp: _write_normalized(gc_fp, product_dirs, grid_res, dem_method=dem_method),
+                n_jobs=n_jobs,
+                joblib_backend=joblib_backend,
+                joblib_batch_size=joblib_batch_size,
+                joblib_pre_dispatch=joblib_pre_dispatch,
+                source=str(classified_root),
+            )
+            if not norm_phase["ok"] and norm_phase["skipped"]:
+                raise RuntimeError(f"FAST-GC phase 3/3 NORMALIZED {sensor_mode} skipped all tiles.")
 
     if need_dsm:
         _run_phase(
@@ -2080,3 +3736,10 @@ __all__ = [
     "list_classified_files",
     "process_fastgc_path",
 ]
+
+
+
+
+
+
+

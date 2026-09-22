@@ -6,6 +6,9 @@ from typing import Any
 import numpy as np
 
 from .common import (
+    adaptive_canopy_mask,
+    adaptive_local_maxima,
+    adaptive_prune_peaks,
     build_marker_raster,
     dual_gaussian_filter,
     label_peak_counts,
@@ -53,11 +56,13 @@ def run_itd_on_chm(
     banded_neighborhood_px = int(kwargs.get("itd_banded_neighborhood_px", DEFAULTS["itd_banded_neighborhood_px"]))
     min_crown_area_m2 = float(kwargs.get("itd_min_crown_area_m2", DEFAULTS["itd_min_crown_area_m2"]))
     write_filtered = bool(kwargs.get("itd_write_filtered_chm", DEFAULTS["itd_write_filtered_chm"]))
+    adaptive = bool(kwargs.get("itd_adaptive", False))
 
     arr, profile, transform, crs = read_chm_raster(chm_raster)
-    canopy_mask = np.isfinite(arr) & (arr >= min_height)
+    canopy_mask = adaptive_canopy_mask(arr, min_height=min_height) if adaptive else (np.isfinite(arr) & (arr >= min_height))
 
-    filtered = dual_gaussian_filter(arr)
+    # Adaptive mode uses slightly less broad smoothing to preserve suppressed crowns.
+    filtered = dual_gaussian_filter(arr, sigma_dist=0.65, sigma_height=1.25) if adaptive else dual_gaussian_filter(arr)
     filtered[~np.isfinite(arr)] = np.nan
 
     px = abs(float(transform.a))
@@ -67,22 +72,30 @@ def run_itd_on_chm(
     if window_pixels % 2 == 0:
         window_pixels += 1
 
-    peak_mask_raw = local_maxima_mask(
-        filtered,
-        window_pixels=window_pixels,
-        min_height=min_height,
-        valid_mask=canopy_mask,
-    )
-    peak_rows_raw, peak_cols_raw = np.where(peak_mask_raw)
-    peak_values_raw = filtered[peak_rows_raw, peak_cols_raw]
+    if adaptive:
+        peak_rows_raw, peak_cols_raw, peak_values_raw = adaptive_local_maxima(
+            filtered, min_height=min_height, transform=transform, valid_mask=canopy_mask
+        )
+        peak_rows, peak_cols, peak_values = adaptive_prune_peaks(
+            peak_rows_raw, peak_cols_raw, peak_values_raw, arr=filtered, transform=transform
+        )
+    else:
+        peak_mask_raw = local_maxima_mask(
+            filtered,
+            window_pixels=window_pixels,
+            min_height=min_height,
+            valid_mask=canopy_mask,
+        )
+        peak_rows_raw, peak_cols_raw = np.where(peak_mask_raw)
+        peak_values_raw = filtered[peak_rows_raw, peak_cols_raw]
 
-    peak_rows, peak_cols, peak_values = prune_peaks_by_distance(
-        peak_rows_raw,
-        peak_cols_raw,
-        peak_values_raw,
-        transform=transform,
-        min_separation_m=min_peak_sep_m,
-    )
+        peak_rows, peak_cols, peak_values = prune_peaks_by_distance(
+            peak_rows_raw,
+            peak_cols_raw,
+            peak_values_raw,
+            transform=transform,
+            min_separation_m=min_peak_sep_m,
+        )
 
     peak_rows, peak_cols, peak_values = screen_false_peaks(
         filtered,
@@ -138,7 +151,7 @@ def run_itd_on_chm(
 
     return {
         "status": "ok",
-        "method": "watershed",
+        "method": "adaptive_watershed" if adaptive else "watershed",
         "source_raster": str(chm_raster),
         "outputs": outputs,
         "tree_count": int(np.max(labels)) if labels.size else 0,
@@ -146,6 +159,7 @@ def run_itd_on_chm(
         "seed_count_screened": int(len(peak_rows)),
         "multi_apex_segments": multi_apex_segments,
         "notes": [
+            ("Adaptive mode uses height-dependent crown scales and conservative peak prominence." if adaptive else "Classical fixed-window watershed mode."),
             "Treetops are written as ESRI Shapefile points.",
             "Crowns are written as ESRI Shapefile polygons.",
             "Crown attributes include area_m2, rad_m, max_h_m, and mean_h_m.",

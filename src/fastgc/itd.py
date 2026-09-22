@@ -16,6 +16,7 @@ SUPPORTED_ITD_METHODS = {
     "placeholder",
     "lmf",
     "watershed",
+    "adaptive_watershed",
     "yun2021",
     "dalponte2016",
     "li2012",
@@ -269,7 +270,10 @@ def _load_algorithm_module(method: str):
     if method == "placeholder":
         return None
 
-    module_name = f"{ALGORITHM_PACKAGE}.{method}"
+    # adaptive_watershed is an advanced mode of the existing watershed module;
+    # no additional runtime module is required.
+    module_key = "watershed" if method == "adaptive_watershed" else method
+    module_name = f"{ALGORITHM_PACKAGE}.{module_key}"
     try:
         return importlib.import_module(module_name)
     except ModuleNotFoundError:
@@ -302,6 +306,9 @@ def _algorithm_runner(
 
     fn_surface = getattr(module, "run_itd_on_surface", None)
     fn_chm = getattr(module, "run_itd_on_chm", None)
+    if method == "adaptive_watershed":
+        extra_kwargs = dict(extra_kwargs)
+        extra_kwargs["itd_adaptive"] = True
 
     if fn_surface is not None:
         result = fn_surface(

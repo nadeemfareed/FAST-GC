@@ -522,10 +522,15 @@ def run_clip(
     if (not overwrite) and os.path.exists(out_fp):
         return
 
-    import fiona
+    from pyogrio.raw import read as _ogr_read
+    import shapely
 
-    with fiona.open(shp_fp, "r") as shp:
-        geoms = [feature["geometry"] for feature in shp]
+    _meta, _fids, geometry_wkb, _fields = _ogr_read(str(shp_fp), columns=[])
+    if geometry_wkb is None or len(geometry_wkb) == 0:
+        raise ValueError(f"No vector geometries found in clipping dataset: {shp_fp}")
+    geoms = [g for g in shapely.from_wkb(geometry_wkb) if g is not None and not g.is_empty]
+    if not geoms:
+        raise ValueError(f"No valid vector geometries found in clipping dataset: {shp_fp}")
 
     with rasterio.open(in_fp) as src:
         out_img, out_transform = mask(src, geoms, crop=crop)

@@ -1,0 +1,14 @@
+[package]
+name = "fastgc-native"
+version = "0.2.1"
+edition = "2021"
+
+[lib]
+name = "_fastgc_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.26", features = ["extension-module"] }
+numpy = "0.26"
+rayon = "1.11"
+

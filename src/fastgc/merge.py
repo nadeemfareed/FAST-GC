@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import math
@@ -10,6 +10,8 @@ from typing import Any
 import laspy
 import numpy as np
 from tqdm import tqdm
+
+from .monster import ProgressDashboard
 
 from .monster import log_info, stage_banner
 
@@ -75,23 +77,137 @@ def _core_mask(x: np.ndarray, y: np.ndarray, core_bounds: list[float]) -> np.nda
     return (x >= xmin) & (x <= xmax) & (y >= ymin) & (y <= ymax)
 
 
-def _ensure_same_point_layout(first_header: laspy.LasHeader, next_header: laspy.LasHeader):
+def _point_dimension_signature(header: laspy.LasHeader) -> tuple[str, ...]:
+    return tuple(str(n) for n in header.point_format.dimension_names)
+
+
+def _ensure_compatible_point_layout(first_header: laspy.LasHeader, next_header: laspy.LasHeader):
+    """
+    Validate the parts of the LAS layout that truly must match for merge.
+
+    Coordinate scales/offsets are intentionally NOT required to match.  They are
+    storage metadata, not classification data, and multi-file benchmark sites can
+    legitimately contain source files quantized at different XYZ scales.  Merge
+    requantizes every kept tile to one canonical output scale/offset instead.
+    """
     if first_header.point_format.id != next_header.point_format.id:
         raise RuntimeError(
             f"Cannot merge point products with different point formats: "
             f"{first_header.point_format.id} vs {next_header.point_format.id}"
         )
-    if tuple(first_header.scales) != tuple(next_header.scales):
+
+    first_dims = _point_dimension_signature(first_header)
+    next_dims = _point_dimension_signature(next_header)
+    if first_dims != next_dims:
         raise RuntimeError(
-            f"Cannot merge point products with different scales: "
-            f"{tuple(first_header.scales)} vs {tuple(next_header.scales)}"
-        )
-    if tuple(first_header.offsets) != tuple(next_header.offsets):
-        raise RuntimeError(
-            f"Cannot merge point products with different offsets: "
-            f"{tuple(first_header.offsets)} vs {tuple(next_header.offsets)}"
+            "Cannot merge point products with different dimension layouts.\n"
+            f"First: {first_dims}\n"
+            f"Next : {next_dims}"
         )
 
+
+def _canonical_merge_header(tile_paths: list[Path]) -> laspy.LasHeader:
+    """
+    Build one safe output header for a collection of compatible point tiles.
+
+    * use the finest (smallest positive) XYZ scale found on any tile;
+    * choose offsets near the global dataset minimum to keep integer magnitudes
+      small and avoid avoidable quantization/overflow risk;
+    * preserve the first tile's point format, VLRs, CRS, and extra dimensions.
+
+    No classification or other point attribute is altered here.
+    """
+    if not tile_paths:
+        raise ValueError("tile_paths must not be empty")
+
+    headers: list[laspy.LasHeader] = []
+    for fp in tile_paths:
+        with laspy.open(fp) as reader:
+            headers.append(reader.header)
+
+    first = headers[0]
+    for h in headers[1:]:
+        _ensure_compatible_point_layout(first, h)
+
+    scales = np.asarray([np.asarray(h.scales, dtype=np.float64) for h in headers])
+    scales = np.abs(scales)
+    scales[scales <= 0] = np.nan
+    canonical_scales = np.nanmin(scales, axis=0)
+    if np.any(~np.isfinite(canonical_scales)):
+        raise RuntimeError(f"Invalid LAS coordinate scales in merge inputs: {scales}")
+
+    mins = np.asarray([np.asarray(h.mins, dtype=np.float64) for h in headers])
+    global_min = np.nanmin(mins, axis=0)
+    canonical_offsets = np.floor(global_min / canonical_scales) * canonical_scales
+
+    out_header = first.copy()
+    out_header.scales = canonical_scales
+    out_header.offsets = canonical_offsets
+    return out_header
+
+
+def _requantize_points(points, dst_header):
+    """
+    Re-encode a laspy point record using dst_header scales/offsets.
+
+    XYZ are converted through real-world coordinates so source tiles with
+    different LAS integer scales/offsets can safely be merged.
+
+    All non-coordinate dimensions are copied unchanged.
+    """
+    import numpy as np
+    import laspy
+
+    n = len(points)
+    if n == 0:
+        return laspy.ScaleAwarePointRecord.zeros(
+            0,
+            header=dst_header,
+        )
+
+    # Source XYZ stored as integer LAS dimensions.
+    X = np.asarray(points["X"], dtype=np.float64)
+    Y = np.asarray(points["Y"], dtype=np.float64)
+    Z = np.asarray(points["Z"], dtype=np.float64)
+
+    # ScaleAwarePointRecord carries its source coordinate encoding.
+    src_scales = np.asarray(points.scales, dtype=np.float64)
+    src_offsets = np.asarray(points.offsets, dtype=np.float64)
+
+    # Convert source integer coordinates to real-world coordinates.
+    x = X * src_scales[0] + src_offsets[0]
+    y = Y * src_scales[1] + src_offsets[1]
+    z = Z * src_scales[2] + src_offsets[2]
+
+    # Allocate destination record using canonical merge encoding.
+    dst = laspy.ScaleAwarePointRecord.zeros(
+        n,
+        header=dst_header,
+    )
+
+    # Copy every compatible non-XYZ dimension.
+    src_names = set(points.point_format.dimension_names)
+    dst_names = set(dst.point_format.dimension_names)
+
+    for name in src_names.intersection(dst_names):
+        if name in {"X", "Y", "Z"}:
+            continue
+
+        try:
+            dst[name] = points[name]
+        except Exception:
+            # Some packed/derived LAS dimensions cannot be assigned
+            # independently. Their underlying packed fields are already
+            # represented by the normal point-format dimensions.
+            pass
+
+    # Assign scaled coordinates LAST. laspy performs quantization according
+    # to dst_header.scales and dst_header.offsets.
+    dst.x = x
+    dst.y = y
+    dst.z = z
+
+    return dst
 
 def merge_point_product(
     manifest: dict[str, Any],
@@ -114,46 +230,68 @@ def merge_point_product(
 
     stage_banner(f"MERGE {product}", source=str(processed_root / product), total=len(available_tiles), unit="tile")
 
+    # IMPORTANT: FAST_GC classifications are finalized before this function.
+    # Merge is deliberately class-agnostic: core trim + concatenate only.
+    # No seam reconciliation, ground promotion, or ground demotion is allowed
+    # here, so a tile inspected on disk is exactly what enters the mosaic.
+
     writer = None
     kept_tiles = 0
     kept_points = 0
-    first_header = None
     t0 = perf_counter()
 
+    tile_paths = [
+        _expected_tile_output_path(processed_root, product, tile["tile_name"])
+        for tile in available_tiles
+    ]
+    merge_header = _canonical_merge_header(tile_paths)
+    log_info(
+        f"{product} merge coordinate encoding: "
+        f"scales={tuple(float(v) for v in merge_header.scales)} | "
+        f"offsets={tuple(float(v) for v in merge_header.offsets)}"
+    )
+
+    dashboard = ProgressDashboard(f"MERGE {product}", len(available_tiles), unit="tile", enabled=True)
     try:
-        pbar = tqdm(available_tiles, desc=f"MERGE {product}", unit="tile", dynamic_ncols=True)
-        for idx, tile in enumerate(pbar, start=1):
+        writer = laspy.open(out_fp, mode="w", header=merge_header)
+        for idx, tile in enumerate(available_tiles, start=1):
+            item_t0 = perf_counter()
             tile_fp = _expected_tile_output_path(processed_root, product, tile["tile_name"])
             las = laspy.read(tile_fp)
-
-            if first_header is None:
-                first_header = las.header
-                writer = laspy.open(out_fp, mode="w", header=first_header)
-            else:
-                _ensure_same_point_layout(first_header, las.header)
+            _ensure_compatible_point_layout(merge_header, las.header)
 
             x = np.asarray(las.x, dtype=np.float64)
             y = np.asarray(las.y, dtype=np.float64)
             mask = _core_mask(x, y, tile["core_bounds"])
             n_keep = int(np.count_nonzero(mask))
             if n_keep == 0:
-                elapsed = perf_counter() - t0
-                pbar.set_postfix_str(
-                    f"{idx}/{len(available_tiles)} | {elapsed / max(idx, 1):.2f}s/tile | kept_pts={kept_points}"
+                dashboard.update(
+                    1,
+                    current_file=tile["tile_name"],
+                    current_item=tile["tile_name"],
+                    elapsed_item_sec=perf_counter() - item_t0,
+                    ok_count=kept_tiles,
+                    skipped_count=idx - kept_tiles,
+                    failed_count=0,
                 )
                 continue
 
-            writer.write_points(las.points[mask].copy())
+            kept = _requantize_points(las.points[mask], merge_header)
+            writer.write_points(kept)
             kept_tiles += 1
             kept_points += n_keep
 
-            elapsed = perf_counter() - t0
-            pbar.set_postfix_str(
-                f"{idx}/{len(available_tiles)} | {elapsed / max(idx, 1):.2f}s/tile | kept_pts={kept_points}"
+            dashboard.update(
+                1,
+                current_file=tile["tile_name"],
+                current_item=tile["tile_name"],
+                elapsed_item_sec=perf_counter() - item_t0,
+                ok_count=kept_tiles,
+                skipped_count=idx - kept_tiles,
+                failed_count=0,
             )
-
-        pbar.close()
     finally:
+        dashboard.close()
         if writer is not None:
             writer.close()
 
@@ -346,13 +484,16 @@ def merge_raster_product(
     trimmed: list[Path] = []
     t0 = perf_counter()
 
-    stage_banner(f"TRIM {trim_label}", source=str(processed_root), total=len(manifest["tiles"]), unit="tile")
-    pbar_trim = tqdm(manifest["tiles"], desc=f"TRIM {trim_label}", unit="tile", dynamic_ncols=True)
+    # Core cropping is part of the public product merge stage; do not expose
+    # implementation-level TRIM as a separate user-facing stage.
+    stage_banner(f"MERGE {trim_label}", source=str(processed_root), total=len(manifest["tiles"]), unit="tile")
+    dashboard_trim = ProgressDashboard(f"MERGE {trim_label}", len(manifest["tiles"]), unit="tile", enabled=True)
 
     skipped_empty = 0
     missing_src = 0
 
-    for idx, tile in enumerate(pbar_trim, start=1):
+    for idx, tile in enumerate(manifest["tiles"], start=1):
+        item_t0 = perf_counter()
         tile_src = _expected_tile_output_path(
             processed_root,
             product,
@@ -362,9 +503,14 @@ def merge_raster_product(
         )
         if not tile_src.exists():
             missing_src += 1
-            elapsed = perf_counter() - t0
-            pbar_trim.set_postfix_str(
-                f"{idx}/{len(manifest['tiles'])} | {elapsed / max(idx, 1):.2f}s/tile | kept={len(trimmed)} | skip={skipped_empty}"
+            dashboard_trim.update(
+                1,
+                current_file=tile["tile_name"],
+                current_item=tile["tile_name"],
+                elapsed_item_sec=perf_counter() - item_t0,
+                ok_count=len(trimmed),
+                skipped_count=skipped_empty + missing_src,
+                failed_count=0,
             )
             continue
 
@@ -375,12 +521,17 @@ def merge_raster_product(
         else:
             skipped_empty += 1
 
-        elapsed = perf_counter() - t0
-        pbar_trim.set_postfix_str(
-            f"{idx}/{len(manifest['tiles'])} | {elapsed / max(idx, 1):.2f}s/tile | kept={len(trimmed)} | skip={skipped_empty}"
+        dashboard_trim.update(
+            1,
+            current_file=tile["tile_name"],
+            current_item=tile["tile_name"],
+            elapsed_item_sec=perf_counter() - item_t0,
+            ok_count=len(trimmed),
+            skipped_count=skipped_empty + missing_src,
+            failed_count=0,
         )
 
-    pbar_trim.close()
+    dashboard_trim.close()
 
     if missing_src:
         log_info(f"{trim_label}: missing source rasters skipped = {missing_src}")
@@ -391,8 +542,9 @@ def merge_raster_product(
         log_info(f"No trimmed rasters available for merge: {trim_label}")
         return None
 
-    stage_banner(f"MERGE {trim_label}", source=str(temp_trim_dir), total=len(trimmed), unit="tile")
-
+    # rio_merge below is one indivisible mosaic operation. The tile-wise merge
+    # preparation above is the truthful dynamic progress; do not fake a second
+    # tile counter for this single operation.
     datasets = [rasterio.open(fp) for fp in trimmed]
     try:
         ub = manifest.get("union_bounds")

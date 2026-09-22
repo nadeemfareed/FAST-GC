@@ -41,6 +41,7 @@ CHM_METHOD_CHOICES = {
     "p99",
     "tin",
     "pitfree",
+    "adaptive_pitfree",
     "csf_chm",
     "spikefree",       # derived later as DSM - DEM; kept here for pipeline continuity
     "percentile",
@@ -50,7 +51,7 @@ CHM_METHOD_CHOICES = {
 
 # Native CHM constructors from normalized LAS.
 # NOTE: spikefree is intentionally removed from native CHM constructors.
-CHM_SURFACE_METHOD_CHOICES = {"p2r", "p99", "tin", "pitfree", "csf_chm"}
+CHM_SURFACE_METHOD_CHOICES = {"p2r", "p99", "tin", "pitfree", "adaptive_pitfree", "csf_chm"}
 
 CHM_SMOOTH_CHOICES = {"none", "median", "gaussian"}
 
@@ -688,6 +689,175 @@ def _rasterize_constrained_tin(
     return grid, out_xmin, out_ymax
 
 
+
+def _support_count_grid(
+    x: np.ndarray,
+    y: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    res: float,
+) -> np.ndarray:
+    """Per-cell point support count on the CHM grid."""
+    _ix, _iy, flat, nx, ny, _xmin, _ymax = _cell_index_arrays(x, y, bounds, res)
+    counts = np.bincount(flat, minlength=nx * ny).reshape(ny, nx)
+    return counts.astype(np.float32)
+
+
+def _adaptive_pitfree_fusion(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    res: float,
+    *,
+    sensor_mode: str,
+    percentile: float,
+    pitfree_thresholds: list[float] | None,
+    pitfree_max_edge: float | list[float] | None,
+    pitfree_subcircle: float | None,
+    pitfree_highest: bool,
+) -> tuple[np.ndarray, float, float]:
+    """
+    Density-aware canopy envelope.
+
+    The method intentionally keeps the established p99 and pit-free constructors
+    unchanged and fuses them using local support and robust pit evidence. Dense
+    cells prefer p99 (spike resistant); sparse or demonstrably depressed cells
+    may borrow the pit-free envelope. No global smoothing is performed here.
+    """
+    p99, xmin, ymax = _rasterize_stat(
+        x, y, z, bounds, res, mode="percentile", percentile=float(percentile)
+    )
+    p2r, _x2, _y2 = _rasterize_stat(x, y, z, bounds, res, mode="max")
+
+    # Reuse the existing pit-free implementation verbatim through its primitives.
+    thresholds = _normalize_thresholds(pitfree_thresholds, sensor_mode=sensor_mode)
+    if 0.0 not in thresholds:
+        thresholds = [0.0] + thresholds
+    edge_limits = _normalize_pitfree_max_edge(thresholds, pitfree_max_edge, res)
+    px, py, pz = _densify_subcircle(x, y, z, pitfree_subcircle)
+    layers: list[np.ndarray] = []
+    for thr, edge_lim in zip(thresholds, edge_limits):
+        keep = pz >= float(thr)
+        if np.count_nonzero(keep) < 1:
+            continue
+        lx, ly, lz = px[keep], py[keep], pz[keep]
+        if pitfree_highest:
+            sx, sy, sz = _cellmax_support_points(lx, ly, lz, bounds, res)
+        else:
+            sx, sy, sz = lx, ly, lz
+        if sx.size < 1:
+            continue
+        grid_i, _gx, _gy = _rasterize_constrained_tin(
+            sx, sy, sz, bounds, res, max_edge=edge_lim
+        )
+        layers.append(grid_i)
+    pit = _max_envelope(layers) if layers else p2r.copy()
+
+    counts = _support_count_grid(x, y, bounds, res)
+    finite_counts = counts[counts > 0]
+    if finite_counts.size:
+        dense_ref = max(3.0, float(np.nanpercentile(finite_counts, 60.0)))
+    else:
+        dense_ref = 3.0
+    support_conf = np.clip(counts / dense_ref, 0.0, 1.0)
+
+    # Robust local reference used only to decide whether a p99 cell is a pit.
+    p99_fill = np.where(np.isfinite(p99), p99, 0.0).astype(np.float32)
+    valid = np.isfinite(p99).astype(np.float32)
+    num = median_filter(p99_fill, size=3, mode="nearest")
+    # median_filter cannot be NaN aware, so only trust neighborhoods with support.
+    nbh_support = maximum_filter(valid, size=3, mode="nearest") > 0
+    local_ref = np.where(nbh_support, num, np.nan).astype(np.float32)
+
+    finite_z = z[np.isfinite(z)]
+    if finite_z.size:
+        q75, q25 = np.percentile(finite_z, [75.0, 25.0])
+        vertical_iqr = max(float(q75 - q25), 0.25)
+    else:
+        vertical_iqr = 0.25
+    pit_tol = float(np.clip(0.035 * vertical_iqr + 0.20, 0.20, 0.65))
+
+    out = p99.astype(np.float32, copy=True)
+
+    # Reject isolated high spikes before any envelope promotion. A true apex normally
+    # has supporting returns in the same or adjacent cells, whereas a single-return
+    # outlier sits well above the local canopy shoulder.
+    isolated_spike = (
+        (counts <= 1)
+        & np.isfinite(out)
+        & np.isfinite(local_ref)
+        & ((out - local_ref) > max(1.25, 3.0 * pit_tol))
+    )
+    out[isolated_spike] = local_ref[isolated_spike]
+
+    missing = ~np.isfinite(out) & np.isfinite(pit)
+    out[missing] = pit[missing]
+
+    # Sparse support: use the pit-free envelope only when it is higher than p99.
+    sparse = (support_conf < 0.45) & np.isfinite(pit) & np.isfinite(out)
+    out[sparse] = np.maximum(out[sparse], pit[sparse])
+
+    # Dense cells are left on p99 unless there is strong local pit evidence.
+    depressed = (
+        np.isfinite(local_ref)
+        & np.isfinite(out)
+        & np.isfinite(pit)
+        & ((local_ref - out) > pit_tol)
+        & ((pit - out) > 0.5 * pit_tol)
+    )
+    out[depressed] = np.maximum(out[depressed], pit[depressed])
+
+    # A maximum return is admitted only where the peak has neighboring support;
+    # this preserves narrow true apices without restoring isolated spikes.
+    high_neighbor = maximum_filter(p99_fill, size=3, mode="nearest")
+    peak_supported = (
+        np.isfinite(p2r)
+        & np.isfinite(out)
+        & (counts >= 2)
+        & ((high_neighbor - out) < max(0.75, 2.0 * pit_tol))
+        & ((p2r - out) > 0.0)
+        & ((p2r - out) < max(1.25, 3.0 * pit_tol))
+    )
+    out[peak_supported] = np.maximum(out[peak_supported], p2r[peak_supported])
+    return out.astype(np.float32), float(xmin), float(ymax)
+
+
+def _adaptive_canopy_refine(
+    arr: np.ndarray,
+    *,
+    footprint: np.ndarray,
+    support_mask: np.ndarray,
+    zero_support_mask: np.ndarray,
+    min_height: float,
+    fill_ground_voids_zero: bool,
+) -> np.ndarray:
+    """Conservative post-processing for adaptive_pitfree only."""
+    out = arr.astype(np.float32, copy=True)
+    out[~footprint] = np.nan
+
+    if fill_ground_voids_zero:
+        out = _fill_missing_with_zero(out, support_mask, zero_support_mask)
+
+    # Fill only small internal holes with multi-directional support. Genuine canopy
+    # gaps and large voids remain untouched.
+    missing = footprint & ~np.isfinite(out)
+    if np.any(missing):
+        finite = np.isfinite(out) & footprint
+        n = np.zeros(out.shape, dtype=np.int16)
+        vals = np.where(finite, out, 0.0)
+        total = np.zeros(out.shape, dtype=np.float32)
+        for dy, dx in ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)):
+            sh_v = np.roll(vals, (dy, dx), axis=(0,1))
+            sh_m = np.roll(finite, (dy, dx), axis=(0,1))
+            total += np.where(sh_m, sh_v, 0.0)
+            n += sh_m.astype(np.int16)
+        fill = missing & (n >= 5)
+        out[fill] = total[fill] / np.maximum(n[fill], 1)
+
+    out = _apply_min_height(out, min_height)
+    out[~footprint] = np.nan
+    return out.astype(np.float32)
+
 def _max_envelope(grids: list[np.ndarray]) -> np.ndarray:
     if not grids:
         raise ValueError("No grids supplied for max-envelope CHM.")
@@ -789,6 +959,17 @@ def _build_surface(
     if surface_method == "tin":
         sx, sy, sz = _cellmax_support_points(x, y, z, bounds, res)
         return _rasterize_constrained_tin(sx, sy, sz, bounds, res, max_edge=None)
+
+    if surface_method == "adaptive_pitfree":
+        return _adaptive_pitfree_fusion(
+            x, y, z, bounds, res,
+            sensor_mode=sensor_mode,
+            percentile=percentile,
+            pitfree_thresholds=pitfree_thresholds,
+            pitfree_max_edge=pitfree_max_edge,
+            pitfree_subcircle=pitfree_subcircle,
+            pitfree_highest=pitfree_highest,
+        )
 
     if surface_method == "pitfree":
         thresholds = _normalize_thresholds(pitfree_thresholds, sensor_mode=sensor_mode)
@@ -969,27 +1150,42 @@ def _build_single_chm_tile(
 
     arr, footprint = _mask_outside_footprint(arr, support_mask, grow_cells=1)
 
-    if fill_ground_voids_zero:
-        arr = _fill_missing_with_zero(
+    if str(algorithm).lower() == "adaptive_pitfree":
+        arr = _adaptive_canopy_refine(
             arr,
-            support_mask,
-            zero_support_mask,
+            footprint=footprint,
+            support_mask=support_mask,
+            zero_support_mask=zero_support_mask,
+            min_height=min_height,
+            fill_ground_voids_zero=fill_ground_voids_zero,
         )
+        # User-requested smoothing remains available, but the adaptive method does
+        # not add any implicit global smoothing of its own.
+        arr = _apply_smoothing(
+            arr, method=smooth_method, median_size=median_size, gaussian_sigma=gaussian_sigma
+        )
+    else:
+        if fill_ground_voids_zero:
+            arr = _fill_missing_with_zero(
+                arr,
+                support_mask,
+                zero_support_mask,
+            )
 
-    arr = _fill_internal_canopy_voids_nearest(arr, footprint)
-    arr = _apply_min_height(arr, min_height)
-    arr = _fix_pits_and_voids(
-        arr,
-        footprint=footprint,
-        pit_threshold=max(0.25, float(void_ground_threshold)),
-        median_size=max(3, int(median_size) if int(median_size) > 0 else 3),
-    )
-    arr = _apply_smoothing(
-        arr,
-        method=smooth_method,
-        median_size=median_size,
-        gaussian_sigma=gaussian_sigma,
-    )
+        arr = _fill_internal_canopy_voids_nearest(arr, footprint)
+        arr = _apply_min_height(arr, min_height)
+        arr = _fix_pits_and_voids(
+            arr,
+            footprint=footprint,
+            pit_threshold=max(0.25, float(void_ground_threshold)),
+            median_size=max(3, int(median_size) if int(median_size) > 0 else 3),
+        )
+        arr = _apply_smoothing(
+            arr,
+            method=smooth_method,
+            median_size=median_size,
+            gaussian_sigma=gaussian_sigma,
+        )
     arr[~footprint] = np.nan
 
     _write_tif(arr, out_fp, xmin, ymax, grid_res, crs=crs)

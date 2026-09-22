@@ -1,0 +1,15 @@
+{
+  "name": "fastgc-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@giro3d/giro3d": "2.0.4"
+  },
+  "devDependencies": {
+    "vite": "^7.1.0"
+  }
+}

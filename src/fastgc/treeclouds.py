@@ -15,15 +15,14 @@ _VECTOR_SUFFIXES = {".shp", ".geojson", ".json"}
 _LAS_SUFFIXES = {".las", ".laz"}
 
 try:  # pragma: no cover
-    import fiona
+    from pyogrio.raw import read as _ogr_read
 except Exception:  # pragma: no cover
-    fiona = None
+    _ogr_read = None
 
 try:  # pragma: no cover
-    from shapely.geometry import shape
-    from shapely import contains_xy
+    from shapely import contains_xy, from_wkb
 except Exception:  # pragma: no cover
-    shape = None
+    from_wkb = None
     contains_xy = None
 
 try:  # pragma: no cover
@@ -110,36 +109,45 @@ def _find_crown_vector(root: Path, method: str, variant: str | None) -> tuple[Pa
 
 
 def _load_polygons(vector_path: Path) -> list[dict[str, Any]]:
-    if fiona is None or shape is None:
-        raise RuntimeError("fiona and shapely are required for FAST_TREECLOUDS crown vector reading.")
+    if _ogr_read is None or from_wkb is None:
+        raise RuntimeError("pyogrio and shapely are required for FAST_TREECLOUDS crown vector reading.")
 
+    meta, _fids, geometry_wkb, field_data = _ogr_read(str(vector_path))
+    if geometry_wkb is None:
+        return []
+
+    field_names = [str(v) for v in meta.get("fields", [])]
+    geometries = from_wkb(geometry_wkb)
     records: list[dict[str, Any]] = []
-    with fiona.open(vector_path) as src:
-        for idx, feat in enumerate(src, start=1):
-            geom = feat.get("geometry")
-            if not geom:
-                continue
-            poly = shape(geom)
-            if poly.is_empty:
-                continue
-            props = dict(feat.get("properties") or {})
-            source_crown_id = props.get("crown_id")
-            if source_crown_id is None:
-                source_crown_id = props.get("tree_id")
-            if source_crown_id is None:
-                source_crown_id = idx
 
-            centroid = poly.representative_point()
-            records.append({
-                # guaranteed-unique feature id for internal export bookkeeping
-                "feature_uid": int(idx),
-                # preserve original crown/tree id from vector if present
-                "crown_id": int(source_crown_id),
-                "geometry": poly,
-                "properties": props,
-                "area": float(poly.area),
-                "centroid": (float(centroid.x), float(centroid.y)),
-            })
+    for idx, poly in enumerate(geometries, start=1):
+        if poly is None or poly.is_empty:
+            continue
+
+        props: dict[str, Any] = {}
+        row = idx - 1
+        for name, values in zip(field_names, field_data):
+            value = values[row]
+            if isinstance(value, np.generic):
+                value = value.item()
+            props[name] = value
+
+        source_crown_id = props.get("crown_id")
+        if source_crown_id is None:
+            source_crown_id = props.get("tree_id")
+        if source_crown_id is None:
+            source_crown_id = idx
+
+        centroid = poly.representative_point()
+        records.append({
+            "feature_uid": int(idx),
+            "crown_id": int(source_crown_id),
+            "geometry": poly,
+            "properties": props,
+            "area": float(poly.area),
+            "centroid": (float(centroid.x), float(centroid.y)),
+        })
+
     # smaller crowns first to reduce swallowing of suppressed crowns
     records.sort(key=lambda r: (r["area"], r["feature_uid"]))
     return records

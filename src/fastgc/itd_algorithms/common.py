@@ -5,12 +5,13 @@ import math
 from pathlib import Path
 from typing import Iterable
 
-import fiona
+from pyogrio.raw import write as _ogr_write
 import numpy as np
 import rasterio
 from rasterio import features
 from scipy import ndimage as ndi
 from shapely.geometry import shape, mapping
+import shapely
 from shapely.geometry.base import BaseGeometry
 
 
@@ -192,6 +193,120 @@ def dual_gaussian_filter(
     out[~finite] = np.nan
     return out.astype(np.float32)
 
+
+
+def adaptive_local_maxima(
+    arr: np.ndarray,
+    *,
+    min_height: float,
+    transform: rasterio.Affine,
+    valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Height-adaptive local maxima without user-tuned crown windows.
+
+    Short/suppressed trees use compact neighborhoods while tall crowns use
+    progressively larger support. The mapping is deterministic and expressed in
+    physical units so raster resolution changes do not alter the crown scale.
+    """
+    if valid_mask is None:
+        valid_mask = np.isfinite(arr) & (arr >= float(min_height))
+    valid_mask = valid_mask.astype(bool)
+    if not np.any(valid_mask):
+        e = np.empty(0, dtype=np.int32)
+        return e, e, np.empty(0, dtype=np.float32)
+
+    dx, dy = pixel_size(transform)
+    res = max((dx + dy) / 2.0, 1e-6)
+    # Crown-window diameters in metres for height strata. Internal, not CLI knobs.
+    strata = [
+        (float(min_height), 6.0, 1.5),
+        (6.0, 12.0, 2.25),
+        (12.0, 20.0, 3.25),
+        (20.0, 30.0, 4.5),
+        (30.0, np.inf, 6.0),
+    ]
+    peak_union = np.zeros(arr.shape, dtype=bool)
+    for lo, hi, win_m in strata:
+        band = valid_mask & (arr >= lo) & (arr < hi)
+        if not np.any(band):
+            continue
+        win = max(3, int(round(win_m / res)))
+        if win % 2 == 0:
+            win += 1
+        mx = ndi.maximum_filter(np.where(valid_mask, arr, -np.inf), size=win, mode="nearest")
+        peak_union |= band & np.isfinite(arr) & (arr == mx)
+
+    rows, cols = np.where(peak_union)
+    vals = arr[rows, cols].astype(np.float32)
+    return rows.astype(np.int32), cols.astype(np.int32), vals
+
+
+def adaptive_prune_peaks(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    values: np.ndarray,
+    *,
+    arr: np.ndarray,
+    transform: rasterio.Affine,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Height-aware non-maximum suppression plus conservative prominence test."""
+    if len(rows) <= 1:
+        return rows, cols, values
+
+    dx, dy = pixel_size(transform)
+    res = max((dx + dy) / 2.0, 1e-6)
+    order = np.argsort(values)[::-1]
+    keep: list[int] = []
+    kept_xyh: list[tuple[float, float, float]] = []
+
+    finite = np.isfinite(arr)
+    filled = fill_nan_by_nearest(arr)
+    for idx in order:
+        r, c = int(rows[idx]), int(cols[idx])
+        h = float(values[idx])
+        x, y = map_point(transform, r, c)
+        # Internal allometry proxy. Grows smoothly from suppressed to dominant trees.
+        sep = float(np.clip(0.055 * h + 0.55, 0.75, 2.8))
+        if any(math.hypot(x-kx, y-ky) < min(sep, 0.80 * (0.055*kh+0.55)) for kx,ky,kh in kept_xyh):
+            continue
+
+        # Prominence in a physically scaled neighborhood. This is intentionally
+        # permissive; it rejects tiny within-crown ripples, not nearby true trees.
+        rad_m = float(np.clip(0.10 * h + 0.8, 1.2, 4.5))
+        rad_px = max(2, int(round(rad_m / res)))
+        r0, r1 = max(0, r-rad_px), min(arr.shape[0], r+rad_px+1)
+        c0, c1 = max(0, c-rad_px), min(arr.shape[1], c+rad_px+1)
+        patch = filled[r0:r1, c0:c1]
+        pmask = finite[r0:r1, c0:c1]
+        vals_local = patch[pmask]
+        if vals_local.size >= 8:
+            shoulder = float(np.percentile(vals_local, 70.0))
+            prominence = h - shoulder
+            need = float(np.clip(0.018*h + 0.12, 0.18, 0.65))
+            if prominence < need:
+                continue
+
+        keep.append(int(idx))
+        kept_xyh.append((x,y,h))
+
+    keep_arr=np.asarray(keep,dtype=int)
+    return rows[keep_arr], cols[keep_arr], values[keep_arr]
+
+
+def adaptive_canopy_mask(arr: np.ndarray, *, min_height: float) -> np.ndarray:
+    """Canopy mask that suppresses isolated low-height speckle without eroding crowns."""
+    m = np.isfinite(arr) & (arr >= float(min_height))
+    if not np.any(m):
+        return m
+    # Keep connected crown support; remove isolated one-pixel noise only.
+    labels, n = ndi.label(m, structure=np.ones((3,3), dtype=np.uint8))
+    if n == 0:
+        return m
+    counts = np.bincount(labels.ravel())
+    keep_ids = np.flatnonzero(counts >= 2)
+    keep_ids = keep_ids[keep_ids != 0]
+    return np.isin(labels, keep_ids)
 
 def local_maxima_mask(
     arr: np.ndarray,
@@ -584,30 +699,50 @@ def write_shapefile(
 
     geom_type = feats[0]["geometry"]["type"]
     first_props = feats[0].get("properties", {})
+    fields = list(first_props.keys())
 
-    schema = {
-        "geometry": geom_type,
-        "properties": {k: _schema_type_for_value(v) for k, v in first_props.items()},
-    }
+    # Remove an existing shapefile family before rewriting, matching Fiona's
+    # previous mode="w" behavior.
+    for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix"):
+        sidecar = path.with_suffix(suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+    geometries = np.asarray(
+        shapely.to_wkb([shape(feat["geometry"]) for feat in feats]),
+        dtype=object,
+    )
+
+    field_data: list[np.ndarray] = []
+    field_masks: list[np.ndarray | None] = []
+    for key in fields:
+        values = [_normalize_shp_value(feat.get("properties", {}).get(key)) for feat in feats]
+        non_null = [v for v in values if v is not None]
+        example = non_null[0] if non_null else ""
+        mask = np.asarray([v is None for v in values], dtype=bool)
+
+        if isinstance(example, (int, np.integer, bool, np.bool_)):
+            arr = np.asarray([0 if v is None else int(v) for v in values], dtype=np.int64)
+        elif isinstance(example, (float, np.floating)):
+            arr = np.asarray([np.nan if v is None else float(v) for v in values], dtype=np.float64)
+        else:
+            arr = np.asarray(["" if v is None else str(v) for v in values], dtype=object)
+
+        field_data.append(arr)
+        field_masks.append(mask if np.any(mask) else None)
 
     crs_wkt = crs.to_wkt() if crs is not None else None
-
-    with fiona.open(
-        path,
-        mode="w",
+    _ogr_write(
+        str(path),
+        geometries,
+        field_data,
+        fields,
+        field_mask=field_masks,
         driver="ESRI Shapefile",
-        schema=schema,
-        crs_wkt=crs_wkt,
+        geometry_type=geom_type,
+        crs=crs_wkt,
         encoding="UTF-8",
-    ) as dst:
-        for feat in feats:
-            props = {k: _normalize_shp_value(v) for k, v in feat.get("properties", {}).items()}
-            dst.write(
-                {
-                    "geometry": feat["geometry"],
-                    "properties": props,
-                }
-            )
+    )
 
     return str(path)
 
