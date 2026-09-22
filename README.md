@@ -1,15 +1,12 @@
 # FAST-GC
 
-```{=html}
 <p align="center">
-```
-`<img src="docs/images/fastgc_banner.png" width="100%" alt="FAST-GC">`{=html}
-
-```{=html}
+  <img src="docs/images/fastgc_banner.png" width="100%" alt="FAST-GC">
 </p>
-```
-## Fully Adaptive Self-Tuning Ground Classification (FAST-GC) 
-## parameter-free ground point classifiction
+
+## Fully Adaptive Self-Tuning Ground Classification (FAST-GC)
+
+**Sensor-adaptive ground classification and LiDAR-derived geospatial products**
 
 FAST-GC is a Python-first framework for automated LiDAR ground
 classification and downstream terrain, surface, canopy,
@@ -156,7 +153,12 @@ resulting classified terrain points support downstream
 terrain-referenced products.
 
 ``` bash
-fastgc --in_path input.laz --out_dir output --sensor_mode ALS --workflow run --products FAST_GC
+fastgc \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --workflow run \
+  --products FAST_GC
 ```
 
 ![FAST-GC ground classification](docs/images/FASTGC.png)
@@ -169,11 +171,15 @@ points. Supported rasterization methods are `min`, `max`, `mean`,
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
-  --products FAST_GC FAST_DEM --grid_res 0.5 --dem_method nearest
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --products FAST_GC FAST_DEM \
+  --grid_res 0.5 \
+  --dem_method nearest
 ```
 
-![FAST-GC digital elevation model](docs/images/FASTDEM.png)
+![FAST-GC digital elevation model](docs/images/FAST_DEM.png)
 
 ## FAST_NORMALIZED --- Height-Normalized Point Cloud
 
@@ -183,11 +189,13 @@ tree-level analysis.
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
   --products FAST_GC FAST_DEM FAST_NORMALIZED
 ```
 
-![FAST-GC normalized point cloud](docs/images/FASTNORMALIZED.png)
+![FAST-GC normalized point cloud](docs/images/FAST_NORMALIZED.png)
 
 ## FAST_DSM --- Digital Surface Model
 
@@ -198,11 +206,15 @@ and `spikefree`.
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
-  --products FAST_DSM --grid_res 0.5 --dsm_method max
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --products FAST_DSM \
+  --grid_res 0.5 \
+  --dsm_method max
 ```
 
-![FAST-GC digital surface model](docs/images/FASTDSM.png)
+
 
 ## FAST_CHM --- Canopy Height Models
 
@@ -226,14 +238,16 @@ Multiple CHMs can be generated in one run:
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_CHM \
   --chm_methods p2r p99 pitfree
 ```
 
-![FAST-GC canopy height model](docs/images/FASTCHM.png)
+![FAST-GC canopy height model](docs/images/FAST_CHM.png)
 
-![FAST-GC pit-free canopy height model](docs/images/FASTCHM_PITFREE.png)
+
 
 ## FAST_TERRAIN --- Terrain Derivatives
 
@@ -243,11 +257,14 @@ DTW, and TCI.
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
-  --products FAST_GC FAST_DEM FAST_TERRAIN --terrain_products all
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --products FAST_GC FAST_DEM FAST_TERRAIN \
+  --terrain_products all
 ```
 
-![FAST-GC terrain products](docs/images/FASTTERRAIN.png)
+![FAST-GC terrain products](docs/images/FAST_SLOPE.png)
 
 ## FAST_STRUCTURE --- Forest Structure
 
@@ -258,12 +275,14 @@ diversity (FHD), vertical complexity index (VCI), and point count.
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_STRUCTURE \
   --structure_products all
 ```
 
-![FAST-GC forest structure](docs/images/FASTSTRUCTURE.png)
+
 
 ## FAST_ITD --- Individual Tree Detection
 
@@ -279,12 +298,15 @@ implemented and validated.
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_CHM FAST_ITD \
-  --chm_method pitfree --itd_method watershed
+  --chm_method pitfree \
+  --itd_method watershed
 ```
 
-![FAST-GC individual tree detection](docs/images/FASTITD.png)
+
 
 ## FAST_TREECLOUDS --- Individual-Tree Point Clouds
 
@@ -294,12 +316,15 @@ and creates tree-level point-cloud products. The point source can be
 
 ``` bash
 fastgc \
-  --in_path processed_FASTGC_workspace --sensor_mode ALS \
-  --workflow derive-only --products FAST_TREECLOUDS \
-  --treeclouds_las_source FAST_NORMALIZED --treeclouds_write_individual
+  --in_path processed_FASTGC_workspace \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_TREECLOUDS \
+  --treeclouds_las_source FAST_NORMALIZED \
+  --treeclouds_write_individual
 ```
 
-![FAST-GC individual-tree point clouds](docs/images/FASTTREECLOUDS.png)
+
 
 ## FAST_CHANGE --- Raster Change Analysis
 
@@ -310,12 +335,15 @@ controls.
 
 ``` bash
 fastgc \
-  --in_path processed_FASTGC_workspace --sensor_mode ALS \
-  --workflow derive-only --products FAST_CHANGE \
-  --change_input_type FAST_CHM --change_mode sequential
+  --in_path processed_FASTGC_workspace \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_CHANGE \
+  --change_input_type FAST_CHM \
+  --change_mode sequential
 ```
 
-![FAST-GC raster change analysis](docs/images/FASTCHANGE.png)
+
 
 # Processing Architecture
 
@@ -386,7 +414,12 @@ normalized-height products require a terrain reference.
 ## 1. Single LAS/LAZ --- Ground Classification
 
 ``` bash
-fastgc --in_path input.laz --out_dir output --sensor_mode ALS --workflow run --products FAST_GC
+fastgc \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --workflow run \
+  --products FAST_GC
 ```
 
 Change `ALS` to `ULS` or `TLS` according to the acquisition platform.
@@ -395,24 +428,36 @@ Change `ALS` to `ULS` or `TLS` according to the acquisition platform.
 
 ``` bash
 fastgc \
-  --in_path lidar_folder --out_dir output --sensor_mode ULS \
-  --workflow run --products FAST_GC --recursive
+  --in_path lidar_folder \
+  --out_dir output \
+  --sensor_mode ULS \
+  --workflow run \
+  --products FAST_GC \
+  --recursive
 ```
 
 ## 3. Large Dataset --- Tiling Only
 
 ``` bash
 fastgc \
-  --in_path large_input.laz --out_dir output --sensor_mode ALS \
-  --workflow tile-only --tile_size_m 250 --buffer_m 5
+  --in_path large_input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --workflow tile-only \
+  --tile_size_m 250 \
+  --buffer_m 5
 ```
 
 ## 4. Tile and Process
 
 ``` bash
 fastgc \
-  --in_path large_input.laz --out_dir output --sensor_mode ALS \
-  --workflow tile-run --tile_size_m 250 --buffer_m 5 \
+  --in_path large_input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --workflow tile-run \
+  --tile_size_m 250 \
+  --buffer_m 5 \
   --products FAST_GC FAST_DEM FAST_NORMALIZED
 ```
 
@@ -420,10 +465,15 @@ fastgc \
 
 ``` bash
 fastgc \
-  --in_path large_input.laz --out_dir output --sensor_mode ALS \
-  --workflow tile-run-merge --tile_size_m 100 --buffer_m 5 \
+  --in_path large_input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --workflow tile-run-merge \
+  --tile_size_m 100 \
+  --buffer_m 5 \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_CHM FAST_TERRAIN \
-  --terrain_products all --jobs 0
+  --terrain_products all \
+  --jobs 0
 ```
 
 ## 6. Complete Core-Product Workflow
@@ -433,10 +483,15 @@ core products in one tiled run and merges the final outputs:
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
-  --workflow tile-run-merge --tile_size_m 100 --buffer_m 5 \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --workflow tile-run-merge \
+  --tile_size_m 100 \
+  --buffer_m 5 \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_CHM FAST_TERRAIN \
-  --terrain_products all --jobs 0
+  --terrain_products all \
+  --jobs 0
 ```
 
 `FAST_STRUCTURE`, `FAST_ITD`, `FAST_TREECLOUDS`, and `FAST_CHANGE` are
@@ -448,7 +503,9 @@ raw-LiDAR processing stage.
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_CHM \
   --chm_methods p2r p99 pitfree adaptive_pitfree
 ```
@@ -457,8 +514,10 @@ fastgc \
 
 ``` bash
 fastgc \
-  --in_path processed_FASTGC_workspace --sensor_mode ALS \
-  --workflow derive-only --products FAST_CHM \
+  --in_path processed_FASTGC_workspace \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_CHM \
   --chm_methods p2r p99 pitfree
 ```
 
@@ -467,8 +526,10 @@ workspace:
 
 ``` bash
 fastgc \
-  --in_path processed_FASTGC_workspace --sensor_mode ALS \
-  --workflow derive-only --products FAST_STRUCTURE \
+  --in_path processed_FASTGC_workspace \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_STRUCTURE \
   --structure_products all
 ```
 
@@ -476,7 +537,8 @@ fastgc \
 
 ``` bash
 fastgc \
-  --in_path processed_FASTGC_workspace --sensor_mode ALS \
+  --in_path processed_FASTGC_workspace \
+  --sensor_mode ALS \
   --workflow merge \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_TERRAIN
 ```
@@ -485,18 +547,24 @@ fastgc \
 
 ``` bash
 fastgc \
-  --in_path input.laz --out_dir output --sensor_mode ALS \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_CHM FAST_ITD \
-  --chm_method pitfree --itd_method watershed
+  --chm_method pitfree \
+  --itd_method watershed
 ```
 
 ## 11. Raster Change Workflow
 
 ``` bash
 fastgc \
-  --in_path processed_FASTGC_workspace --sensor_mode ALS \
-  --workflow derive-only --products FAST_CHANGE \
-  --change_input_type FAST_CHM --change_mode sequential
+  --in_path processed_FASTGC_workspace \
+  --sensor_mode ALS \
+  --workflow derive-only \
+  --products FAST_CHANGE \
+  --change_input_type FAST_CHM \
+  --change_mode sequential
 ```
 
 ## 12. Google Colab / Google Drive
@@ -505,7 +573,9 @@ fastgc \
 !fastgc \
   --in_path "/content/drive/MyDrive/input.laz" \
   --out_dir "/content/drive/MyDrive/FASTGC_output" \
-  --sensor_mode ALS --workflow run --products FAST_GC
+  --sensor_mode ALS \
+  --workflow run \
+  --products FAST_GC
 ```
 
 Notebook environments are convenient for modest datasets. Large-area
@@ -520,9 +590,14 @@ logical CPU.
 
 ``` bash
 fastgc \
-  --in_path large_input.laz --out_dir output --sensor_mode ALS \
-  --workflow tile-run-merge --tile_size_m 250 --buffer_m 5 \
-  --jobs 0 --products FAST_GC FAST_DEM
+  --in_path large_input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --workflow tile-run-merge \
+  --tile_size_m 250 \
+  --buffer_m 5 \
+  --jobs 0 \
+  --products FAST_GC FAST_DEM
 ```
 
 Explicit worker counts can also be supplied with `--jobs`.
@@ -547,28 +622,6 @@ FASTGC_output/
 Point-cloud products are written as LAS/LAZ outputs and raster products
 as geospatial raster outputs according to the selected workflow.
 
-# Figure Placeholders
-
-The README uses standardized product-image locations:
-
-``` text
-docs/images/
-├── fastgc_banner.png
-├── FASTGC.png
-├── FASTDEM.png
-├── FASTNORMALIZED.png
-├── FASTDSM.png
-├── FASTCHM.png
-├── FASTCHM_PITFREE.png
-├── FASTTERRAIN.png
-├── FASTSTRUCTURE.png
-├── FASTITD.png
-├── FASTTREECLOUDS.png
-└── FASTCHANGE.png
-```
-
-Additional method-specific product figures can be added under
-`docs/images/` without changing the workflow documentation.
 
 # Command-Line Reference
 

@@ -8,7 +8,7 @@ version = "0.2.1"
 description = "FAST-GC: Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification for LiDAR point clouds"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
-license = { text = "Apache-2.0" }
+license = { text = "AGPL-3.0-or-later" }
 
 authors = [
   { name = "Nadeem Fareed" }
@@ -31,7 +31,7 @@ keywords = [
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: Apache Software License",
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
   "Operating System :: Microsoft :: Windows",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
@@ -117,4 +117,3 @@ manifest-path = "native/Cargo.toml"
 python-source = "src"
 module-name = "fastgc._fastgc_native"
 bindings = "pyo3"
-
