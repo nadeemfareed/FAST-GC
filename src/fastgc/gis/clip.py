@@ -11,6 +11,8 @@ from pathlib import Path
 
 import laspy
 import numpy as np
+from shapely import intersects_xy
+from shapely.geometry.base import BaseGeometry
 
 from .las_query import query_las_chunks
 
@@ -18,8 +20,9 @@ from .las_query import query_las_chunks
 def clip_las(
     input_path,
     output_path,
-    bounds,
+    bounds=None,
     *,
+    geometry=None,
     buffer=0.0,
     chunk_size=500_000,
     write_report=True,
@@ -51,7 +54,35 @@ def clip_las(
     if write_report and report_path.exists():
         raise FileExistsError(report_path)
 
-    values = np.asarray(bounds, dtype=np.float64)
+    if geometry is not None:
+        if bounds is not None:
+            raise ValueError(
+                "Specify either bounds or geometry, not both."
+            )
+
+        if not isinstance(geometry, BaseGeometry):
+            raise TypeError("geometry must be a Shapely geometry.")
+
+        if geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise ValueError(
+                "Only Polygon and MultiPolygon geometries are supported."
+            )
+
+        if geometry.is_empty or not geometry.is_valid:
+            raise ValueError("Polygon must be nonempty and valid.")
+
+        values = np.asarray(
+            geometry.bounds,
+            dtype=np.float64,
+        )
+
+    else:
+        if bounds is None:
+            raise ValueError(
+                "Either bounds or geometry is required."
+            )
+
+        values = np.asarray(bounds, dtype=np.float64)
 
     if values.shape != (4,) or not np.all(np.isfinite(values)):
         raise ValueError("Bounds must contain four finite numbers.")
@@ -72,12 +103,26 @@ def clip_las(
     ) or chunk_size <= 0:
         raise ValueError("Chunk size must be a positive integer.")
 
-    expanded = (
-        xmin - buffer,
-        ymin - buffer,
-        xmax + buffer,
-        ymax + buffer,
-    )
+    selection_geometry = None
+
+    if geometry is not None:
+        selection_geometry = (
+            geometry.buffer(buffer)
+            if buffer > 0
+            else geometry
+        )
+
+        expanded = tuple(
+            map(float, selection_geometry.bounds)
+        )
+
+    else:
+        expanded = (
+            xmin - buffer,
+            ymin - buffer,
+            xmax + buffer,
+            ymax + buffer,
+        )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -110,8 +155,22 @@ def clip_las(
                 expanded,
                 chunk_size=chunk_size,
             ):
-                writer.write_points(result.points)
-                selected_count += result.count
+                selected_points = result.points
+
+                if selection_geometry is not None:
+                    inside = intersects_xy(
+                        selection_geometry,
+                        np.asarray(selected_points.x),
+                        np.asarray(selected_points.y),
+                    )
+
+                    selected_points = selected_points[
+                        np.flatnonzero(inside)
+                    ]
+
+                if len(selected_points):
+                    writer.write_points(selected_points)
+                    selected_count += len(selected_points)
 
         with laspy.open(temporary) as reader:
             output_header = reader.header
@@ -171,6 +230,9 @@ def clip_las(
         "selected_points": selected_count,
         "selection_fraction": (
             selected_count / source_count if source_count else 0.0
+        ),
+        "selection_type": (
+            "polygon" if geometry is not None else "bounds"
         ),
         "requested_bounds": list(map(float, values)),
         "expanded_bounds": list(expanded),
