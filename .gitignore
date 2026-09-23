@@ -131,3 +131,6 @@ poetry.lock
 *before_*.py
 patch_payload/
 FASTGC_ALS_*/
+
+# Local Rust build artifacts
+/native/target/
