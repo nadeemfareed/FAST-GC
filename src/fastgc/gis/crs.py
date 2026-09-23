@@ -137,7 +137,7 @@ def inspect_crs(
 # Coordinate transformations and spatial compatibility
 # ============================================================
 
-from pyproj import Transformer
+from pyproj.aoi import AreaOfInterest
 from shapely.geometry import box
 from shapely.ops import transform as shapely_transform
 
@@ -212,11 +212,16 @@ def transform_geometry(
     geometry,
     source_crs: CRS | str | int,
     target_crs: CRS | str | int,
+    *,
+    area_of_interest: AreaOfInterest | None = None,
+    max_accuracy_m: float | None = None,
+    require_known_accuracy: bool = False,
 ):
-    """Transform a Shapely geometry between coordinate systems.
+    """Transform horizontal coordinates without PROJ network access.
 
-    Axis order is fixed to x/y using always_xy=True.
-    Ballpark transformations are not permitted.
+    Selects an available local transformation and keeps PROJ
+    networking disabled throughout its execution. Existing geometry
+    Z coordinates are preserved; vertical datums are not transformed.
     """
 
     source = require_horizontal_crs(source_crs)
@@ -225,18 +230,28 @@ def transform_geometry(
     if source.equals(target):
         return geometry
 
-    transformer = Transformer.from_crs(
-        source,
-        target,
-        always_xy=True,
-        allow_ballpark=False,
-        only_best=True,
-    )
+    with _offline_proj_context():
+        transformer = select_horizontal_transformer(
+            source,
+            target,
+            area_of_interest=area_of_interest,
+            max_accuracy_m=max_accuracy_m,
+            require_known_accuracy=require_known_accuracy,
+        )
 
-    return shapely_transform(
-        transformer.transform,
-        geometry,
-    )
+        return shapely_transform(
+            lambda x, y, z=None: transformer.transform(
+                x,
+                y,
+                z,
+                errcheck=True,
+            ) if z is not None else transformer.transform(
+                x,
+                y,
+                errcheck=True,
+            ),
+            geometry,
+        )
 
 
 def spatially_overlaps(
@@ -365,7 +380,6 @@ from contextlib import contextmanager
 from math import isfinite
 
 from pyproj import network
-from pyproj.aoi import AreaOfInterest
 from pyproj.transformer import TransformerGroup
 
 

@@ -581,3 +581,201 @@ def test_gis_selector_rejects_missing_grid(monkeypatch):
             "EPSG:4326",
             "EPSG:32617",
         )
+
+
+def test_gis_concurrent_selector_isolation():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from pyproj import network
+    from fastgc.gis.crs import select_horizontal_transformer
+
+    def worker(enabled, barrier):
+        previous = network.is_network_enabled()
+
+        try:
+            network.set_network_enabled(enabled)
+            barrier.wait(timeout=15)
+
+            transformer = select_horizontal_transformer(
+                "EPSG:4326",
+                "EPSG:32617",
+            )
+
+            x, y = transformer.transform(
+                -82.3248,
+                29.6516,
+                errcheck=True,
+            )
+
+            return (
+                network.is_network_enabled() == enabled
+                and abs(x - 371776.274) < 1
+                and abs(y - 3280914.294) < 1
+            )
+
+        finally:
+            network.set_network_enabled(previous)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for _ in range(10):
+            barrier = Barrier(2)
+
+            offline = executor.submit(
+                worker,
+                False,
+                barrier,
+            )
+
+            online = executor.submit(
+                worker,
+                True,
+                barrier,
+            )
+
+            assert offline.result()
+            assert online.result()
+
+
+def test_gis_selector_restores_network_after_failure(
+    monkeypatch,
+):
+    from pyproj import network
+    import fastgc.gis.crs as crs
+
+    original = network.is_network_enabled()
+
+    class FailingTransformerGroup:
+        def __init__(self, *args, **kwargs):
+            assert not network.is_network_enabled()
+            raise RuntimeError("Simulated construction failure")
+
+    monkeypatch.setattr(
+        crs,
+        "TransformerGroup",
+        FailingTransformerGroup,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Simulated construction failure",
+    ):
+        crs.select_horizontal_transformer(
+            "EPSG:4326",
+            "EPSG:32617",
+        )
+
+    assert network.is_network_enabled() == original
+
+
+def test_gis_selector_preserves_caller_network_setting():
+    from pyproj import network
+    from fastgc.gis.crs import select_horizontal_transformer
+
+    original = network.is_network_enabled()
+
+    try:
+        for enabled in (False, True):
+            network.set_network_enabled(enabled)
+
+            transformer = select_horizontal_transformer(
+                "EPSG:4326",
+                "EPSG:32617",
+            )
+
+            assert transformer is not None
+            assert network.is_network_enabled() == enabled
+
+    finally:
+        network.set_network_enabled(original)
+
+
+def test_gis_geometry_execution_stays_offline(monkeypatch):
+    from pyproj import network
+    from shapely.geometry import Point
+    import fastgc.gis.crs as crs
+
+    original_transform = crs.shapely_transform
+    original_setting = network.is_network_enabled()
+    observed = []
+
+    def inspect_execution(function, geometry):
+        observed.append(network.is_network_enabled())
+        return original_transform(function, geometry)
+
+    monkeypatch.setattr(
+        crs,
+        "shapely_transform",
+        inspect_execution,
+    )
+
+    try:
+        network.set_network_enabled(True)
+
+        result = crs.transform_geometry(
+            Point(-82.3248, 29.6516),
+            "EPSG:4326",
+            "EPSG:32617",
+        )
+
+        assert abs(result.x - 371776.274) < 1
+        assert abs(result.y - 3280914.294) < 1
+        assert observed == [False]
+        assert network.is_network_enabled()
+
+    finally:
+        network.set_network_enabled(original_setting)
+
+
+def test_gis_geometry_restores_network_after_execution_failure(
+    monkeypatch,
+):
+    from pyproj import network
+    from shapely.geometry import Point
+    import fastgc.gis.crs as crs
+
+    original_setting = network.is_network_enabled()
+
+    def fail_during_execution(function, geometry):
+        assert not network.is_network_enabled()
+        raise RuntimeError("Simulated geometry execution failure")
+
+    monkeypatch.setattr(
+        crs,
+        "shapely_transform",
+        fail_during_execution,
+    )
+
+    try:
+        network.set_network_enabled(True)
+
+        with pytest.raises(
+            RuntimeError,
+            match="Simulated geometry execution failure",
+        ):
+            crs.transform_geometry(
+                Point(-82.3248, 29.6516),
+                "EPSG:4326",
+                "EPSG:32617",
+            )
+
+        assert network.is_network_enabled()
+
+    finally:
+        network.set_network_enabled(original_setting)
+
+
+def test_gis_geometry_passes_accuracy_controls():
+    from shapely.geometry import Point
+    from fastgc.gis.crs import transform_geometry
+
+    with pytest.raises(
+        ValueError,
+        match="unknown numerical accuracy",
+    ):
+        transform_geometry(
+            Point(-82.3248, 29.6516),
+            "EPSG:4326",
+            "EPSG:32617",
+            require_known_accuracy=True,
+        )
