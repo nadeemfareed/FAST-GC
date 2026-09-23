@@ -447,3 +447,137 @@ def test_selector_restores_proj_network_setting():
 
     finally:
         network.set_network_enabled(original)
+
+
+def test_gis_coverage_florida():
+    from pyproj.aoi import AreaOfInterest
+    from fastgc.gis.crs import (
+        select_horizontal_transformer,
+        validate_transformer_coverage,
+    )
+
+    area = AreaOfInterest(-83, 29, -82, 30)
+
+    transformer = select_horizontal_transformer(
+        "EPSG:4326",
+        "EPSG:32617",
+        area_of_interest=area,
+    )
+
+    validate_transformer_coverage(transformer, area)
+
+
+def test_gis_coverage_rejects_outside_area():
+    from pyproj.aoi import AreaOfInterest
+    from fastgc.gis.crs import (
+        select_horizontal_transformer,
+        validate_transformer_coverage,
+    )
+
+    transformer = select_horizontal_transformer(
+        "EPSG:4326",
+        "EPSG:32617",
+    )
+
+    outside = AreaOfInterest(10, 40, 11, 41)
+
+    with pytest.raises(ValueError, match="does not cover"):
+        validate_transformer_coverage(
+            transformer,
+            outside,
+        )
+
+
+def test_gis_coverage_rejects_antimeridian():
+    from pyproj.aoi import AreaOfInterest
+    from fastgc.gis.crs import (
+        select_horizontal_transformer,
+        validate_transformer_coverage,
+    )
+
+    transformer = select_horizontal_transformer(
+        "EPSG:4326",
+        "EPSG:32617",
+    )
+
+    crossing = AreaOfInterest(
+        179,
+        -10,
+        -179,
+        10,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="antimeridian",
+    ):
+        validate_transformer_coverage(
+            transformer,
+            crossing,
+        )
+
+
+def test_gis_coverage_rejects_invalid_bounds():
+    from pyproj.aoi import AreaOfInterest
+    from fastgc.gis.crs import (
+        select_horizontal_transformer,
+        validate_transformer_coverage,
+    )
+
+    transformer = select_horizontal_transformer(
+        "EPSG:4326",
+        "EPSG:32617",
+    )
+
+    invalid = AreaOfInterest(
+        -83,
+        30,
+        -82,
+        29,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="southern boundary",
+    ):
+        validate_transformer_coverage(
+            transformer,
+            invalid,
+        )
+
+
+def test_gis_selector_rejects_missing_grid(monkeypatch):
+    from types import SimpleNamespace
+    import fastgc.gis.crs as crs
+
+    missing_grid = SimpleNamespace(
+        short_name="missing_test_grid.tif",
+        available=False,
+    )
+
+    unavailable_operation = SimpleNamespace(
+        grids=[missing_grid],
+    )
+
+    class FakeTransformerGroup:
+        def __init__(self, *args, **kwargs):
+            self.best_available = False
+            self.transformers = []
+            self.unavailable_operations = [
+                unavailable_operation,
+            ]
+
+    monkeypatch.setattr(
+        crs,
+        "TransformerGroup",
+        FakeTransformerGroup,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="missing_test_grid.tif",
+    ):
+        crs.select_horizontal_transformer(
+            "EPSG:4326",
+            "EPSG:32617",
+        )

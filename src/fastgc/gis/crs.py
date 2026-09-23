@@ -453,4 +453,88 @@ def select_horizontal_transformer(
             f"{accuracy} m > {max_accuracy_m} m."
         )
 
+    if area_of_interest is not None:
+        validate_transformer_coverage(
+            transformer,
+            area_of_interest,
+        )
+
     return transformer
+
+
+def validate_transformer_coverage(
+    transformer,
+    area_of_interest: AreaOfInterest,
+) -> None:
+    """Validate geographic coverage of a selected operation."""
+
+    if not isinstance(area_of_interest, AreaOfInterest):
+        raise TypeError(
+            "area_of_interest must be an AreaOfInterest instance."
+        )
+
+    west = area_of_interest.west_lon_degree
+    south = area_of_interest.south_lat_degree
+    east = area_of_interest.east_lon_degree
+    north = area_of_interest.north_lat_degree
+
+    coordinates = (west, south, east, north)
+
+    if not all(isfinite(value) for value in coordinates):
+        raise ValueError(
+            "Area-of-interest coordinates must be finite."
+        )
+
+    if not (
+        -180 <= west <= 180
+        and -180 <= east <= 180
+        and -90 <= south <= 90
+        and -90 <= north <= 90
+    ):
+        raise ValueError(
+            "Area-of-interest coordinates exceed "
+            "geographic coordinate limits."
+        )
+
+    if west >= east:
+        raise ValueError(
+            "Invalid or antimeridian-crossing longitude bounds."
+        )
+
+    if south >= north:
+        raise ValueError(
+            "Area-of-interest southern boundary must "
+            "be below its northern boundary."
+        )
+
+    coverage = transformer.area_of_use
+
+    if coverage is None:
+        raise ValueError(
+            "Selected transformation does not report "
+            "geographic coverage."
+        )
+
+    if coverage.west > coverage.east:
+        raise ValueError(
+            "Antimeridian-crossing transformation coverage "
+            "requires dedicated handling."
+        )
+
+    tolerance = 1e-9
+
+    covered = (
+        west >= coverage.west - tolerance
+        and east <= coverage.east + tolerance
+        and south >= coverage.south - tolerance
+        and north <= coverage.north + tolerance
+    )
+
+    if not covered:
+        raise ValueError(
+            "Selected transformation does not cover "
+            "the entire requested geographic area. "
+            f"Requested: {(west, south, east, north)}. "
+            f"Operation coverage: "
+            f"{(coverage.west, coverage.south, coverage.east, coverage.north)}."
+        )
