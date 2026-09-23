@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 from .core import DEFAULT_WORKFLOW, WORKFLOW_CHOICES, run_fastgc
 from .monster import BACKEND_CHOICES, DEFAULT_BACKEND
@@ -120,6 +121,13 @@ TREECLOUDS_LAS_SOURCE_CHOICES = [
 
 
 def main(argv=None):
+    # FAST-GIS is an integrated subcommand, while the established FAST-GC
+    # option interface remains byte-for-byte compatible for normal invocations.
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if effective_argv and effective_argv[0].lower() == "gis":
+        from .gis.gis_cli import main as gis_main
+        return gis_main(effective_argv[1:])
+
     parser = argparse.ArgumentParser(
         prog="fastgc",
         description="FAST-GC: sensor-aware ground classification and LiDAR derivative products",

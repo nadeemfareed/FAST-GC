@@ -17,6 +17,7 @@ from pyproj import CRS
 
 from .clip import clip_las
 from .plot_io import import_plots
+from .progress import gis_progress
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -97,42 +98,54 @@ def extract_plots(
     started = time.perf_counter()
     entries = []
     try:
-        for index, plot in enumerate(plots, start=1):
-            name = plot.plot_name
-            folder = staging / name
-            folder.mkdir()
-            core_rel = f"{name}/{name}{source.suffix.lower()}"
-            core_path = staging / core_rel
-            print(f"[{index}/{len(plots)}] {name}: exact core", flush=True)
-            core = clip_las(source, core_path, geometry=plot.geometry, chunk_size=chunk_size, write_report=False)
-            buffer_rel = None
-            buffered = None
-            if buffer > 0:
-                buffer_rel = f"{name}/{name}_buffer{buffer:g}{source.suffix.lower()}"
-                print(f"[{index}/{len(plots)}] {name}: {buffer:g} m buffer", flush=True)
-                buffered = clip_las(
-                    source, staging / buffer_rel, geometry=plot.geometry,
-                    buffer=buffer, chunk_size=chunk_size, write_report=False,
-                )
-            entry = {
-                "plot_id": plot.plot_id,
-                "plot_name": name,
-                "source_feature_id": plot.source_feature_id,
-                "source_file": plot.source_file,
-                "source_crs": plot.source_crs,
-                "processing_crs": plot.processing_crs,
-                "geometry_wkt": plot.geometry.wkt,
-                "attributes": plot.attributes,
-                "core_file": core_rel,
-                "core_points": core["selected_points"],
-                "core_seconds": core["elapsed_seconds"],
-                "buffer_m": float(buffer),
-                "buffer_file": buffer_rel,
-                "buffer_points": buffered["selected_points"] if buffered else None,
-                "buffer_seconds": buffered["elapsed_seconds"] if buffered else None,
-            }
-            _write_json(folder / f"Clip_{name}.json", entry)
-            entries.append(entry)
+        total_plots = len(plots)
+        bar = gis_progress("CLIPPING", total_plots, unit="plot")
+        try:
+            for index, plot in enumerate(plots, start=1):
+                name = plot.plot_name
+                try:
+                    bar.set_postfix_str(f"{name}: core", refresh=True)
+                except Exception:
+                    pass
+                folder = staging / name
+                folder.mkdir()
+                core_rel = f"{name}/{name}{source.suffix.lower()}"
+                core_path = staging / core_rel
+                core = clip_las(source, core_path, geometry=plot.geometry, chunk_size=chunk_size, write_report=False)
+                buffer_rel = None
+                buffered = None
+                if buffer > 0:
+                    buffer_rel = f"{name}/{name}_buffer{buffer:g}{source.suffix.lower()}"
+                    try:
+                        bar.set_postfix_str(f"{name}: buffer {buffer:g} m", refresh=True)
+                    except Exception:
+                        pass
+                    buffered = clip_las(
+                        source, staging / buffer_rel, geometry=plot.geometry,
+                        buffer=buffer, chunk_size=chunk_size, write_report=False,
+                    )
+                entry = {
+                    "plot_id": plot.plot_id,
+                    "plot_name": name,
+                    "source_feature_id": plot.source_feature_id,
+                    "source_file": plot.source_file,
+                    "source_crs": plot.source_crs,
+                    "processing_crs": plot.processing_crs,
+                    "geometry_wkt": plot.geometry.wkt,
+                    "attributes": plot.attributes,
+                    "core_file": core_rel,
+                    "core_points": core["selected_points"],
+                    "core_seconds": core["elapsed_seconds"],
+                    "buffer_m": float(buffer),
+                    "buffer_file": buffer_rel,
+                    "buffer_points": buffered["selected_points"] if buffered else None,
+                    "buffer_seconds": buffered["elapsed_seconds"] if buffered else None,
+                }
+                _write_json(folder / f"Clip_{name}.json", entry)
+                entries.append(entry)
+                bar.update(1)
+        finally:
+            bar.close()
         manifest = {
             "schema_version": 1,
             "source_las": str(source),
