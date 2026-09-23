@@ -320,6 +320,11 @@ def import_plots(
 
     elif suffix == ".csv":
 
+        if source_crs is None or not str(source_crs).strip():
+            raise ValueError(
+                "CSV plot centers require source_crs."
+            )
+
         input_crs = CRS.from_user_input(
             source_crs
         )
