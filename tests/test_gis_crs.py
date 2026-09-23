@@ -305,3 +305,145 @@ def test_inspect_crs_rejects_conflicting_las_metadata(tmp_path):
         match="Conflicting LAS CRS metadata",
     ):
         inspect_crs(path)
+
+
+
+# ============================================================
+# Compound CRS and elevation-preservation regression tests
+# ============================================================
+
+from fastgc.gis.crs import extract_horizontal_crs
+
+
+def test_extract_compound_horizontal_crs():
+    horizontal = extract_horizontal_crs("EPSG:6348+5703")
+
+    assert horizontal.to_epsg() == 6348
+    assert horizontal.is_projected
+    assert len(horizontal.axis_info) == 2
+
+
+def test_extract_geographic_3d_horizontal_crs():
+    horizontal = extract_horizontal_crs("EPSG:4979")
+
+    assert horizontal.to_epsg() == 4326
+    assert horizontal.is_geographic
+    assert len(horizontal.axis_info) == 2
+
+
+def test_extract_vertical_only_crs_rejected():
+    with pytest.raises(ValueError, match="vertical-only"):
+        extract_horizontal_crs("EPSG:5703")
+
+
+def test_compound_crs_geometry_preserves_z():
+    original = Point(-69.0, 42.0, 125.5)
+
+    transformed = transform_geometry(
+        original,
+        "EPSG:4979",
+        "EPSG:6348+5703",
+    )
+
+    assert transformed.has_z
+    assert transformed.z == pytest.approx(125.5)
+
+    recovered = transform_geometry(
+        transformed,
+        "EPSG:6348+5703",
+        "EPSG:4979",
+    )
+
+    assert recovered.x == pytest.approx(original.x, abs=1e-7)
+    assert recovered.y == pytest.approx(original.y, abs=1e-7)
+    assert recovered.z == pytest.approx(original.z)
+
+
+def test_compound_crs_horizontal_requirement():
+    horizontal = require_horizontal_crs("EPSG:6348+5703")
+
+    assert horizontal.to_epsg() == 6348
+    assert not horizontal.is_compound
+    assert len(horizontal.axis_info) == 2
+
+
+# Controlled horizontal transformation regression tests
+
+
+def test_selector_compound_crs():
+    from fastgc.gis.crs import select_horizontal_transformer
+
+    transformer = select_horizontal_transformer(
+        "EPSG:4979",
+        "EPSG:6348+5703",
+    )
+
+    x, y = transformer.transform(-69.0, 42.0)
+
+    assert abs(x) > 1000
+    assert abs(y) > 1000
+
+
+def test_selector_rejects_vertical_only_crs():
+    from fastgc.gis.crs import select_horizontal_transformer
+
+    with pytest.raises(ValueError, match="vertical-only"):
+        select_horizontal_transformer(
+            "EPSG:5703",
+            "EPSG:32617",
+        )
+
+
+def test_selector_rejects_unknown_accuracy_when_required():
+    from fastgc.gis.crs import select_horizontal_transformer
+
+    with pytest.raises(
+        ValueError,
+        match="unknown numerical accuracy",
+    ):
+        select_horizontal_transformer(
+            "EPSG:4326",
+            "EPSG:32617",
+            max_accuracy_m=1.0,
+        )
+
+
+def test_selector_rejects_invalid_accuracy_threshold():
+    from fastgc.gis.crs import select_horizontal_transformer
+
+    for threshold in (-1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite"):
+            select_horizontal_transformer(
+                "EPSG:4326",
+                "EPSG:32617",
+                max_accuracy_m=threshold,
+            )
+
+
+def test_selector_restores_proj_network_setting():
+    from pyproj import network
+    from fastgc.gis.crs import select_horizontal_transformer
+
+    original = network.is_network_enabled()
+
+    try:
+        network.set_network_enabled(True)
+
+        select_horizontal_transformer(
+            "EPSG:4326",
+            "EPSG:32617",
+        )
+
+        assert network.is_network_enabled()
+
+        network.set_network_enabled(False)
+
+        select_horizontal_transformer(
+            "EPSG:4326",
+            "EPSG:32617",
+        )
+
+        assert not network.is_network_enabled()
+
+    finally:
+        network.set_network_enabled(original)

@@ -142,10 +142,17 @@ from shapely.geometry import box
 from shapely.ops import transform as shapely_transform
 
 
-def require_horizontal_crs(
+def extract_horizontal_crs(
     crs: CRS | str | int | None,
 ) -> CRS:
-    """Require a valid CRS with an identifiable horizontal component."""
+    """Extract the horizontal 2D component of a CRS.
+
+    Geographic 3D and compound CRS definitions are reduced to
+    their horizontal components. Vertical-only and unsupported
+    coordinate systems are rejected.
+
+    This function does not transform elevation values.
+    """
 
     if crs is None:
         raise ValueError(
@@ -155,24 +162,50 @@ def require_horizontal_crs(
 
     resolved = CRS.from_user_input(crs)
 
+    if resolved.is_compound:
+        horizontal_components = [
+            component
+            for component in resolved.sub_crs_list
+            if component.is_geographic or component.is_projected
+        ]
+
+        if len(horizontal_components) != 1:
+            raise ValueError(
+                "Compound CRS must contain exactly one "
+                "recognized horizontal component."
+            )
+
+        resolved = horizontal_components[0]
+
     if resolved.is_vertical:
         raise ValueError(
             "A vertical-only CRS cannot be used for horizontal "
             "spatial operations."
         )
 
-    if not (
-        resolved.is_geographic
-        or resolved.is_projected
-        or resolved.is_geocentric
-        or resolved.is_compound
-    ):
+    if not (resolved.is_geographic or resolved.is_projected):
         raise ValueError(
-            "CRS does not provide a recognized horizontal "
-            "coordinate system."
+            "CRS does not provide a supported geographic or "
+            "projected horizontal coordinate system."
         )
 
-    return resolved
+    horizontal = resolved.to_2d()
+
+    if len(horizontal.axis_info) != 2:
+        raise ValueError(
+            "Horizontal CRS extraction did not produce "
+            "a two-dimensional coordinate system."
+        )
+
+    return horizontal
+
+
+def require_horizontal_crs(
+    crs: CRS | str | int | None,
+) -> CRS:
+    """Return a validated two-dimensional horizontal CRS."""
+
+    return extract_horizontal_crs(crs)
 
 
 def transform_geometry(
@@ -326,3 +359,98 @@ def inspect_las_crs_records(
             )
 
     return reference_crs
+
+
+from contextlib import contextmanager
+from math import isfinite
+
+from pyproj import network
+from pyproj.aoi import AreaOfInterest
+from pyproj.transformer import TransformerGroup
+
+
+@contextmanager
+def _offline_proj_context():
+    """Temporarily disable PROJ network access."""
+
+    was_enabled = network.is_network_enabled()
+
+    try:
+        network.set_network_enabled(False)
+        yield
+    finally:
+        network.set_network_enabled(was_enabled)
+
+
+def select_horizontal_transformer(
+    source_crs: CRS | str | int,
+    target_crs: CRS | str | int,
+    *,
+    area_of_interest: AreaOfInterest | None = None,
+    max_accuracy_m: float | None = None,
+    require_known_accuracy: bool = False,
+):
+    """Select an available horizontal coordinate transformation."""
+
+    source = extract_horizontal_crs(source_crs)
+    target = extract_horizontal_crs(target_crs)
+
+    if max_accuracy_m is not None:
+        if (
+            not isfinite(max_accuracy_m)
+            or max_accuracy_m < 0
+        ):
+            raise ValueError(
+                "max_accuracy_m must be finite and nonnegative."
+            )
+
+    with _offline_proj_context():
+        group = TransformerGroup(
+            source,
+            target,
+            always_xy=True,
+            area_of_interest=area_of_interest,
+            allow_ballpark=False,
+        )
+
+    if not group.best_available:
+        missing_grids = sorted({
+            grid.short_name
+            for operation in group.unavailable_operations
+            for grid in operation.grids
+            if not grid.available
+        })
+
+        raise RuntimeError(
+            "The preferred horizontal transformation is "
+            "unavailable with locally installed PROJ resources. "
+            f"Missing grids: {missing_grids}"
+        )
+
+    if not group.transformers:
+        raise RuntimeError(
+            "No suitable horizontal coordinate transformation "
+            "is available."
+        )
+
+    transformer = group.transformers[0]
+    accuracy = transformer.accuracy
+
+    if accuracy < 0:
+        if max_accuracy_m is not None or require_known_accuracy:
+            raise ValueError(
+                "Selected coordinate transformation has "
+                "unknown numerical accuracy."
+            )
+
+    elif (
+        max_accuracy_m is not None
+        and accuracy > max_accuracy_m
+    ):
+        raise ValueError(
+            "Selected coordinate transformation exceeds "
+            "the permitted accuracy threshold: "
+            f"{accuracy} m > {max_accuracy_m} m."
+        )
+
+    return transformer
