@@ -38,7 +38,7 @@ PRODUCT_ITD = "FAST_ITD"
 PRODUCT_STRUCTURE = "FAST_STRUCTURE"
 
 DEFAULT_WORKFLOW = "run"
-WORKFLOW_CHOICES = ["run", "tile-only", "tile-run", "tile-run-merge", "merge", "derive-only"]
+WORKFLOW_CHOICES = ["run", "plots-run", "tile-only", "tile-run", "tile-run-merge", "merge", "derive-only"]
 
 _CHM_ALGORITHMS = {"p2r", "p99", "tin", "pitfree", "csf_chm", "spikefree"}
 _CHM_NATIVE = {"p2r", "p99", "tin", "pitfree", "csf_chm"}
@@ -877,6 +877,131 @@ def run_fastgc(
     # Do not emit a synthetic outer progress stage. Real progress is reported by
     # TILING, each requested FAST product, and each product-specific MERGE stage.
 
+    if workflow == "plots-run":
+        from .gis.plots_run import load_plots_manifest
+
+        plot_manifest = load_plots_manifest(in_path)
+        manifest_sensor = plot_manifest.sensor_mode
+
+        if sensor_mode is not None and str(sensor_mode).strip().upper() != manifest_sensor:
+            raise ValueError(
+                "sensor_mode conflicts with plots_manifest.json: "
+                f"CLI={str(sensor_mode).strip().upper()} "
+                f"manifest={manifest_sensor}"
+            )
+
+        sensor_mode = manifest_sensor
+
+        if out_dir is not None:
+            requested_out = Path(out_dir).resolve()
+            if requested_out != plot_manifest.root:
+                raise ValueError(
+                    "workflow=plots-run writes each product inside its existing "
+                    "Plot_### directory; --out_dir must be omitted or equal to "
+                    f"the plots collection root: {plot_manifest.root}"
+                )
+
+        if not plot_manifest.jobs:
+            raise ValueError(
+                f"No plot jobs found in {plot_manifest.root / 'plots_manifest.json'}"
+            )
+
+        log_info(
+            f"plots-run collection: {plot_manifest.root} | "
+            f"sensor={sensor_mode} | plots={len(plot_manifest.jobs)}"
+        )
+
+        completed: list[str] = []
+
+        for index, job in enumerate(plot_manifest.jobs, start=1):
+            log_info(
+                f"[PLOT {index}/{len(plot_manifest.jobs)}] "
+                f"{job.plot_name}: {job.point_file}"
+            )
+
+            run_fastgc(
+                in_path=str(job.point_file),
+                out_dir=str(job.output_root),
+                sensor_mode=sensor_mode,
+                products=products,
+                grid_res=grid_res,
+                recursive=False,
+                n_jobs=n_jobs,
+                joblib_backend=joblib_backend,
+                joblib_batch_size=joblib_batch_size,
+                joblib_pre_dispatch=joblib_pre_dispatch,
+                skip_existing=skip_existing,
+                overwrite=overwrite,
+                dem_method=dem_method,
+                dsm_method=dsm_method,
+                chm_method=chm_method,
+                chm_methods=chm_methods,
+                chm_surface_method=chm_surface_method,
+                chm_smooth_method=chm_smooth_method,
+                chm_percentile=chm_percentile,
+                chm_percentile_low=chm_percentile_low,
+                chm_percentile_high=chm_percentile_high,
+                chm_pitfree_thresholds=chm_pitfree_thresholds,
+                chm_use_first_returns=chm_use_first_returns,
+                chm_spikefree_freeze_distance=chm_spikefree_freeze_distance,
+                chm_spikefree_insertion_buffer=chm_spikefree_insertion_buffer,
+                chm_median_size=chm_median_size,
+                chm_gaussian_sigma=chm_gaussian_sigma,
+                chm_min_height=chm_min_height,
+                chm_fill_ground_voids_zero=chm_fill_ground_voids_zero,
+                chm_void_ground_threshold=chm_void_ground_threshold,
+                terrain_products=terrain_products,
+                hillshade_azimuth=hillshade_azimuth,
+                hillshade_altitude=hillshade_altitude,
+                hillshade_z_factor=hillshade_z_factor,
+                tpi_radius=tpi_radius,
+                twi_eps=twi_eps,
+                dtw_max_distance=dtw_max_distance,
+                structure_products=structure_products,
+                structure_res=structure_res,
+                structure_min_h=structure_min_h,
+                structure_bin_size=structure_bin_size,
+                canopy_thr=canopy_thr,
+                canopy_mode=canopy_mode,
+                structure_na_fill=structure_na_fill,
+                change_input_type=change_input_type,
+                change_mode=change_mode,
+                change_threshold=change_threshold,
+                change_baseline_index=change_baseline_index,
+                change_source_subdir=change_source_subdir,
+                change_sigma1=change_sigma1,
+                change_sigma2=change_sigma2,
+                change_lod_mode=change_lod_mode,
+                itd_method=itd_method,
+                itd_source_chm=itd_source_chm,
+                itd_min_height=itd_min_height,
+                itd_crown_window_m=itd_crown_window_m,
+                itd_min_peak_separation_m=itd_min_peak_separation_m,
+                itd_angle_threshold_deg=itd_angle_threshold_deg,
+                itd_screen_max_pair_distance_m=itd_screen_max_pair_distance_m,
+                itd_banded_neighborhood_px=itd_banded_neighborhood_px,
+                itd_min_crown_area_m2=itd_min_crown_area_m2,
+                treeclouds_las_source=treeclouds_las_source,
+                treeclouds_min_height=treeclouds_min_height,
+                treeclouds_write_individual=treeclouds_write_individual,
+                workflow="run",
+                apply_fp_fix=apply_fp_fix,
+                fp_fix_dem_res=fp_fix_dem_res,
+                fp_fix_nonground_to_ground_max_z=fp_fix_nonground_to_ground_max_z,
+                fp_fix_ground_to_nonground_min_z=fp_fix_ground_to_nonground_min_z,
+                keep_fp_fix_temp=keep_fp_fix_temp,
+            )
+
+            completed.append(job.plot_name)
+
+        log_info(
+            f"[TIME] WORKFLOW plots-run: "
+            f"{perf_counter() - total_t0:.2f}s | "
+            f"completed={len(completed)}/{len(plot_manifest.jobs)}"
+        )
+
+        return str(plot_manifest.root)
+
     if workflow == "run":
         if use_existing_tiles:
             log_info("--use_existing_tiles ignored for workflow=run; processing input path directly.")
@@ -1569,5 +1694,3 @@ def run_fastgc(
         return str(final_root)
 
     raise ValueError(f"Unsupported workflow: {workflow}")
-
-

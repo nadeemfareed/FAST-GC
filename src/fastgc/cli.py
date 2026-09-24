@@ -157,9 +157,9 @@ def main(argv=None):
         "--sensor_mode",
         "--sensor-mode",
         dest="sensor_mode",
-        required=True,
+        required=False,
         choices=["ALS", "ULS", "TLS"],
-        help="Sensor mode.",
+        help="Sensor mode. Required except for plots-run, where it is read from plots_manifest.json.",
     )
     parser.add_argument(
         "--workflow",
@@ -793,6 +793,23 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
+    if args.workflow != "plots-run" and args.sensor_mode is None:
+        parser.error("--sensor_mode is required unless --workflow plots-run is used")
+
+    if args.workflow == "plots-run":
+        from .gis.plots_run import load_plots_manifest
+
+        plot_manifest = load_plots_manifest(args.in_path)
+        manifest_sensor_mode = plot_manifest.sensor_mode
+
+        if args.sensor_mode is not None and args.sensor_mode.upper() != manifest_sensor_mode:
+            parser.error(
+                "--sensor_mode conflicts with plots_manifest.json: "
+                f"CLI={args.sensor_mode.upper()} manifest={manifest_sensor_mode}"
+            )
+
+        args.sensor_mode = manifest_sensor_mode
+
     try:
         configure_sensor_compute_backend(args.sensor_mode)
     except (ValueError, RuntimeError) as exc:
@@ -887,4 +904,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
