@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -175,3 +176,109 @@ def load_plots_manifest(collection_root: str | Path) -> PlotRunManifest:
         jobs=tuple(jobs),
         raw=data,
     )
+def plot_work_root(
+    manifest: PlotRunManifest,
+    job: PlotRunJob,
+) -> Path:
+    """Private processing workspace used only by workflow=plots-run."""
+    return (
+        manifest.root
+        / ".fastgc_plots_run_work"
+        / job.plot_name
+    )
+
+
+def publish_plot_products(
+    *,
+    collection_root: str | Path,
+    work_root: str | Path,
+    overwrite: bool = False,
+) -> list[Path]:
+    """Publish one plot's FAST_* outputs into collection product folders.
+
+    Normal FAST-GC workflow=run output organization is not changed.
+    This function is used only by workflow=plots-run.
+
+    Example:
+        private/Plot_001/FAST_GC/Plot_001.las
+            ->
+        ALS_plots/FAST_GC/Plot_001.las
+
+        private/Plot_001/FAST_CHM/p2r/Plot_001.tif
+            ->
+        ALS_plots/FAST_CHM/p2r/Plot_001.tif
+    """
+    collection = Path(collection_root).resolve()
+    work = Path(work_root).resolve()
+
+    try:
+        work.relative_to(collection)
+    except ValueError as exc:
+        raise ValueError(
+            "plots-run work_root must be inside the "
+            f"collection root: {work}"
+        ) from exc
+
+    published: list[Path] = []
+
+    if not work.is_dir():
+        return published
+
+    for product_dir in sorted(work.glob("FAST_*")):
+        if not product_dir.is_dir():
+            continue
+
+        sources = sorted(
+            p
+            for p in product_dir.rglob("*")
+            if p.is_file()
+        )
+
+        for source in sources:
+            relative = source.relative_to(product_dir)
+
+            destination = (
+                collection
+                / product_dir.name
+                / relative
+            )
+
+            destination.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            if destination.exists():
+                if not overwrite:
+                    continue
+
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+
+            shutil.copy2(source, destination)
+            published.append(destination)
+
+    return published
+
+
+def cleanup_plot_work_root(
+    work_root: str | Path,
+) -> None:
+    """Remove a successfully published plots-run private workspace."""
+    work = Path(work_root)
+
+    if work.exists():
+        shutil.rmtree(work)
+
+    parent = work.parent
+
+    if (
+        parent.name == ".fastgc_plots_run_work"
+        and parent.exists()
+    ):
+        try:
+            parent.rmdir()
+        except OSError:
+            pass

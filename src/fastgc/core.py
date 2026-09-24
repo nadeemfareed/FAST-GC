@@ -878,7 +878,12 @@ def run_fastgc(
     # TILING, each requested FAST product, and each product-specific MERGE stage.
 
     if workflow == "plots-run":
-        from .gis.plots_run import load_plots_manifest
+        from .gis.plots_run import (
+            cleanup_plot_work_root,
+            load_plots_manifest,
+            plot_work_root,
+            publish_plot_products,
+        )
 
         plot_manifest = load_plots_manifest(in_path)
         manifest_sensor = plot_manifest.sensor_mode
@@ -896,8 +901,8 @@ def run_fastgc(
             requested_out = Path(out_dir).resolve()
             if requested_out != plot_manifest.root:
                 raise ValueError(
-                    "workflow=plots-run writes each product inside its existing "
-                    "Plot_### directory; --out_dir must be omitted or equal to "
+                    "workflow=plots-run publishes products at the plots collection "
+                    "root; --out_dir must be omitted or equal to "
                     f"the plots collection root: {plot_manifest.root}"
                 )
 
@@ -921,7 +926,7 @@ def run_fastgc(
 
             run_fastgc(
                 in_path=str(job.point_file),
-                out_dir=str(job.output_root),
+                out_dir=str(plot_work_root(plot_manifest, job)),
                 sensor_mode=sensor_mode,
                 products=products,
                 grid_res=grid_res,
@@ -991,6 +996,19 @@ def run_fastgc(
                 fp_fix_ground_to_nonground_min_z=fp_fix_ground_to_nonground_min_z,
                 keep_fp_fix_temp=keep_fp_fix_temp,
             )
+
+            work_root = plot_work_root(
+                plot_manifest,
+                job,
+            )
+
+            publish_plot_products(
+                collection_root=plot_manifest.root,
+                work_root=work_root,
+                overwrite=overwrite,
+            )
+
+            cleanup_plot_work_root(work_root)
 
             completed.append(job.plot_name)
 

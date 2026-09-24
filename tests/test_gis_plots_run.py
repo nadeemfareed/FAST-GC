@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 
 import fastgc.core as core
-from fastgc.gis.plots_run import load_plots_manifest
+from fastgc.gis.plots_run import (
+    load_plots_manifest,
+    publish_plot_products,
+)
 
 
 def _make_collection(tmp_path: Path, *, sensor_mode: str = "ALS") -> Path:
@@ -140,7 +143,9 @@ def test_plots_run_dispatches_each_plot_to_existing_run_workflow(
         ).resolve()
 
         assert Path(call["out_dir"]) == (
-            root / name
+            root
+            / ".fastgc_plots_run_work"
+            / name
         ).resolve()
 
         assert call["sensor_mode"] == "ALS"
@@ -195,3 +200,138 @@ def test_load_plots_manifest_accepts_utf8_bom(tmp_path):
 
     assert manifest.sensor_mode == "ALS"
     assert len(manifest.jobs) == 2
+
+def test_publish_plot_products_groups_outputs_by_product(
+    tmp_path,
+):
+    root = _make_collection(tmp_path)
+
+    work = (
+        root
+        / ".fastgc_plots_run_work"
+        / "Plot_001"
+    )
+
+    (work / "FAST_GC").mkdir(parents=True)
+    (work / "FAST_DEM").mkdir(parents=True)
+    (work / "FAST_NORMALIZED").mkdir(parents=True)
+    (work / "FAST_CHM" / "p2r").mkdir(
+        parents=True
+    )
+
+    (
+        work
+        / "FAST_GC"
+        / "Plot_001.las"
+    ).write_bytes(b"gc")
+
+    (
+        work
+        / "FAST_DEM"
+        / "Plot_001.tif"
+    ).write_bytes(b"dem")
+
+    (
+        work
+        / "FAST_NORMALIZED"
+        / "Plot_001.las"
+    ).write_bytes(b"normalized")
+
+    (
+        work
+        / "FAST_CHM"
+        / "p2r"
+        / "Plot_001.tif"
+    ).write_bytes(b"chm")
+
+    published = publish_plot_products(
+        collection_root=root,
+        work_root=work,
+        overwrite=False,
+    )
+
+    assert len(published) == 4
+
+    assert (
+        root
+        / "FAST_GC"
+        / "Plot_001.las"
+    ).read_bytes() == b"gc"
+
+    assert (
+        root
+        / "FAST_DEM"
+        / "Plot_001.tif"
+    ).read_bytes() == b"dem"
+
+    assert (
+        root
+        / "FAST_NORMALIZED"
+        / "Plot_001.las"
+    ).read_bytes() == b"normalized"
+
+    assert (
+        root
+        / "FAST_CHM"
+        / "p2r"
+        / "Plot_001.tif"
+    ).read_bytes() == b"chm"
+
+    # Original FAST-GIS source package remains untouched.
+    assert (
+        root
+        / "Plot_001"
+        / "Plot_001.laz"
+    ).is_file()
+
+    assert (
+        root
+        / "Plot_001"
+        / "Clip_Plot_001.json"
+    ).is_file()
+
+
+def test_publish_plot_products_respects_overwrite(
+    tmp_path,
+):
+    root = _make_collection(tmp_path)
+
+    work = (
+        root
+        / ".fastgc_plots_run_work"
+        / "Plot_001"
+    )
+
+    source = (
+        work
+        / "FAST_GC"
+        / "Plot_001.las"
+    )
+
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"new")
+
+    destination = (
+        root
+        / "FAST_GC"
+        / "Plot_001.las"
+    )
+
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"old")
+
+    publish_plot_products(
+        collection_root=root,
+        work_root=work,
+        overwrite=False,
+    )
+
+    assert destination.read_bytes() == b"old"
+
+    publish_plot_products(
+        collection_root=root,
+        work_root=work,
+        overwrite=True,
+    )
+
+    assert destination.read_bytes() == b"new"
