@@ -1209,11 +1209,19 @@ def run_fastgc(
 
         need_normalized_for_chm = PRODUCT_CHM in explicitly_requested
         need_normalized_for_structure = PRODUCT_STRUCTURE in explicitly_requested
+        direct_normalized_input = (
+            _is_las_like(p)
+            and "FAST_NORMALIZED" in p.stem.upper()
+        )
 
         if (
-            (PRODUCT_NORMALIZED in explicitly_requested)
+            (PRODUCT_NORMALIZED in explicitly_requested and not direct_normalized_input)
             or (need_normalized_for_chm and not normalized_root.exists())
-            or (need_normalized_for_structure and not normalized_root.exists())
+            or (
+                need_normalized_for_structure
+                and not direct_normalized_input
+                and not normalized_root.exists()
+            )
         ) and not (_existing_path(normalized_root) and skip_existing and not overwrite):
             if not classified_root.exists():
                 raise FileNotFoundError(f"FAST_GC folder not found for NORMALIZED derivation: {classified_root}")

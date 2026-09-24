@@ -17,14 +17,20 @@ import laspy
 
 PRODUCT_STRUCTURE = "FAST_STRUCTURE"
 STRUCTURE_PRODUCT_CHOICES = [
-    "all",
-    "canopy_cover",
-    "z_mean",
-    "z_max",
-    "z_sd",
-    "FHD",
-    "VCI",
-    "n_points",
+    "all", "canopy_cover", "n_points", "n_points_all", "point_density",
+    "vegetation_point_density", "point_density_all",
+    "z_min", "z_mean", "z_median", "z_max", "z_range", "z_sd", "z_variance", "z_cv",
+    "z_skewness", "z_kurtosis", "z_excess_kurtosis", "z_p01", "z_p05", "z_p10", "z_p20", "z_p25",
+    "z_p30", "z_p40", "z_p50", "z_p60", "z_p70", "z_p75", "z_p80", "z_p90",
+    "z_p95", "z_p99", "z_iqr", "density_above_mean", "FHD", "VCI", "vertical_entropy",
+    "vertical_richness", "vertical_evenness", "vertical_effective_layers", "vertical_dominance",
+    "vertical_simpson", "vertical_occupancy_fraction", "vertical_gap_count", "vertical_gap_fraction",
+    "max_vertical_gap_m", "sigma_z", "eigenvalue_1", "eigenvalue_2", "eigenvalue_3",
+    "linearity", "planarity", "sphericity", "anisotropy", "surface_variation", "eigenentropy",
+    "omnivariance", "robust_scale", "axis_x", "axis_y", "axis_z", "normal_x", "normal_y",
+    "normal_z", "slope", "normal_inclination_deg",
+    "intensity_mean", "intensity_sd", "intensity_p50", "intensity_p95",
+    "first_return_fraction", "multi_return_fraction", "mean_number_of_returns",
 ]
 
 
@@ -297,181 +303,238 @@ def _compute_entropy_metrics(vals: np.ndarray, bin_size: float) -> Tuple[float, 
     return fhd, vci
 
 
+
+def _vertical_profile_metrics(vals: np.ndarray, bin_size: float) -> Dict[str, float]:
+    if vals.size == 0:
+        return {}
+    lo = max(0.0, float(np.min(vals)))
+    hi = float(np.max(vals))
+    if hi <= lo:
+        return {"vertical_entropy": 0.0, "vertical_richness": 1.0, "vertical_evenness": 0.0,
+                "vertical_effective_layers": 1.0, "vertical_dominance": 1.0, "vertical_simpson": 0.0,
+                "vertical_occupancy_fraction": 1.0, "vertical_gap_count": 0.0,
+                "vertical_gap_fraction": 0.0, "max_vertical_gap_m": 0.0}
+    edges = np.arange(0.0, hi + bin_size + 1e-12, bin_size)
+    hist, _ = np.histogram(vals, bins=edges)
+    occ = hist > 0
+    p = hist[occ].astype(float)
+    p /= p.sum()
+    H = -float(np.sum(p * np.log(p))) if p.size else np.nan
+    richness = int(occ.sum())
+    even = H / np.log(richness) if richness > 1 else 0.0
+    simpson = 1.0 - float(np.sum(p*p)) if p.size else np.nan
+    dominance = float(np.max(p)) if p.size else np.nan
+    # Internal empty runs between first/last occupied layers only.
+    idx = np.flatnonzero(occ)
+    gaps=[]
+    if idx.size > 1:
+        run=0
+        for flag in occ[idx[0]:idx[-1]+1]:
+            if not flag: run += 1
+            elif run: gaps.append(run); run=0
+    span = int(idx[-1]-idx[0]+1) if idx.size else 0
+    return {"vertical_entropy": H, "vertical_richness": float(richness), "vertical_evenness": float(even),
+            "vertical_effective_layers": float(np.exp(H)) if np.isfinite(H) else np.nan,
+            "vertical_dominance": dominance, "vertical_simpson": simpson,
+            "vertical_occupancy_fraction": float(richness/span) if span else np.nan,
+            "vertical_gap_count": float(len(gaps)),
+            "vertical_gap_fraction": float(sum(gaps)/span) if span else 0.0,
+            "max_vertical_gap_m": float(max(gaps)*bin_size) if gaps else 0.0}
+
+
+def _geometry_metrics(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> Dict[str, float]:
+    if z.size < 3:
+        return {}
+    pts=np.column_stack((x,y,z)).astype(np.float64)
+    center=np.median(pts,axis=0)
+    d=np.linalg.norm(pts-center,axis=1)
+    med=float(np.median(d)); mad=float(np.median(np.abs(d-med)))
+    scale=max(1.4826*mad, 1e-9); c=1.345*scale
+    w=np.ones_like(d); mask=d>c; w[mask]=c/d[mask]
+    sw=float(w.sum())
+    if sw <= 0: return {}
+    center=(pts*w[:,None]).sum(axis=0)/sw
+    q=pts-center
+    cov=(q*w[:,None]).T@q/sw
+    try: vals, vecs=np.linalg.eigh(cov)
+    except np.linalg.LinAlgError: return {}
+    order=np.argsort(vals)[::-1]; vals=np.maximum(vals[order],0.0); vecs=vecs[:,order]
+    l1,l2,l3=map(float,vals); total=l1+l2+l3
+    axis=vecs[:,0].copy(); normal=vecs[:,-1].copy()
+    if axis[2] < 0: axis=-axis
+    if normal[2] < 0: normal=-normal
+    p=vals/total if total>0 else np.zeros(3)
+    pe=p[p>0]
+    normal_inclination_deg=float(
+        np.degrees(np.arccos(np.clip(normal[2],-1,1)))
+    )
+    return {"eigenvalue_1":l1,"eigenvalue_2":l2,"eigenvalue_3":l3,
+            "linearity":(l1-l2)/l1 if l1>0 else np.nan,"planarity":(l2-l3)/l1 if l1>0 else np.nan,
+            "sphericity":l3/l1 if l1>0 else np.nan,"anisotropy":(l1-l3)/l1 if l1>0 else np.nan,
+            "surface_variation":l3/total if total>0 else np.nan,
+            "eigenentropy":-float(np.sum(pe*np.log(pe))) if pe.size else np.nan,
+            "omnivariance":float(np.cbrt(l1*l2*l3)),"robust_scale":scale,
+            "axis_x":float(axis[0]),"axis_y":float(axis[1]),"axis_z":float(axis[2]),
+            "normal_x":float(normal[0]),"normal_y":float(normal[1]),"normal_z":float(normal[2]),
+            "slope":normal_inclination_deg,
+            "normal_inclination_deg":normal_inclination_deg}
+
+
+def _sigma_z(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float:
+    """Residual vertical dispersion around a locally fitted XY plane.
+
+    XY coordinates are centered before least-squares fitting.  This keeps
+    the fit numerically stable for projected coordinate systems such as UTM
+    while leaving the fitted residuals invariant to coordinate translation.
+    """
+    if z.size < 3:
+        return np.nan
+
+    xx = np.asarray(x, dtype=np.float64)
+    yy = np.asarray(y, dtype=np.float64)
+    zz = np.asarray(z, dtype=np.float64)
+
+    xc = xx - np.mean(xx)
+    yc = yy - np.mean(yy)
+
+    A = np.column_stack((xc, yc, np.ones(zz.size)))
+
+    try:
+        coef, _, rank, _ = np.linalg.lstsq(A, zz, rcond=None)
+    except np.linalg.LinAlgError:
+        return np.nan
+
+    if rank < 3:
+        return np.nan
+
+    residual = zz - A @ coef
+
+    return (
+        float(np.std(residual, ddof=1))
+        if residual.size > 1
+        else 0.0
+    )
+
+
+
 # =========================================================
 # Main computation
 # =========================================================
 
 
 def compute_structure_metrics(
-    x: np.ndarray,
-    y: np.ndarray,
-    z: np.ndarray,
-    *,
-    sensor_mode: str,
-    res: float | None = None,
-    min_h: float | None = None,
-    bin_size: float | None = None,
-    canopy_threshold: float | None = None,
-    canopy_mode: str | None = None,
-    na_fill: str | None = None,
-    bounds: Tuple[float, float, float, float] | None = None,
+    x: np.ndarray, y: np.ndarray, z: np.ndarray, *, sensor_mode: str,
+    res: float | None = None, min_h: float | None = None, bin_size: float | None = None,
+    canopy_threshold: float | None = None, canopy_mode: str | None = None,
+    na_fill: str | None = None, bounds: Tuple[float,float,float,float] | None = None,
+    intensity: np.ndarray | None = None, return_number: np.ndarray | None = None,
+    number_of_returns: np.ndarray | None = None,
 ) -> Dict[str, object]:
-    """Compute FAST_STRUCTURE metrics on a normalized point cloud.
+    """Compute resolution-controlled FAST_STRUCTURE metrics from normalized XYZ.
 
-    Parameters
-    ----------
-    x, y, z
-        Normalized point cloud coordinates. z must already be height-above-ground.
-    sensor_mode
-        ALS, ULS, or TLS. MLS/PLS should be mapped to TLS upstream for now.
-    res
-        Horizontal raster resolution for structure metrics.
-    min_h
-        Minimum normalized height to include in vegetation metrics.
-    bin_size
-        Vertical bin size for FHD and VCI.
-    canopy_threshold
-        Threshold for canopy cover.
-    canopy_mode
-        Currently supports "all_points". Kept as an explicit switch for future extension.
-    na_fill
-        Optional NA fill mode: none | 3x3_mean.
-    bounds
-        Optional (xmin, ymin, xmax, ymax). If omitted, point bounds are used.
+    All-point metrics (n_points_all/canopy_cover) use every finite point. Height,
+    vertical-profile and geometry metrics use points >= min_h. Optional LAS
+    attributes are emitted only when supplied. No plot/tile assumptions live here.
     """
-    x = np.asarray(x, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-    z = np.asarray(z, dtype=np.float64)
-    if not (x.size == y.size == z.size):
-        raise ValueError("x, y, z must have the same length")
-    if x.size == 0:
-        raise ValueError("Point cloud is empty")
+    x=np.asarray(x,dtype=float); y=np.asarray(y,dtype=float); z=np.asarray(z,dtype=float)
+    if not (x.size==y.size==z.size) or x.size==0: raise ValueError("x, y, z must be non-empty and have the same length")
+    sm=(sensor_mode or '').upper().strip(); sdef=_STRUCTURE_DEFAULTS.get(sm)
+    if sdef is None: raise ValueError(f"sensor_mode must be one of ALS|ULS|TLS (got {sensor_mode!r})")
+    res=float(sdef.res if res is None else res); min_h=float(sdef.min_h if min_h is None else min_h)
+    bin_size=float(sdef.bin_size if bin_size is None else bin_size)
+    canopy_threshold=float(sdef.canopy_threshold if canopy_threshold is None else canopy_threshold)
+    canopy_mode=str(sdef.canopy_mode if canopy_mode is None else canopy_mode).lower().strip()
+    na_fill=str(sdef.na_fill if na_fill is None else na_fill).lower().strip()
+    for n,v in [('structure_res',res),('structure_min_h',min_h),('structure_bin_size',bin_size),('canopy_threshold',canopy_threshold)]: _validate_positive(n,v)
+    if canopy_mode not in {'all_points','all'}: raise ValueError(f"Unsupported canopy_mode {canopy_mode!r}; currently only 'all_points' is implemented")
+    attrs={}
+    for name,a in [('intensity',intensity),('return_number',return_number),('number_of_returns',number_of_returns)]:
+        if a is not None:
+            a=np.asarray(a);
+            if a.size!=x.size: raise ValueError(f"{name} must have the same length as x, y, z")
+            attrs[name]=a
+    valid=np.isfinite(x)&np.isfinite(y)&np.isfinite(z)
+    x=x[valid]; y=y[valid]; z=z[valid]; attrs={k:v[valid] for k,v in attrs.items()}
+    if x.size==0: raise ValueError("No finite points available after filtering")
+    if bounds is None: xmin,ymin,xmax,ymax=float(x.min()),float(y.min()),float(x.max()),float(y.max())
+    else: xmin,ymin,xmax,ymax=map(float,bounds)
+    if xmax<=xmin or ymax<=ymin: raise ValueError("Invalid bounds for structure metric rasterization")
+    nx=max(1,int(np.ceil((xmax-xmin)/res))); ny=max(1,int(np.ceil((ymax-ymin)/res)))
+    ix=np.floor((x-xmin)/res).astype(np.int64); iy=np.floor((ymax-y)/res).astype(np.int64)
+    inside=(ix>=0)&(ix<nx)&(iy>=0)&(iy<ny)
+    x=x[inside]; y=y[inside]; z=z[inside]; ix=ix[inside]; iy=iy[inside]; attrs={k:v[inside] for k,v in attrs.items()}
+    if x.size==0: raise ValueError("No points fall inside the requested structure metric bounds")
+    metric_names=list(STRUCTURE_PRODUCT_CHOICES[1:])
 
-    sm = (sensor_mode or "").upper().strip()
-    sdef = _STRUCTURE_DEFAULTS.get(sm)
-    if sdef is None:
-        raise ValueError(f"sensor_mode must be one of ALS|ULS|TLS (got {sensor_mode!r})")
-
-    res = float(sdef.res if res is None else res)
-    min_h = float(sdef.min_h if min_h is None else min_h)
-    bin_size = float(sdef.bin_size if bin_size is None else bin_size)
-    canopy_threshold = float(sdef.canopy_threshold if canopy_threshold is None else canopy_threshold)
-    canopy_mode = str(sdef.canopy_mode if canopy_mode is None else canopy_mode).lower().strip()
-    na_fill = str(sdef.na_fill if na_fill is None else na_fill).lower().strip()
-
-    _validate_positive("structure_res", res)
-    _validate_positive("structure_min_h", min_h)
-    _validate_positive("structure_bin_size", bin_size)
-    _validate_positive("canopy_threshold", canopy_threshold)
-
-    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-    x = x[valid]
-    y = y[valid]
-    z = z[valid]
-    if x.size == 0:
-        raise ValueError("No finite points available after filtering")
-
-    veg = z >= min_h
-    x = x[veg]
-    y = y[veg]
-    z = z[veg]
-    if x.size == 0:
-        raise ValueError("No points remain after applying structure_min_h filter")
-
-    if bounds is None:
-        xmin, ymin = float(np.min(x)), float(np.min(y))
-        xmax, ymax = float(np.max(x)), float(np.max(y))
-    else:
-        xmin, ymin, xmax, ymax = map(float, bounds)
-
-    width = xmax - xmin
-    height = ymax - ymin
-    if width <= 0 or height <= 0:
-        raise ValueError("Invalid bounds for structure metric rasterization")
-
-    nx = max(1, int(np.ceil(width / res)))
-    ny = max(1, int(np.ceil(height / res)))
-
-    ix = np.floor((x - xmin) / res).astype(np.int64)
-    iy = np.floor((ymax - y) / res).astype(np.int64)
-
-    in_bounds = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
-    x = x[in_bounds]
-    y = y[in_bounds]
-    z = z[in_bounds]
-    ix = ix[in_bounds]
-    iy = iy[in_bounds]
-    if x.size == 0:
-        raise ValueError("No points fall inside the requested structure metric bounds")
-
-    z_mean = np.full((ny, nx), np.nan, dtype=np.float32)
-    z_max = np.full((ny, nx), np.nan, dtype=np.float32)
-    z_sd = np.full((ny, nx), np.nan, dtype=np.float32)
-    canopy_cover = np.full((ny, nx), np.nan, dtype=np.float32)
-    fhd = np.full((ny, nx), np.nan, dtype=np.float32)
-    vci = np.full((ny, nx), np.nan, dtype=np.float32)
-    n_points = np.zeros((ny, nx), dtype=np.int32)
-
-    cell_ids, order, starts = _cell_slices(ix, iy, nx, ny)
-    z_sorted = z[order]
-
-    ends = np.empty_like(starts)
-    ends[:-1] = starts[1:]
-    ends[-1] = z_sorted.size
-
-    for cell_id, start, end in zip(cell_ids, starts, ends):
-        vals = z_sorted[start:end]
-        row = int(cell_id // nx)
-        col = int(cell_id % nx)
-
-        if vals.size == 0:
-            continue
-
-        n_points[row, col] = int(vals.size)
-        z_mean[row, col] = np.float32(np.mean(vals))
-        z_max[row, col] = np.float32(np.max(vals))
-        z_sd[row, col] = np.float32(np.std(vals, ddof=0))
-
-        if canopy_mode not in {"all_points", "all"}:
-            raise ValueError(
-                f"Unsupported canopy_mode {canopy_mode!r}; currently only 'all_points' is implemented"
-            )
-        canopy_cover[row, col] = np.float32(np.mean(vals >= canopy_threshold))
-
-        fhd_val, vci_val = _compute_entropy_metrics(vals, bin_size=bin_size)
-        fhd[row, col] = np.float32(fhd_val) if np.isfinite(fhd_val) else np.nan
-        vci[row, col] = np.float32(vci_val) if np.isfinite(vci_val) else np.nan
-
-    z_mean = _fix_pits_and_voids(_fill_na(z_mean, na_fill), pit_threshold=1.0, size=3)
-    z_max = _fix_pits_and_voids(_fill_na(z_max, na_fill), pit_threshold=1.0, size=3)
-    z_sd = _fix_pits_and_voids(_fill_na(z_sd, na_fill), pit_threshold=0.5, size=3)
-    canopy_cover = _fix_pits_and_voids(_fill_na(canopy_cover, na_fill), pit_threshold=0.2, size=3)
-    fhd = _fix_pits_and_voids(_fill_na(fhd, na_fill), pit_threshold=0.5, size=3)
-    vci = _fix_pits_and_voids(_fill_na(vci, na_fill), pit_threshold=0.2, size=3)
-
-    transform = from_origin(xmin, ymax, res, res)
-
-    return {
-        "sensor_mode": sm,
-        "res": res,
-        "min_h": min_h,
-        "bin_size": bin_size,
-        "canopy_threshold": canopy_threshold,
-        "canopy_mode": canopy_mode,
-        "na_fill": na_fill,
-        "bounds": (xmin, ymin, xmax, ymax),
-        "transform": transform,
-        "shape": (ny, nx),
-        "metrics": {
-            "canopy_cover": canopy_cover,
-            "z_mean": z_mean,
-            "z_max": z_max,
-            "z_sd": z_sd,
-            "FHD": fhd,
-            "VCI": vci,
-            "n_points": n_points,
-        },
+    optional_metric_requirements = {
+        "intensity_mean": "intensity",
+        "intensity_sd": "intensity",
+        "intensity_p50": "intensity",
+        "intensity_p95": "intensity",
+        "first_return_fraction": "return_number",
+        "multi_return_fraction": "return_number",
+        "mean_number_of_returns": "number_of_returns",
     }
+    metric_names = [
+        k for k in metric_names
+        if (
+            k not in optional_metric_requirements
+            or optional_metric_requirements[k] in attrs
+        )
+    ]
+
+    metrics={k:np.full((ny,nx),np.nan,dtype=np.float32) for k in metric_names if k not in {'n_points','n_points_all'}}
+    metrics['n_points']=np.zeros((ny,nx),dtype=np.int32); metrics['n_points_all']=np.zeros((ny,nx),dtype=np.int32)
+    ids,order,starts=_cell_slices(ix,iy,nx,ny); ends=np.r_[starts[1:],order.size]
+    xs=x[order]; ys=y[order]; zs=z[order]; sorted_attrs={k:v[order] for k,v in attrs.items()}
+    qs=[1,5,10,20,25,30,40,50,60,70,75,80,90,95,99]
+    for cid,a,b in zip(ids,starts,ends):
+        row=int(cid//nx); col=int(cid%nx); za=zs[a:b]; xa=xs[a:b]; ya=ys[a:b]
+        metrics['n_points_all'][row,col]=za.size
+        metrics['canopy_cover'][row,col]=np.mean(za>=canopy_threshold)
+        metrics['point_density_all'][row,col]=za.size/(res*res)
+        veg=za>=min_h; zv=za[veg]; xv=xa[veg]; yv=ya[veg]; metrics['n_points'][row,col]=zv.size
+        if zv.size==0: continue
+        mean=float(zv.mean()); sd=float(zv.std(ddof=0)); centered=zv-mean
+        base={'z_min':zv.min(),'z_mean':mean,'z_median':np.median(zv),'z_max':zv.max(),'z_range':np.ptp(zv),'z_sd':sd,
+              'z_variance':sd*sd,'z_cv':sd/mean if abs(mean)>1e-12 else np.nan,
+              'z_skewness':np.mean(centered**3)/(sd**3) if sd>0 else 0.0,
+              'z_kurtosis':np.mean(centered**4)/(sd**4)-3.0 if sd>0 else 0.0,
+              'z_excess_kurtosis':np.mean(centered**4)/(sd**4)-3.0 if sd>0 else 0.0,
+              'point_density':zv.size/(res*res),
+              'vegetation_point_density':zv.size/(res*res),
+              'density_above_mean':100.0*np.mean(zv>mean),
+              'sigma_z':_sigma_z(xv,yv,zv)}
+        pct=np.percentile(zv,qs)
+        for q,v in zip(qs,pct): base[f'z_p{q:02d}']=v
+        base['z_iqr']=base['z_p75']-base['z_p25']
+        vertical = _vertical_profile_metrics(zv, bin_size)
+        base.update(vertical)
+        # Backward-compatible aliases. FHD is Shannon vertical entropy and
+        # VCI is Shannon evenness normalized by occupied vertical layers.
+        base['FHD'] = vertical['vertical_entropy']
+        base['VCI'] = vertical['vertical_evenness']
+        base.update(_geometry_metrics(xv, yv, zv))
+        if 'intensity' in sorted_attrs:
+            iv=np.asarray(sorted_attrs['intensity'][a:b])[veg].astype(float)
+            if iv.size: base.update(intensity_mean=iv.mean(),intensity_sd=iv.std(),intensity_p50=np.percentile(iv,50),intensity_p95=np.percentile(iv,95))
+        if 'return_number' in sorted_attrs:
+            rv=np.asarray(sorted_attrs['return_number'][a:b])[veg].astype(float)
+            if rv.size: base.update(first_return_fraction=np.mean(rv==1),multi_return_fraction=np.mean(rv>1))
+        if 'number_of_returns' in sorted_attrs:
+            nv=np.asarray(sorted_attrs['number_of_returns'][a:b])[veg].astype(float)
+            if nv.size: base['mean_number_of_returns']=nv.mean()
+        for k,v in base.items():
+            if k in metrics and np.isfinite(v): metrics[k][row,col]=np.float32(v)
+    # Structural metrics represent observed point-cloud statistics.
+    # Preserve NaN in unobserved cells by default. Spatial interpolation is
+    # applied only when the caller explicitly requests structure_na_fill.
+    if str(na_fill).lower().strip() not in {"none", "off", "false"}:
+        for k in ("z_mean", "z_max", "z_sd", "canopy_cover", "FHD", "VCI"):
+            metrics[k] = _fill_na(metrics[k], na_fill)
+    return {'sensor_mode':sm,'res':res,'min_h':min_h,'bin_size':bin_size,'canopy_threshold':canopy_threshold,
+            'canopy_mode':canopy_mode,'na_fill':na_fill,'bounds':(xmin,ymin,xmax,ymax),'transform':from_origin(xmin,ymax,res,res),
+            'shape':(ny,nx),'metrics':metrics}
 
 
 # =========================================================
@@ -508,6 +571,12 @@ def write_structure_rasters(
             arr_write = arr_write.astype(np.float32)
             dtype = arr_write.dtype
 
+        # Floating-point structure metrics use NaN for missing cells.
+        # Integer metrics such as n_points cannot represent NaN; zero is
+        # already the meaningful value for cells containing no points, so
+        # do not assign an integer nodata sentinel here.
+        raster_nodata = nodata if arr_write.dtype.kind == "f" else None
+
         with rasterio.open(
             path,
             "w",
@@ -518,7 +587,7 @@ def write_structure_rasters(
             dtype=str(dtype),
             transform=transform,
             crs=crs,
-            nodata=nodata,
+            nodata=raster_nodata,
             compress="deflate",
         ) as dst:
             dst.write(arr_write, 1)
@@ -591,9 +660,18 @@ def run_structure_from_root(
             return {'status':'skipped','output':str(out_dir)}
         out_dir.mkdir(parents=True, exist_ok=True)
         las = laspy.read(fp)
+        dim_names = set(las.point_format.dimension_names)
+        optional = {}
+        if "intensity" in dim_names:
+            optional["intensity"] = np.asarray(las.intensity)
+        if "return_number" in dim_names:
+            optional["return_number"] = np.asarray(las.return_number)
+        if "number_of_returns" in dim_names:
+            optional["number_of_returns"] = np.asarray(las.number_of_returns)
         result = compute_structure_metrics(
             np.asarray(las.x), np.asarray(las.y), np.asarray(las.z),
             sensor_mode=sensor_mode,
+            **optional,
             res=structure_res,
             min_h=structure_min_h,
             bin_size=structure_bin_size,
