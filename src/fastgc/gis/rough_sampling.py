@@ -21,6 +21,7 @@ from scipy.ndimage import distance_transform_edt, median_filter
 from shapely.geometry import Point, mapping
 
 from .plot_runner import extract_plots, _metre_crs
+from .publish import publish_directory
 from .progress import gis_progress
 
 
@@ -125,7 +126,7 @@ def choose_circular_plots(height, valid, transform, *, count=30, radius=10.0,
     return chosen
 
 
-def sample_and_clip(source, dsm_path, output_dir, *, count=30, radius=10., buffer=10.,
+def sample_and_clip(source, dsm_path, output_dir, *, count=30, radius=15., buffer=5.,
                     thresholds=(5., 15.), seed=42, chunk_size=500_000, sensor_mode="ALS"):
     """Create sampling GeoJSON and publish an existing-runner clip workspace.
 
@@ -168,9 +169,19 @@ def sample_and_clip(source, dsm_path, output_dir, *, count=30, radius=10., buffe
         }, indent=2), encoding='utf-8')
         # Existing transactional clip runner: outputs include workspace_manifest.json.
         clip_root = stage/f'{sensor_mode}_plots'
-        extract_plots(source, plots, clip_root, buffer=buffer, chunk_size=chunk_size)
+        extract_plots(source, plots, clip_root, buffer=buffer, chunk_size=chunk_size,
+                      sensor_mode=sensor_mode, sampling_method="rough_height_local_min_spikefree",
+                      shape="circle", radius=radius)
+        (stage/'workspace_manifest.json').write_text(json.dumps({
+            'schema':'fastgc.gis.workspace', 'schema_version':3,
+            'sensor_mode':sensor_mode, 'sampling_method':'rough_height_local_min_spikefree',
+            'shape':'circle', 'core_radius_m':float(radius), 'buffer_m':float(buffer),
+            'plot_count':int(count), 'seed':int(seed), 'collection':f'{sensor_mode}_plots',
+            'plots_manifest':f'{sensor_mode}_plots/plots_manifest.json',
+            'sample_plots':'sample_plots.geojson', 'sampling_manifest':'sampling_manifest.json'
+        }, indent=2), encoding='utf-8')
         # Publish root only after clipping completes.
-        stage.rename(target)
+        publish_directory(stage, target)
         return target
     finally:
         if stage.exists():
@@ -183,8 +194,8 @@ def main(argv=None):
     p.add_argument('--dsm_path', required=True, help='Existing FAST_DSM SpikeFree GeoTIFF')
     p.add_argument('--out_dir', required=True)
     p.add_argument('--plots', type=int, default=30)
-    p.add_argument('--radius', type=float, default=10.)
-    p.add_argument('--buffer', type=float, default=10.)
+    p.add_argument('--radius', type=float, default=15.)
+    p.add_argument('--buffer', type=float, default=5.)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--low_max', type=float, default=5.)
     p.add_argument('--medium_max', type=float, default=15.)

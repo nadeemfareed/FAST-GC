@@ -37,7 +37,8 @@ def _xyz_keys(points, header):
     return np.rint((xyz - offsets) / scales).astype(np.int64)
 
 
-def clip_las_sources(source_paths, output_path, *, geometry, chunk_size=500_000, deduplicate_xyz=True):
+def clip_las_sources(source_paths, output_path, *, geometry, core_geometry=None,
+                     chunk_size=500_000, deduplicate_xyz=True):
     sources = [Path(p).resolve() for p in source_paths]
     destination = Path(output_path).resolve()
     if not sources:
@@ -59,6 +60,7 @@ def clip_las_sources(source_paths, output_path, *, geometry, chunk_size=500_000,
         temporary = Path(h.name)
 
     selected = 0
+    core_selected = 0
     duplicates = 0
     per_source = []
     seen = set()
@@ -87,6 +89,11 @@ def clip_las_sources(source_paths, output_path, *, geometry, chunk_size=500_000,
                                 seen.add(item)
                         pts = pts[np.flatnonzero(keep)]
                     if len(pts):
+                        if core_geometry is not None:
+                            core_inside = intersects_xy(
+                                core_geometry, np.asarray(pts.x), np.asarray(pts.y)
+                            )
+                            core_selected += int(np.count_nonzero(core_inside))
                         writer.write_points(pts)
                         source_selected += len(pts)
                 selected += source_selected
@@ -101,7 +108,7 @@ def clip_las_sources(source_paths, output_path, *, geometry, chunk_size=500_000,
     finally:
         temporary.unlink(missing_ok=True)
 
-    return {"output": str(destination), "selected_points": selected,
+    return {"output": str(destination), "selected_points": selected, "core_points": core_selected if core_geometry is not None else None,
             "duplicates_removed": duplicates, "source_count": len(sources),
             "sources": per_source, "deduplication": "output_grid_exact_xyz" if deduplicate_xyz else "none",
             "elapsed_seconds": round(time.perf_counter() - started, 4)}
