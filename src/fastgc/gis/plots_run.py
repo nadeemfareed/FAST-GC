@@ -12,7 +12,7 @@ class PlotRunJob:
     plot_id: str
     plot_name: str
     point_file: Path
-    metadata_file: Path
+    metadata_file: Path | None
     output_root: Path
 
 
@@ -22,6 +22,7 @@ class PlotRunManifest:
     sensor_mode: str
     jobs: tuple[PlotRunJob, ...]
     raw: dict[str, Any]
+    source_type: str = "fast_gis"
 
 
 def _safe_resolve(root: Path, relative: str, *, field: str) -> Path:
@@ -176,6 +177,224 @@ def load_plots_manifest(collection_root: str | Path) -> PlotRunManifest:
         jobs=tuple(jobs),
         raw=data,
     )
+
+def load_external_plots(
+    input_path: str | Path,
+    *,
+    collection_root: str | Path,
+    sensor_mode: str,
+) -> PlotRunManifest:
+    """Build a plots-run collection from ordinary LAS/LAZ inputs.
+
+    External source files are referenced in place and are never moved,
+    renamed, or modified. Unlike FAST-GIS plots, external plots have no
+    authoritative core geometry metadata and therefore are not core-masked.
+    """
+    source = Path(input_path).resolve()
+    collection = Path(collection_root).resolve()
+
+    sensor = str(sensor_mode).strip().upper()
+    if sensor not in {"ALS", "ULS", "TLS"}:
+        raise ValueError(
+            "External plots-run input requires --sensor_mode ALS, ULS, or TLS"
+        )
+
+    if source.is_file():
+        if source.suffix.lower() not in {".las", ".laz"}:
+            raise ValueError(
+                f"External plots-run input must be LAS/LAZ: {source}"
+            )
+        files = [source]
+    elif source.is_dir():
+        files = sorted(
+            p.resolve()
+            for p in source.iterdir()
+            if p.is_file() and p.suffix.lower() in {".las", ".laz"}
+        )
+    else:
+        raise FileNotFoundError(
+            f"External plots-run input not found: {source}"
+        )
+
+    if not files:
+        raise ValueError(
+            f"No LAS/LAZ files found for external plots-run input: {source}"
+        )
+
+    seen_names: set[str] = set()
+    jobs: list[PlotRunJob] = []
+
+    for index, point_file in enumerate(files, start=1):
+        plot_name = point_file.stem
+
+        key = plot_name.casefold()
+        if key in seen_names:
+            raise ValueError(
+                "External plots-run requires unique LAS/LAZ filename stems; "
+                f"duplicate plot name: {plot_name}"
+            )
+        seen_names.add(key)
+
+        jobs.append(
+            PlotRunJob(
+                plot_id=f"external_{index}",
+                plot_name=plot_name,
+                point_file=point_file,
+                metadata_file=None,
+                output_root=collection,
+            )
+        )
+
+    raw = {
+        "schema": "fastgc.plots.collection",
+        "schema_version": 1,
+        "collection_type": "external_plots",
+        "source_origin": "external",
+        "source_description": (
+            "Independent plot point clouds supplied externally. "
+            "These plots were not generated or clipped by FAST-GIS."
+        ),
+        "processing_workflow": "plots-run",
+        "sensor_mode": sensor,
+        "source_root": str(source),
+        "collection_root": str(collection),
+        "plot_count": len(jobs),
+        "spatial_support": {
+            "type": "whole_input_file",
+            "core_geometry_authoritative": False,
+            "buffer_known": False,
+        },
+    }
+
+    return PlotRunManifest(
+        root=collection,
+        sensor_mode=sensor,
+        jobs=tuple(jobs),
+        raw=raw,
+        source_type="external",
+    )
+
+
+def resolve_plots_run_input(
+    input_path: str | Path,
+    *,
+    out_dir: str | Path | None,
+    sensor_mode: str | None,
+) -> PlotRunManifest:
+    """Resolve FAST-GIS manifest collections or ordinary LAS/LAZ inputs."""
+    source = Path(input_path).resolve()
+
+    if source.is_dir() and (source / "plots_manifest.json").is_file():
+        from .collection_manifest import (
+            COLLECTION_SCHEMA,
+            load_external_collection_manifest,
+            read_manifest_schema,
+        )
+
+        manifest_path = source / "plots_manifest.json"
+        schema = read_manifest_schema(manifest_path)
+
+        if schema == "fastgc.gis.plots":
+            manifest = load_plots_manifest(source)
+
+            if out_dir is not None:
+                requested_out = Path(out_dir).resolve()
+                if requested_out != manifest.root:
+                    raise ValueError(
+                        "FAST-GIS workflow=plots-run publishes products at the "
+                        "plots collection root; --out_dir must be omitted or equal "
+                        f"to the plots collection root: {manifest.root}"
+                    )
+
+            return manifest
+
+        if schema == COLLECTION_SCHEMA:
+            data = load_external_collection_manifest(source)
+
+            stored_source = data.get("source_root")
+            stored_sensor = str(data.get("sensor_mode", "")).strip().upper()
+
+            if stored_sensor not in {"ALS", "ULS", "TLS"}:
+                raise ValueError(
+                    "Invalid sensor_mode in external plots collection: "
+                    f"{stored_sensor!r}"
+                )
+
+            if (
+                sensor_mode is not None
+                and str(sensor_mode).strip().upper() != stored_sensor
+            ):
+                raise ValueError(
+                    "sensor_mode conflicts with external plots_manifest.json: "
+                    f"CLI={str(sensor_mode).strip().upper()} "
+                    f"manifest={stored_sensor}"
+                )
+
+            if not stored_source:
+                raise ValueError(
+                    "External plots_manifest.json is missing source_root"
+                )
+
+            if out_dir is not None:
+                requested_out = Path(out_dir).resolve()
+                sensor_dir = f"{stored_sensor}_plots"
+                expected = (
+                    requested_out
+                    if requested_out.name.casefold() == sensor_dir.casefold()
+                    else requested_out / sensor_dir
+                ).resolve()
+
+                if expected != source:
+                    raise ValueError(
+                        "External plots collection --out_dir does not resolve "
+                        f"to the existing collection root: {source}"
+                    )
+
+            return load_external_plots(
+                stored_source,
+                collection_root=source,
+                sensor_mode=stored_sensor,
+            )
+
+        raise ValueError(
+            "Unsupported plots_manifest.json schema: "
+            f"{schema!r}. Expected 'fastgc.gis.plots' or "
+            f"{COLLECTION_SCHEMA!r}."
+        )
+
+    if sensor_mode is None:
+        raise ValueError(
+            "External LAS/LAZ workflow=plots-run requires --sensor_mode "
+            "ALS, ULS, or TLS"
+        )
+
+    sensor = str(sensor_mode).strip().upper()
+    if sensor not in {"ALS", "ULS", "TLS"}:
+        raise ValueError(
+            "External LAS/LAZ workflow=plots-run requires --sensor_mode "
+            "ALS, ULS, or TLS"
+        )
+
+    if out_dir is None:
+        base = source.parent if source.is_file() else source.parent
+        name = source.stem if source.is_file() else source.name
+        destination = base / f"{name}_FAST_GC" / f"{sensor}_plots"
+    else:
+        requested = Path(out_dir).resolve()
+        sensor_dir = f"{sensor}_plots"
+        destination = (
+            requested
+            if requested.name.casefold() == sensor_dir.casefold()
+            else requested / sensor_dir
+        )
+
+    return load_external_plots(
+        source,
+        collection_root=destination,
+        sensor_mode=sensor,
+    )
+
+
 def plot_work_root(
     manifest: PlotRunManifest,
     job: PlotRunJob,

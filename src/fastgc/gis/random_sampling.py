@@ -26,8 +26,8 @@ from .survey_catalog import build_survey_catalog
 from .survey_regions import discover_survey_regions
 
 
-def _ready_catalog(source):
-    catalog = build_survey_catalog(source)
+def _ready_catalog(source, *, source_crs=None):
+    catalog = build_survey_catalog(source, source_crs=source_crs)
     ready = [t for t in catalog["tiles"] if t["status"] == "ready"]
     if not ready:
         raise ValueError("No survey LAS/LAZ tile has a resolved CRS")
@@ -119,17 +119,16 @@ def choose_random_plots(catalog, regions, *, count=30, radius=15.0, buffer=5.0,
             selected_here += 1
             if selected_here == quota:
                 break
-        if selected_here != quota:
-            raise ValueError(
-                f"Insufficient eligible area in {region['region_id']}: "
-                f"selected {selected_here} of {quota}; no partial plot set published"
-            )
+    if not chosen:
+        raise ValueError(
+            "No fully observed, non-overlapping plot+buffer footprint can be placed"
+        )
     return chosen, quotas
 
 
 def sample_random_and_clip(source, output_dir, *, count=30, radius=15.0, buffer=5.0,
                            seed=42, cell_size=5.0, chunk_size=500_000,
-                           sensor_mode="ALS", shape="hexagon"):
+                           sensor_mode="ALS", shape="hexagon", source_crs=None):
     """Build random plots from raw observed coverage and transactionally clip them."""
     source = Path(source).resolve()
     target = Path(output_dir).resolve()
@@ -141,7 +140,7 @@ def sample_random_and_clip(source, output_dir, *, count=30, radius=15.0, buffer=
     if target.exists():
         raise FileExistsError(target)
 
-    catalog, _, crs = _ready_catalog(source)
+    catalog, _, crs = _ready_catalog(source, source_crs=source_crs)
     regions = discover_survey_regions(catalog)
     chosen, quotas = choose_random_plots(
         catalog, regions, count=count, radius=radius, buffer=buffer, seed=seed,
@@ -170,7 +169,11 @@ def sample_random_and_clip(source, output_dir, *, count=30, radius=15.0, buffer=
             "schema_version": 1,
             "method": "random_observed_coverage",
             "source": str(source), "crs": crs.to_string(),
-            "sensor_mode": sensor_mode, "seed": seed, "plot_count": count,
+            "sensor_mode": sensor_mode, "seed": seed,
+            "requested_plot_count": int(count),
+            "generated_plot_count": len(chosen),
+            "capacity_limited": len(chosen) < int(count),
+            "plot_count": len(chosen),
             "shape": shape, "radius_m": radius, "radius_definition": "circumradius" if shape == "hexagon" else "circle_radius", "buffer_m": buffer,
             "coverage_cell_m": cell_size,
             "region_allocation": "equal", "region_quotas": quotas,
@@ -179,14 +182,17 @@ def sample_random_and_clip(source, output_dir, *, count=30, radius=15.0, buffer=
         clip_root = stage / f"{sensor_mode}_plots"
         extract_plots(source, plots, clip_root, buffer=buffer, chunk_size=chunk_size,
                       sensor_mode=sensor_mode, sampling_method="random_observed_coverage",
-                      shape=shape, radius=radius)
+                      shape=shape, radius=radius, source_crs=source_crs)
         # Promote the collection manifest to a workspace-level hierarchy.
         collection_manifest = clip_root / "plots_manifest.json"
         workspace = {
             "schema": "fastgc.gis.workspace", "schema_version": 3,
             "sensor_mode": sensor_mode, "sampling_method": "random_observed_coverage",
             "shape": shape, "core_radius_m": float(radius), "buffer_m": float(buffer),
-            "plot_count": int(count), "seed": int(seed),
+            "requested_plot_count": int(count),
+            "generated_plot_count": len(chosen),
+            "capacity_limited": len(chosen) < int(count),
+            "plot_count": len(chosen), "seed": int(seed),
             "collection": f"{sensor_mode}_plots",
             "plots_manifest": f"{sensor_mode}_plots/plots_manifest.json",
             "sample_plots": "sample_plots.geojson", "sampling_manifest": "sampling_manifest.json",

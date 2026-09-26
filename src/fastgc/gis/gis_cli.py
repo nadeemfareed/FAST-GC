@@ -20,7 +20,7 @@ def main(argv=None):
     p.add_argument("--plot_file", "--plot-file", dest="plot_file",
                    help="KML/KMZ/SHP/GPKG/GeoJSON/CSV; required only for imported")
     p.add_argument("--source_crs", "--source-crs", dest="source_crs",
-                   help="Source CRS for CSV plot centers")
+                   help="Source CRS override for LAS/LAZ without embedded CRS, or for CSV plot centers")
     p.add_argument("--layer", help="Optional vector layer for imported GPKG/vector data")
     p.add_argument("--plots", type=int, default=30)
     p.add_argument("--shape", choices=["circle", "hexagon"], default="hexagon")
@@ -49,6 +49,7 @@ def main(argv=None):
             a.in_path, a.out_dir, count=a.plots, radius=a.radius, buffer=a.buffer,
             seed=a.seed, cell_size=a.coverage_cell_m, chunk_size=a.chunk_size,
             sensor_mode=a.sensor_mode, shape=a.shape,
+            source_crs=a.source_crs,
         )
     elif a.sampling == "rough_height_stratified":
         if a.shape != "circle":

@@ -784,6 +784,83 @@ def _run_processing_with_optional_fpfix(
     return out_root
 
 
+def _plots_run_product_exists(
+    *,
+    collection_root: Path,
+    plot_name: str,
+    product: str,
+    chm_targets: list[dict],
+) -> bool:
+    """Return True only when a requested plot product is already published.
+
+    This is intentionally conservative. Unknown or multi-output products are
+    treated as incomplete so plots-run never skips work based on a guess.
+    """
+    stem = Path(plot_name).stem
+
+    if product in {PRODUCT_GC, PRODUCT_NORMALIZED}:
+        root = collection_root / product
+        return any(
+            (root / f"{stem}{suffix}").is_file()
+            for suffix in (".las", ".laz")
+        )
+
+    if product in {PRODUCT_DEM, PRODUCT_DSM}:
+        root = collection_root / product
+        return any(
+            (root / f"{stem}{suffix}").is_file()
+            for suffix in (".tif", ".tiff")
+        )
+
+    if product == PRODUCT_CHM:
+        for target in chm_targets:
+            root = collection_root / PRODUCT_CHM / target["label"]
+            if not any(
+                (root / f"{stem}{suffix}").is_file()
+                for suffix in (".tif", ".tiff")
+            ):
+                return False
+        return bool(chm_targets)
+
+    return False
+
+
+def _plots_run_requested_products_complete(
+    *,
+    collection_root: Path,
+    plot_name: str,
+    requested_products: list[str],
+    resolved_products: list[str],
+    chm_method: str,
+    chm_methods: list[str] | None,
+    chm_surface_method: str,
+) -> bool:
+    """Check collection-level outputs for one plots-run job."""
+    products_to_check = (
+        resolved_products
+        if "all" in requested_products
+        else requested_products
+    )
+
+    chm_targets: list[dict] = []
+    if PRODUCT_CHM in products_to_check:
+        chm_targets = _resolve_chm_targets(
+            chm_method=chm_method,
+            chm_methods=chm_methods,
+            chm_surface_method=chm_surface_method,
+        )
+
+    return all(
+        _plots_run_product_exists(
+            collection_root=collection_root,
+            plot_name=plot_name,
+            product=product,
+            chm_targets=chm_targets,
+        )
+        for product in products_to_check
+    )
+
+
 def run_fastgc(
     in_path: str,
     out_dir: str | None,
@@ -878,17 +955,29 @@ def run_fastgc(
     # TILING, each requested FAST product, and each product-specific MERGE stage.
 
     if workflow == "plots-run":
+        from .gis.core_mask import mask_plot_rasters_to_core
+        from .gis.collection_manifest import (
+            write_external_collection_manifest,
+        )
         from .gis.plots_run import (
             cleanup_plot_work_root,
-            load_plots_manifest,
             plot_work_root,
             publish_plot_products,
+            resolve_plots_run_input,
         )
 
-        plot_manifest = load_plots_manifest(in_path)
+        plot_manifest = resolve_plots_run_input(
+            in_path,
+            out_dir=out_dir,
+            sensor_mode=sensor_mode,
+        )
         manifest_sensor = plot_manifest.sensor_mode
 
-        if sensor_mode is not None and str(sensor_mode).strip().upper() != manifest_sensor:
+        if (
+            plot_manifest.source_type == "fast_gis"
+            and sensor_mode is not None
+            and str(sensor_mode).strip().upper() != manifest_sensor
+        ):
             raise ValueError(
                 "sensor_mode conflicts with plots_manifest.json: "
                 f"CLI={str(sensor_mode).strip().upper()} "
@@ -897,18 +986,29 @@ def run_fastgc(
 
         sensor_mode = manifest_sensor
 
-        if out_dir is not None:
-            requested_out = Path(out_dir).resolve()
-            if requested_out != plot_manifest.root:
+        # External plots-run collections use an output-side persistent ledger.
+        # Reconcile it from actual published FAST_* outputs at workflow start,
+        # so files on disk remain authoritative for resume/recovery.
+        if plot_manifest.source_type == "external":
+            source_root = plot_manifest.raw.get("source_root")
+            if not source_root:
+                source_root = plot_manifest.raw.get("source")
+
+            if not source_root:
                 raise ValueError(
-                    "workflow=plots-run publishes products at the plots collection "
-                    "root; --out_dir must be omitted or equal to "
-                    f"the plots collection root: {plot_manifest.root}"
+                    "External plots-run collection has no source_root"
                 )
+
+            write_external_collection_manifest(
+                source=source_root,
+                collection_root=plot_manifest.root,
+                sensor_mode=plot_manifest.sensor_mode,
+                jobs=plot_manifest.jobs,
+            )
 
         if not plot_manifest.jobs:
             raise ValueError(
-                f"No plot jobs found in {plot_manifest.root / 'plots_manifest.json'}"
+                f"No plot jobs found for plots-run input: {in_path}"
             )
 
         log_info(
@@ -923,6 +1023,26 @@ def run_fastgc(
                 f"[PLOT {index}/{len(plot_manifest.jobs)}] "
                 f"{job.plot_name}: {job.point_file}"
             )
+
+            if (
+                skip_existing
+                and not overwrite
+                and _plots_run_requested_products_complete(
+                    collection_root=plot_manifest.root,
+                    plot_name=job.plot_name,
+                    requested_products=requested_products,
+                    resolved_products=resolved_products,
+                    chm_method=chm_method,
+                    chm_methods=chm_methods,
+                    chm_surface_method=chm_surface_method,
+                )
+            ):
+                log_info(
+                    f"[SKIP PLOT] {job.plot_name}: "
+                    "all requested collection products already exist"
+                )
+                completed.append(job.plot_name)
+                continue
 
             run_fastgc(
                 in_path=str(job.point_file),
@@ -1002,11 +1122,28 @@ def run_fastgc(
                 job,
             )
 
+            if job.metadata_file is not None:
+                mask_plot_rasters_to_core(
+                    work_root=work_root,
+                    metadata_path=job.metadata_file,
+                )
+
             publish_plot_products(
                 collection_root=plot_manifest.root,
                 work_root=work_root,
                 overwrite=overwrite,
             )
+
+            # Publication succeeded. Refresh the external collection ledger
+            # before deleting private processing state. The ledger is derived
+            # from actual published FAST_* outputs rather than assumed state.
+            if plot_manifest.source_type == "external":
+                write_external_collection_manifest(
+                    source=source_root,
+                    collection_root=plot_manifest.root,
+                    sensor_mode=plot_manifest.sensor_mode,
+                    jobs=plot_manifest.jobs,
+                )
 
             cleanup_plot_work_root(work_root)
 

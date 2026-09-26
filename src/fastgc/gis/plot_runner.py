@@ -52,7 +52,7 @@ def extract_plots(input_las, plot_file, output_dir, *, buffer=5.0, chunk_size=50
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer")
 
-    catalog = build_survey_catalog(source)
+    catalog = build_survey_catalog(source, source_crs=source_crs)
     ready = [t for t in catalog["tiles"] if t["status"] == "ready"]
     if not ready: raise ValueError("Survey contains no CRS-resolved LAS/LAZ sources")
     index = SurveyTileIndex(catalog)

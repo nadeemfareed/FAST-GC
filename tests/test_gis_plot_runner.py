@@ -239,3 +239,47 @@ def test_no_buffer_creates_only_core(sample, tmp_path):
     else:
         assert len(list(workspace.rglob("*.las"))) == 2
         assert len(list(workspace.rglob("*.laz"))) == 0
+
+def test_crsless_las_with_explicit_source_crs(tmp_path):
+    import json
+    import laspy
+    import numpy as np
+    from pyproj import CRS
+    from shapely.geometry import Point, mapping
+    from fastgc.gis.plot_runner import extract_plots
+
+    source = tmp_path / "local_header.las"
+    header = laspy.LasHeader(point_format=3, version="1.2")
+    header.scales = np.array([0.01, 0.01, 0.01])
+    las = laspy.LasData(header)
+    las.x = np.array([500000.0, 500001.0, 500002.0])
+    las.y = np.array([7000000.0, 7000001.0, 7000002.0])
+    las.z = np.array([100.0, 101.0, 102.0])
+    las.write(source)
+    assert laspy.read(source).header.parse_crs() is None
+
+    definitions = tmp_path / "plots.geojson"
+    geometry = Point(500001.0, 7000001.0).buffer(5.0)
+    definitions.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "crs": {"type": "name", "properties": {"name": "EPSG:32756"}},
+        "features": [{
+            "type": "Feature",
+            "properties": {"plot_name": "Plot_001"},
+            "geometry": mapping(geometry),
+        }],
+    }), encoding="utf-8")
+
+    output = tmp_path / "extracted"
+    result = extract_plots(
+        source, definitions, output,
+        source_crs="EPSG:32756",
+        sensor_mode="TLS", buffer=0.0,
+    )
+    assert result["plot_count"] == 1
+    metadata = json.loads(
+        (output / "Plot_001" / "Clip_Plot_001.json").read_text(encoding="utf-8")
+    )
+    assert CRS.from_user_input(metadata["processing_crs"]) == CRS.from_epsg(32756)
+    assert metadata["points_written"] == 3
+    assert (output / "Plot_001" / "Plot_001.las").is_file()
