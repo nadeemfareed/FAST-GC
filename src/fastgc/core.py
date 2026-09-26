@@ -26,7 +26,11 @@ from .io_las import (
 from .itd import run_itd_from_processed_root
 from .merge import cleanup_tiling_workspace, merge_processed_tiles
 from .viewer.manifest import ViewManifest
-from .monster import log_info, stage_banner
+from .monster import (
+    log_info,
+    run_with_progress_plot_context,
+    stage_banner,
+)
 from .preprocess import tile_las_dataset
 from .structure import run_structure_from_root
 from .terrain import run_terrain_from_processed_root
@@ -1044,7 +1048,9 @@ def run_fastgc(
                 completed.append(job.plot_name)
                 continue
 
-            run_fastgc(
+            run_with_progress_plot_context(
+                job.plot_name,
+                run_fastgc,
                 in_path=str(job.point_file),
                 out_dir=str(plot_work_root(plot_manifest, job)),
                 sensor_mode=sensor_mode,

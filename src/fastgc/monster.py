@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import math
 import os
 import re
@@ -305,6 +308,52 @@ def _plural_unit(unit: str, count: int) -> str:
     return unit if unit.endswith("s") else f"{unit}s"
 
 
+_progress_plot_context: ContextVar[str] = ContextVar(
+    "fastgc_progress_plot",
+    default="",
+)
+
+
+@contextmanager
+def progress_plot_context(plot_name: str | None):
+    """Scope enclosing plot identity for nested FAST progress dashboards."""
+    token = _progress_plot_context.set(str(plot_name or ""))
+    try:
+        yield
+    finally:
+        _progress_plot_context.reset(token)
+
+
+def run_with_progress_plot_context(plot_name, func, /, *args, **kwargs):
+    """Run a callable with plot identity available to nested progress dashboards."""
+    with progress_plot_context(plot_name):
+        return func(*args, **kwargs)
+
+
+def compact_progress_name(value: str | None, max_len: int = 14) -> str:
+    """Compact a progress item name while preserving its identifying suffix."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    # Progress context should show the logical item rather than a full path.
+    # Accept both Windows and POSIX separators without filesystem access.
+    raw = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    lower = raw.lower()
+    if lower.endswith(".las") or lower.endswith(".laz"):
+        raw = raw[:-4]
+
+    max_len = max(8, int(max_len))
+    if len(raw) <= max_len:
+        return raw
+
+    # Preserve both ends. This keeps names such as NSpruce_plot1,
+    # NSpruce_plot2, ... distinguishable after compaction.
+    suffix_len = max(2, min(4, max_len // 3))
+    prefix_len = max_len - suffix_len - 3
+    return f"{raw[:prefix_len]}...{raw[-suffix_len:]}"
+
+
 class ProgressDashboard:
     """Shared single-line FAST-family progress dashboard.
 
@@ -333,6 +382,7 @@ class ProgressDashboard:
         self.current_name = ""
         self.current_file = ""
         self.current_item = ""
+        self.plot_name = _progress_plot_context.get()
         self.ok = 0
         self.skipped = 0
         self.failed = 0
@@ -486,6 +536,8 @@ class ProgressDashboard:
         else:
             rate_text = format_rate(0.0, self.unit)
 
+        plot_context = compact_progress_name(self.plot_name)
+
         line = (
             f"{self._identity()} | [{bar}] | {frac*100:5.1f}% | {done}/{self.total}"
             f" | {rate_text}"
@@ -494,6 +546,9 @@ class ProgressDashboard:
             f" | CPU {cpu}"
             f" | RAM {ram}"
         )
+
+        if plot_context:
+            line += f" | plot={plot_context}"
         if self._outcomes_supplied:
             line += (
                 f" | ok {self.ok}"
@@ -503,7 +558,15 @@ class ProgressDashboard:
 
         width = self._console_width()
         if len(line) > width:
-            line = line[: max(1, width - 1)]
+            if plot_context:
+                suffix = f" | plot={plot_context}"
+                available = width - len(suffix)
+                if available >= 24:
+                    line = line[:available].rstrip() + suffix
+                else:
+                    line = line[: max(1, width - 1)]
+            else:
+                line = line[: max(1, width - 1)]
         return line
 
     def _write_native_windows(self, line: str) -> bool:
@@ -652,11 +715,14 @@ class ProgressDashboard:
         *,
         current_file: str | None = None,
         current_item: str | None = None,
+        plot_name: str | None = None,
     ) -> None:
         if current_file is not None:
             self.current_file = str(current_file)
         if current_item is not None:
             self.current_item = str(current_item)
+        if plot_name is not None:
+            self.plot_name = str(plot_name)
         if self.enabled:
             self._write_line(self._render_line())
 
