@@ -1015,17 +1015,26 @@ def run_fastgc(
                 f"No plot jobs found for plots-run input: {in_path}"
             )
 
+        total_plots = len(plot_manifest.jobs)
+        product_label = ",".join(resolved_products)
+
         log_info(
-            f"plots-run collection: {plot_manifest.root} | "
-            f"sensor={sensor_mode} | plots={len(plot_manifest.jobs)}"
+            f"FAST-GC PLOTS | {sensor_mode} | "
+            f"{total_plots} plots | products={product_label}"
         )
+        log_info(f"Input  : {in_path}")
+        log_info(f"Output : {plot_manifest.root}")
 
         completed: list[str] = []
+        published_count = 0
+        skipped_count = 0
+        processed_seconds = 0.0
+        plots_t0 = perf_counter()
 
         for index, job in enumerate(plot_manifest.jobs, start=1):
             log_info(
-                f"[PLOT {index}/{len(plot_manifest.jobs)}] "
-                f"{job.plot_name}: {job.point_file}"
+                f"[PLOT {index}/{total_plots}] {job.plot_name} | "
+                f"completed={published_count} | skipped={skipped_count}"
             )
 
             if (
@@ -1041,12 +1050,15 @@ def run_fastgc(
                     chm_surface_method=chm_surface_method,
                 )
             ):
-                log_info(
-                    f"[SKIP PLOT] {job.plot_name}: "
-                    "all requested collection products already exist"
-                )
+                skipped_count += 1
                 completed.append(job.plot_name)
+                log_info(
+                    f"[SKIPPED {index}/{total_plots}] {job.plot_name} | "
+                    f"completed={published_count} | skipped={skipped_count}"
+                )
                 continue
+
+            plot_t0 = perf_counter()
 
             run_with_progress_plot_context(
                 job.plot_name,
@@ -1154,11 +1166,31 @@ def run_fastgc(
             cleanup_plot_work_root(work_root)
 
             completed.append(job.plot_name)
+            published_count += 1
+            processed_seconds += perf_counter() - plot_t0
+
+            plots_elapsed = perf_counter() - plots_t0
+            attempted = published_count + skipped_count
+            remaining = max(0, total_plots - attempted)
+
+            if published_count > 0 and remaining > 0:
+                mean_processed_seconds = processed_seconds / published_count
+                eta_seconds = mean_processed_seconds * remaining
+                eta_text = f"{eta_seconds:.0f}s"
+            else:
+                eta_text = "0s"
+
+            log_info(
+                f"[PUBLISHED {index}/{total_plots}] {job.plot_name} | "
+                f"completed={published_count} | skipped={skipped_count} | "
+                f"elapsed={plots_elapsed:.1f}s | ETA={eta_text}"
+            )
 
         log_info(
             f"[TIME] WORKFLOW plots-run: "
             f"{perf_counter() - total_t0:.2f}s | "
-            f"completed={len(completed)}/{len(plot_manifest.jobs)}"
+            f"completed={len(completed)}/{total_plots} | "
+            f"published={published_count} | skipped={skipped_count}"
         )
 
         return str(plot_manifest.root)
