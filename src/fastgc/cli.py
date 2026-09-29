@@ -6,6 +6,7 @@ import sys
 
 from .core import DEFAULT_WORKFLOW, WORKFLOW_CHOICES, run_fastgc
 from .monster import BACKEND_CHOICES, DEFAULT_BACKEND
+from .terrain import TERRAIN_PRODUCT_CHOICES
 from .backend.compute import configure_sensor_compute_backend
 from . import __version__
 
@@ -60,18 +61,6 @@ CHM_MULTI_METHOD_CHOICES = [
 
 CHM_SMOOTH_CHOICES = ["none", "median", "gaussian"]
 
-TERRAIN_PRODUCT_CHOICES = [
-    "all",
-    "slope_percent",
-    "slope_degrees",
-    "aspect",
-    "hillshade",
-    "curvature",
-    "tpi",
-    "twi",
-    "dtw",
-    "tci",
-]
 
 CHANGE_INPUT_CHOICES = [
     "FAST_DEM",

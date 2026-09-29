@@ -33,7 +33,7 @@ from .monster import (
 )
 from .preprocess import tile_las_dataset
 from .structure import run_structure_from_root
-from .terrain import run_terrain_from_processed_root
+from .terrain import run_terrain_from_dem, run_terrain_from_processed_root
 from .treeclouds import PRODUCT_TREECLOUDS, run_treeclouds_from_root
 
 PRODUCT_TERRAIN = "FAST_TERRAIN"
@@ -1290,7 +1290,27 @@ def run_fastgc(
                 )
                 merged_outputs.update(out)
 
-        other_products = [p for p in merge_products if p != PRODUCT_CHM]
+        # Merge ordinary products normally, but FAST_TERRAIN is special:
+        # its authoritative merged products must be derived from the continuous
+        # merged FAST_DEM rather than mosaicked from independently derived
+        # terrain tiles. Tile-level FAST_TERRAIN outputs remain available under
+        # the processed root for tile-run workflows and diagnostics.
+        terrain_requested_for_merge = PRODUCT_TERRAIN in merge_products
+
+        other_products = [
+            p
+            for p in merge_products
+            if p not in {PRODUCT_CHM, PRODUCT_TERRAIN}
+        ]
+
+        # FAST_TERRAIN depends on a merged FAST_DEM. FAST_DEM is already an
+        # implicit dependency of FAST_TERRAIN in product resolution, but the
+        # merge list is based on explicitly requested products. Therefore make
+        # sure the DEM is merged here even when the user requested only
+        # FAST_TERRAIN.
+        if terrain_requested_for_merge and PRODUCT_DEM not in other_products:
+            other_products.insert(0, PRODUCT_DEM)
+
         if other_products:
             out = merge_processed_tiles(
                 manifest=manifest,
@@ -1300,6 +1320,45 @@ def run_fastgc(
                 chm_method=None,
             )
             merged_outputs.update(out)
+
+        if terrain_requested_for_merge:
+            merged_dem_fp = merged_outputs.get(PRODUCT_DEM)
+            if not merged_dem_fp:
+                raise RuntimeError(
+                    "FAST_TERRAIN continuous-domain derivation requires "
+                    "a successfully merged FAST_DEM."
+                )
+
+            merged_terrain_root = merge_root / PRODUCT_TERRAIN
+
+            run_terrain_from_dem(
+                dem_fp=merged_dem_fp,
+                output_root=merged_terrain_root,
+                terrain_products=terrain_products,
+                hillshade_azimuth=hillshade_azimuth,
+                hillshade_altitude=hillshade_altitude,
+                hillshade_z_factor=hillshade_z_factor,
+                tpi_radius=tpi_radius,
+                twi_eps=twi_eps,
+                dtw_max_distance=dtw_max_distance,
+                skip_existing=skip_existing,
+                overwrite=overwrite,
+                n_jobs=n_jobs,
+                joblib_backend=joblib_backend,
+                joblib_batch_size=joblib_batch_size,
+                joblib_pre_dispatch=joblib_pre_dispatch,
+            )
+            if merged_terrain_root.exists():
+                for terrain_dir in sorted(merged_terrain_root.iterdir()):
+                    if not terrain_dir.is_dir():
+                        continue
+                    terrain_files = sorted(
+                        p for p in terrain_dir.glob("*.tif") if p.is_file()
+                    )
+                    if terrain_files:
+                        merged_outputs[
+                            f"{PRODUCT_TERRAIN}_{terrain_dir.name}"
+                        ] = str(terrain_files[0])
 
         if cleanup_tiles:
             tiles_dir = workspace_root / "tiles"

@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import (
+    convolve,
+    distance_transform_edt,
+    maximum_filter,
+    minimum_filter,
+)
 
 try:
     import rasterio
@@ -23,7 +28,15 @@ TERRAIN_PRODUCT_CHOICES = {
     "aspect",
     "hillshade",
     "curvature",
+    "profile_curvature",
+    "tangential_curvature",
+    "planform_curvature",
+    "mean_curvature",
+    "gaussian_curvature",
     "tpi",
+    "tri",
+    "roughness",
+    "local_relief",
     "twi",
     "dtw",
     "tci",
@@ -45,10 +58,15 @@ def _resolve_terrain_products(products: list[str] | None) -> list[str]:
             "aspect",
             "hillshade",
             "curvature",
+            "profile_curvature",
+            "tangential_curvature",
+            "planform_curvature",
+            "mean_curvature",
+            "gaussian_curvature",
             "tpi",
-            "twi",
-            "dtw",
-            "tci",
+            "tri",
+            "roughness",
+            "local_relief",
         ]
 
     out: list[str] = []
@@ -72,7 +90,15 @@ def _read_dem(dem_fp: str):
     return arr, profile, transform, nodata
 
 
-def _write_raster(arr: np.ndarray, profile: dict, out_fp: str, nodata=None):
+def _write_raster(
+    arr: np.ndarray,
+    profile: dict,
+    out_fp: str,
+    nodata=None,
+    *,
+    tags: dict[str, str] | None = None,
+):
+    """Write one FAST_TERRAIN raster and optional provenance metadata."""
     _require_rasterio()
     os.makedirs(os.path.dirname(out_fp), exist_ok=True)
 
@@ -82,11 +108,20 @@ def _write_raster(arr: np.ndarray, profile: dict, out_fp: str, nodata=None):
         count=1,
         compress="lzw",
     )
+
     if nodata is not None:
         profile_out["nodata"] = nodata
 
     with rasterio.open(out_fp, "w", **profile_out) as dst:
         dst.write(arr.astype(np.float32), 1)
+
+        if tags:
+            dst.update_tags(
+                **{
+                    str(key): str(value)
+                    for key, value in tags.items()
+                }
+            )
 
 
 def _pixel_size(transform) -> tuple[float, float]:
@@ -294,21 +329,363 @@ def compute_hillshade(
     return hs.astype(np.float32)
 
 
+def _surface_derivatives(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return first and second DEM derivatives.
+
+    Returns
+    -------
+    p, q, r, s, t
+        p = dz/dx
+        q = dz/dy
+        r = d2z/dx2
+        s = d2z/dxdy
+        t = d2z/dy2
+
+    Notes
+    -----
+    Derivatives are expressed in the coordinate units represented by dx,
+    dy, and DEM elevation. FAST_TERRAIN assumes compatible horizontal and
+    vertical metric units for physically interpretable metric derivatives.
+    """
+    # Curvature depends on second derivatives and is especially sensitive
+    # to premature precision loss. Preserve float64 throughout the
+    # derivative path rather than using _fill_nan_with_nearest(), whose
+    # historical float32 behavior is retained for the existing hydrology
+    # implementation until that subsystem is audited separately.
+    dem64 = np.asarray(dem, dtype=np.float64)
+    valid = np.isfinite(dem64)
+
+    if np.all(valid):
+        dem_fill = dem64.copy()
+    elif not np.any(valid):
+        dem_fill = np.zeros_like(dem64, dtype=np.float64)
+    else:
+        _, inds = distance_transform_edt(~valid, return_indices=True)
+        dem_fill = dem64.copy()
+        dem_fill[~valid] = dem64[inds[0][~valid], inds[1][~valid]]
+
+    q, p = np.gradient(dem_fill, float(dy), float(dx))
+
+    r = np.gradient(p, float(dx), axis=1)
+    t = np.gradient(q, float(dy), axis=0)
+
+    s_from_p = np.gradient(p, float(dy), axis=0)
+    s_from_q = np.gradient(q, float(dx), axis=1)
+    s = 0.5 * (s_from_p + s_from_q)
+
+    return (
+        p.astype(np.float64, copy=False),
+        q.astype(np.float64, copy=False),
+        r.astype(np.float64, copy=False),
+        s.astype(np.float64, copy=False),
+        t.astype(np.float64, copy=False),
+    )
+
+
 def compute_curvature(dem: np.ndarray, dx: float, dy: float) -> np.ndarray:
-    dem_fill = _fill_nan_with_nearest(dem)
-    dzdy, dzdx = np.gradient(dem_fill, dy, dx)
-    d2zdx2 = np.gradient(dzdx, dx, axis=1)
-    d2zdy2 = np.gradient(dzdy, dy, axis=0)
-    # Simple generalized curvature (Laplacian-style proxy).
-    curvature = d2zdx2 + d2zdy2
-    return curvature.astype(np.float32)
+    """Legacy Laplacian curvature retained for backward compatibility.
+
+    This product is z_xx + z_yy. It is not a substitute for profile,
+    plan, mean, or Gaussian curvature.
+    """
+    _p, _q, r, _s, t = _surface_derivatives(dem, dx, dy)
+    return (r + t).astype(np.float32)
+
+
+def compute_profile_curvature(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+) -> np.ndarray:
+    """Curvature of the surface in the local gradient direction.
+
+    Positive/negative sign follows the mathematical surface convention
+    used by this implementation. Cells with effectively zero gradient
+    have no defined profile direction and are returned as NaN.
+    """
+    p, q, r, s, t = _surface_derivatives(dem, dx, dy)
+
+    g2 = p * p + q * q
+    denom = g2 * np.power(1.0 + g2, 1.5)
+    numer = r * p * p + 2.0 * s * p * q + t * q * q
+
+    out = np.full(dem.shape, np.nan, dtype=np.float64)
+    valid = g2 > 1e-16
+    out[valid] = -numer[valid] / denom[valid]
+
+    return out.astype(np.float32)
+
+
+def compute_tangential_curvature(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+) -> np.ndarray:
+    """Geometric tangential curvature of the graph surface z=f(x,y).
+
+    This is the curvature of the normal section tangential to the
+    contour line. The convention follows the geometric curvature
+    system summarized by Minar et al. (2020).
+
+    Cells with effectively zero gradient have no defined contour
+    direction and are returned as NaN.
+    """
+    p, q, r, s, t = _surface_derivatives(dem, dx, dy)
+
+    g2 = p * p + q * q
+    numer = r * q * q - 2.0 * s * p * q + t * p * p
+    denom = g2 * np.sqrt(1.0 + g2)
+
+    out = np.full(dem.shape, np.nan, dtype=np.float64)
+    valid = g2 > 1e-16
+
+    out[valid] = -numer[valid] / denom[valid]
+
+    return out.astype(np.float32)
+
+
+def compute_planform_curvature(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+) -> np.ndarray:
+    """Planform curvature of the graph surface z=f(x,y).
+
+    Planform curvature is the curvature of the horizontal projection
+    of the contour line.
+
+    Cells with effectively zero gradient have no defined contour
+    direction and are returned as NaN.
+    """
+    p, q, r, s, t = _surface_derivatives(dem, dx, dy)
+
+    g2 = p * p + q * q
+    numer = r * q * q - 2.0 * s * p * q + t * p * p
+    denom = np.power(g2, 1.5)
+
+    out = np.full(dem.shape, np.nan, dtype=np.float64)
+    valid = g2 > 1e-16
+
+    out[valid] = -numer[valid] / denom[valid]
+
+    return out.astype(np.float32)
+
+def compute_mean_curvature(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+) -> np.ndarray:
+    """Mean curvature using the geomorphometric sign convention.
+
+    Positive values represent locally convex terrain and negative values
+    locally concave terrain.  The magnitude is the geometric mean curvature
+    of the graph surface z=f(x,y); the leading minus sign selects the
+    geographical/geomorphometric surface-normal convention used by the
+    directional curvature products in FAST_TERRAIN.
+    """
+    p, q, r, s, t = _surface_derivatives(dem, dx, dy)
+
+    g2 = p * p + q * q
+    numer = (
+        (1.0 + q * q) * r
+        - 2.0 * p * q * s
+        + (1.0 + p * p) * t
+    )
+    denom = 2.0 * np.power(1.0 + g2, 1.5)
+
+    return (-numer / denom).astype(np.float32)
+
+
+def compute_gaussian_curvature(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+) -> np.ndarray:
+    """Gaussian curvature of the graph surface z=f(x,y)."""
+    p, q, r, s, t = _surface_derivatives(dem, dx, dy)
+
+    g2 = p * p + q * q
+    numer = r * t - s * s
+    denom = np.power(1.0 + g2, 2.0)
+
+    return (numer / denom).astype(np.float32)
+
+
+def _finite_neighborhood_sum(
+    arr: np.ndarray,
+    kernel: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite-value neighborhood sum and finite sample count."""
+    arr64 = np.asarray(arr, dtype=np.float64)
+    valid = np.isfinite(arr64)
+
+    values = np.where(valid, arr64, 0.0)
+
+    total = convolve(
+        values,
+        kernel,
+        mode="constant",
+        cval=0.0,
+    )
+
+    count = convolve(
+        valid.astype(np.float64),
+        kernel,
+        mode="constant",
+        cval=0.0,
+    )
+
+    return total, count
 
 
 def compute_tpi(dem: np.ndarray, radius: int = 3) -> np.ndarray:
-    mean_local = _nanmean_filter(dem, radius=max(1, int(radius)))
-    tpi = dem - mean_local
-    return tpi.astype(np.float32)
+    """Topographic Position Index.
 
+    TPI is focal elevation minus the mean elevation of the surrounding
+    finite cells. The focal cell itself is excluded.
+    """
+    arr = np.asarray(dem, dtype=np.float64)
+    radius = max(1, int(radius))
+
+    size = 2 * radius + 1
+    kernel = np.ones((size, size), dtype=np.float64)
+    kernel[radius, radius] = 0.0
+
+    total, count = _finite_neighborhood_sum(arr, kernel)
+
+    mean = np.divide(
+        total,
+        count,
+        out=np.full(arr.shape, np.nan, dtype=np.float64),
+        where=count > 0.0,
+    )
+
+    out = arr - mean
+    out[~np.isfinite(arr)] = np.nan
+
+    return out.astype(np.float32)
+
+
+def compute_tri(dem: np.ndarray) -> np.ndarray:
+    """Riley Terrain Ruggedness Index using a 3x3 neighborhood.
+
+    TRI = sqrt(sum((z_neighbor - z_center)^2)) over finite surrounding
+    cells. The focal cell itself is excluded.
+    """
+    arr = np.asarray(dem, dtype=np.float64)
+    valid = np.isfinite(arr)
+
+    kernel = np.ones((3, 3), dtype=np.float64)
+    kernel[1, 1] = 0.0
+
+    values = np.where(valid, arr, 0.0)
+    values_sq = values * values
+
+    sum_z, count = _finite_neighborhood_sum(arr, kernel)
+
+    sum_z2 = convolve(
+        values_sq,
+        kernel,
+        mode="constant",
+        cval=0.0,
+    )
+
+    # sum((zi-z0)^2)
+    # = sum(zi^2) - 2*z0*sum(zi) + n*z0^2
+    center = np.where(valid, arr, 0.0)
+
+    ss = (
+        sum_z2
+        - 2.0 * center * sum_z
+        + count * center * center
+    )
+
+    # Protect against tiny negative roundoff.
+    ss = np.maximum(ss, 0.0)
+
+    out = np.sqrt(ss)
+    out[(~valid) | (count <= 0.0)] = np.nan
+
+    return out.astype(np.float32)
+
+
+def compute_roughness(dem: np.ndarray) -> np.ndarray:
+    """Terrain roughness as the elevation range of a 3x3 neighborhood.
+
+    Roughness is the difference between the maximum and minimum finite
+    elevations in the 3x3 window centered on each cell:
+
+        roughness = max(z_3x3) - min(z_3x3)
+
+    This is the Wilson et al./GDAL terrain-roughness definition.  With
+    compatible metric horizontal and vertical coordinates, output elevation
+    differences are expressed in the DEM vertical unit.
+
+    Missing neighbors are ignored where finite neighbors remain; the original
+    DEM nodata footprint is restored to NaN by the terrain processing path.
+    """
+    arr = np.asarray(dem, dtype=np.float64)
+    valid = np.isfinite(arr)
+
+    hi_source = np.where(valid, arr, -np.inf)
+    lo_source = np.where(valid, arr, np.inf)
+
+    local_max = maximum_filter(
+        hi_source,
+        size=3,
+        mode="constant",
+        cval=-np.inf,
+    )
+
+    local_min = minimum_filter(
+        lo_source,
+        size=3,
+        mode="constant",
+        cval=np.inf,
+    )
+
+    out = local_max - local_min
+    out[~valid] = np.nan
+
+    return out.astype(np.float32)
+
+
+def compute_local_relief(
+    dem: np.ndarray,
+    radius: int = 3,
+) -> np.ndarray:
+    """Local elevation range within a configurable square neighborhood."""
+    arr = np.asarray(dem, dtype=np.float64)
+    valid = np.isfinite(arr)
+
+    radius = max(1, int(radius))
+    size = 2 * radius + 1
+
+    hi_source = np.where(valid, arr, -np.inf)
+    lo_source = np.where(valid, arr, np.inf)
+
+    local_max = maximum_filter(
+        hi_source,
+        size=size,
+        mode="constant",
+        cval=-np.inf,
+    )
+
+    local_min = minimum_filter(
+        lo_source,
+        size=size,
+        mode="constant",
+        cval=np.inf,
+    )
+
+    out = local_max - local_min
+    out[~valid] = np.nan
+
+    return out.astype(np.float32)
 
 def compute_twi(dem: np.ndarray, dx: float, dy: float, eps: float = 1e-6) -> np.ndarray:
     sca, _best_slope = _specific_catchment_area(dem, dx, dy)
@@ -396,8 +773,24 @@ def _compute_terrain_array(
         )
     if product == "curvature":
         return compute_curvature(dem, dx, dy)
+    if product == "profile_curvature":
+        return compute_profile_curvature(dem, dx, dy)
+    if product == "tangential_curvature":
+        return compute_tangential_curvature(dem, dx, dy)
+    if product == "planform_curvature":
+        return compute_planform_curvature(dem, dx, dy)
+    if product == "mean_curvature":
+        return compute_mean_curvature(dem, dx, dy)
+    if product == "gaussian_curvature":
+        return compute_gaussian_curvature(dem, dx, dy)
     if product == "tpi":
         return compute_tpi(dem, radius=tpi_radius)
+    if product == "tri":
+        return compute_tri(dem)
+    if product == "roughness":
+        return compute_roughness(dem)
+    if product == "local_relief":
+        return compute_local_relief(dem, radius=tpi_radius)
     if product == "twi":
         return compute_twi(dem, dx, dy, eps=twi_eps)
     if product == "dtw":
@@ -407,17 +800,102 @@ def _compute_terrain_array(
     raise ValueError(f"Unsupported terrain product: {product}")
 
 
-def _process_dem_for_product(item: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+FAST_TERRAIN_SCHEMA = "1"
+
+
+def _terrain_provenance(item: dict[str, Any]) -> dict[str, str]:
+    """Return deterministic provenance tags for one terrain computation."""
+    dtw_max_distance = item.get("dtw_max_distance")
+
+    return {
+        "FASTGC_PRODUCT": "FAST_TERRAIN",
+        "FASTGC_TERRAIN_PRODUCT": str(item["product"]),
+        "FASTGC_ANALYTICAL_DOMAIN": str(
+            item.get("analytical_domain", "unspecified")
+        ),
+        "FASTGC_SOURCE_DEM": Path(item["dem_fp"]).name,
+        "FASTGC_TERRAIN_SCHEMA": FAST_TERRAIN_SCHEMA,
+        "FASTGC_HILLSHADE_AZIMUTH": str(
+            float(item["hillshade_azimuth"])
+        ),
+        "FASTGC_HILLSHADE_ALTITUDE": str(
+            float(item["hillshade_altitude"])
+        ),
+        "FASTGC_HILLSHADE_Z_FACTOR": str(
+            float(item["hillshade_z_factor"])
+        ),
+        "FASTGC_TPI_RADIUS_CELLS": str(
+            int(item["tpi_radius"])
+        ),
+        "FASTGC_TWI_EPS": str(
+            float(item["twi_eps"])
+        ),
+        "FASTGC_DTW_MAX_DISTANCE": (
+            "none"
+            if dtw_max_distance is None
+            else str(float(dtw_max_distance))
+        ),
+    }
+
+
+def _terrain_provenance_matches(
+    out_fp: Path,
+    expected: dict[str, str],
+) -> bool:
+    """Return True only when an existing raster has matching provenance."""
+    if not out_fp.exists() or not out_fp.is_file():
+        return False
+
+    try:
+        with rasterio.open(out_fp) as src:
+            actual = src.tags()
+    except Exception:
+        return False
+
+    return all(
+        actual.get(key) == str(value)
+        for key, value in expected.items()
+    )
+
+
+def _process_dem_for_product(
+    item: dict[str, Any],
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
     dem_fp = Path(item["dem_fp"])
     out_fp = Path(item["out_fp"])
     skip_existing = bool(item["skip_existing"])
     overwrite = bool(item["overwrite"])
 
-    if out_fp.exists() and out_fp.is_file() and skip_existing and not overwrite and not force:
-        return {"status": "skipped", "path": str(out_fp), "name": dem_fp.name}
+    provenance = _terrain_provenance(item)
 
-    dem, profile, transform, nodata = _read_dem(str(dem_fp))
-    valid_mask = _dem_valid_mask(dem, nodata)
+    if (
+        out_fp.exists()
+        and out_fp.is_file()
+        and skip_existing
+        and not overwrite
+        and not force
+        and _terrain_provenance_matches(
+            out_fp,
+            provenance,
+        )
+    ):
+        return {
+            "status": "skipped",
+            "path": str(out_fp),
+            "name": dem_fp.name,
+        }
+
+    dem, profile, transform, nodata = _read_dem(
+        str(dem_fp)
+    )
+
+    valid_mask = _dem_valid_mask(
+        dem,
+        nodata,
+    )
+
     dx, dy = _pixel_size(transform)
 
     arr = _compute_terrain_array(
@@ -425,17 +903,152 @@ def _process_dem_for_product(item: dict[str, Any], *, force: bool = False) -> di
         dem,
         dx,
         dy,
-        hillshade_azimuth=float(item["hillshade_azimuth"]),
-        hillshade_altitude=float(item["hillshade_altitude"]),
-        hillshade_z_factor=float(item["hillshade_z_factor"]),
-        tpi_radius=int(item["tpi_radius"]),
-        twi_eps=float(item["twi_eps"]),
-        dtw_max_distance=item["dtw_max_distance"],
+        hillshade_azimuth=float(
+            item["hillshade_azimuth"]
+        ),
+        hillshade_altitude=float(
+            item["hillshade_altitude"]
+        ),
+        hillshade_z_factor=float(
+            item["hillshade_z_factor"]
+        ),
+        tpi_radius=int(
+            item["tpi_radius"]
+        ),
+        twi_eps=float(
+            item["twi_eps"]
+        ),
+        dtw_max_distance=item[
+            "dtw_max_distance"
+        ],
     )
 
-    arr = _apply_valid_mask(arr, valid_mask, nodata)
-    _write_raster(arr, profile, str(out_fp), nodata=nodata)
-    return {"status": "ok", "path": str(out_fp), "name": dem_fp.name}
+    arr = _apply_valid_mask(
+        arr,
+        valid_mask,
+        nodata,
+    )
+
+    _write_raster(
+        arr,
+        profile,
+        str(out_fp),
+        nodata=nodata,
+        tags=provenance,
+    )
+
+    return {
+        "status": "ok",
+        "path": str(out_fp),
+        "name": dem_fp.name,
+    }
+
+
+def run_terrain_from_dem(
+    dem_fp: str | os.PathLike[str],
+    output_root: str | os.PathLike[str],
+    *,
+    terrain_products: list[str] | None = None,
+    hillshade_azimuth: float = 315.0,
+    hillshade_altitude: float = 45.0,
+    hillshade_z_factor: float = 1.0,
+    tpi_radius: int = 3,
+    twi_eps: float = 1e-6,
+    dtw_max_distance: float | None = None,
+    skip_existing: bool = False,
+    overwrite: bool = False,
+    n_jobs: int | None = None,
+    joblib_backend: str = "loky",
+    joblib_batch_size: int | str = "auto",
+    joblib_pre_dispatch: str = "2*n_jobs",
+) -> str:
+    """Derive FAST_TERRAIN products from one explicit DEM raster.
+
+    This entry point is intended for analytical domains that are already
+    represented by a single authoritative DEM, including the continuous
+    merged DEM produced by tile-run-merge.
+
+    The terrain mathematics is identical to tile processing because all
+    computation is delegated to _process_dem_for_product().
+    """
+    _require_rasterio()
+
+    dem_fp = Path(dem_fp)
+    if not dem_fp.exists() or not dem_fp.is_file():
+        raise FileNotFoundError(f"DEM raster not found: {dem_fp}")
+
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    requested = _resolve_terrain_products(terrain_products)
+
+    stage_banner(
+        "FAST_TERRAIN",
+        source=str(dem_fp),
+        total=1,
+        unit="DEM",
+        extra=f"products={', '.join(requested)}",
+    )
+
+    for product in requested:
+        out_dir = output_root / product
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Continuous-domain terrain keeps the established public merged
+        # naming convention:
+        #
+        #   <dataset>_FAST_TERRAIN_<product>.tif
+        #
+        # The source DEM is normally:
+        #
+        #   <dataset>_FAST_DEM.tif
+        #
+        # Only the output filename changes; computation still uses the
+        # authoritative merged DEM through _process_dem_for_product().
+        dem_stem = dem_fp.stem
+        if dem_stem.endswith("_FAST_DEM"):
+            dataset_stem = dem_stem[:-len("_FAST_DEM")]
+        else:
+            dataset_stem = dem_stem
+
+        out_fp = (
+            out_dir
+            / f"{dataset_stem}_FAST_TERRAIN_{product}{dem_fp.suffix}"
+        )
+
+        item = {
+            "dem_fp": str(dem_fp),
+            "out_fp": str(out_fp),
+            "product": product,
+            "analytical_domain": "continuous_merged_dem",
+            "skip_existing": skip_existing,
+            "overwrite": overwrite,
+            "hillshade_azimuth": hillshade_azimuth,
+            "hillshade_altitude": hillshade_altitude,
+            "hillshade_z_factor": hillshade_z_factor,
+            "tpi_radius": tpi_radius,
+            "twi_eps": twi_eps,
+            "dtw_max_distance": dtw_max_distance,
+        }
+
+        log_info(
+            f"Terrain product: {product} | "
+            f"DEM={dem_fp.name}"
+        )
+
+        run_stage(
+            stage_name=f"FAST-GC derive TERRAIN [{product}]",
+            items=[item],
+            worker=_process_dem_for_product,
+            item_name_fn=lambda d: Path(d["dem_fp"]).name,
+            unit="DEM",
+            n_jobs=n_jobs,
+            backend=joblib_backend,
+            batch_size=joblib_batch_size,
+            pre_dispatch=joblib_pre_dispatch,
+        )
+
+    return str(output_root)
 
 
 def run_terrain_from_processed_root(
@@ -487,6 +1100,7 @@ def run_terrain_from_processed_root(
                     "dem_fp": str(dem_fp),
                     "out_fp": str(out_fp),
                     "product": product,
+                    "analytical_domain": "buffered_dem_tile",
                     "skip_existing": skip_existing,
                     "overwrite": overwrite,
                     "hillshade_azimuth": hillshade_azimuth,
@@ -518,6 +1132,7 @@ __all__ = [
     "PRODUCT_TERRAIN",
     "TERRAIN_PRODUCT_CHOICES",
     "run_terrain_from_processed_root",
+    "run_terrain_from_dem",
     "compute_slope_percent",
     "compute_slope_degrees",
     "compute_aspect",
