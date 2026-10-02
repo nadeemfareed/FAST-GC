@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.signal import fftconvolve
 from scipy.ndimage import (
     convolve,
     distance_transform_edt,
@@ -34,6 +35,7 @@ TERRAIN_PRODUCT_CHOICES = {
     "mean_curvature",
     "gaussian_curvature",
     "tpi",
+    "multiscale_tpi",
     "tri",
     "roughness",
     "local_relief",
@@ -570,6 +572,86 @@ def compute_tpi(dem: np.ndarray, radius: int = 3) -> np.ndarray:
     return out.astype(np.float32)
 
 
+
+def _circular_metric_kernel(
+    radius_m: float,
+    dx: float,
+    dy: float,
+) -> np.ndarray:
+    """Circular Euclidean neighborhood in physical map units."""
+    radius_m = float(radius_m)
+    dx = abs(float(dx))
+    dy = abs(float(dy))
+
+    if not np.isfinite(radius_m) or radius_m <= 0.0:
+        raise ValueError("TPI physical radius must be finite and > 0.")
+    if dx <= 0.0 or dy <= 0.0:
+        raise ValueError("DEM pixel sizes must be > 0.")
+
+    rx = int(np.ceil(radius_m / dx))
+    ry = int(np.ceil(radius_m / dy))
+
+    x = np.arange(-rx, rx + 1, dtype=np.float64) * dx
+    y = np.arange(-ry, ry + 1, dtype=np.float64) * dy
+    xx, yy = np.meshgrid(x, y)
+
+    kernel = (
+        (xx * xx + yy * yy)
+        <= (radius_m * radius_m + 1.0e-12)
+    ).astype(np.float64)
+
+    # Exclude focal cell from surrounding-terrain mean.
+    kernel[ry, rx] = 0.0
+
+    return kernel
+
+
+def compute_multiscale_tpi(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+    radius_m: float,
+) -> np.ndarray:
+    """Physical-radius circular Topographic Position Index."""
+    arr = np.asarray(dem, dtype=np.float64)
+    valid = np.isfinite(arr)
+
+    kernel = _circular_metric_kernel(
+        radius_m,
+        dx,
+        dy,
+    )
+
+    values = np.where(valid, arr, 0.0)
+
+    total = fftconvolve(
+        values,
+        kernel,
+        mode="same",
+    )
+
+    count = fftconvolve(
+        valid.astype(np.float64),
+        kernel,
+        mode="same",
+    )
+
+    # Recover exact integer sample counts from FFT roundoff.
+    count = np.rint(count)
+
+    mean = np.divide(
+        total,
+        count,
+        out=np.full(arr.shape, np.nan, dtype=np.float64),
+        where=count > 0.0,
+    )
+
+    out = arr - mean
+    out[~valid] = np.nan
+
+    return out.astype(np.float32)
+
+
 def compute_tri(dem: np.ndarray) -> np.ndarray:
     """Riley Terrain Ruggedness Index using a 3x3 neighborhood.
 
@@ -753,6 +835,7 @@ def _compute_terrain_array(
     hillshade_altitude: float,
     hillshade_z_factor: float,
     tpi_radius: int,
+    multiscale_tpi_radius_m: float | None,
     twi_eps: float,
     dtw_max_distance: float | None,
 ) -> np.ndarray:
@@ -785,6 +868,17 @@ def _compute_terrain_array(
         return compute_gaussian_curvature(dem, dx, dy)
     if product == "tpi":
         return compute_tpi(dem, radius=tpi_radius)
+    if product == "multiscale_tpi":
+        if multiscale_tpi_radius_m is None:
+            raise ValueError(
+                "multiscale_tpi requires a physical radius in metres."
+            )
+        return compute_multiscale_tpi(
+            dem,
+            dx,
+            dy,
+            radius_m=multiscale_tpi_radius_m,
+        )
     if product == "tri":
         return compute_tri(dem)
     if product == "roughness":
@@ -826,6 +920,14 @@ def _terrain_provenance(item: dict[str, Any]) -> dict[str, str]:
         ),
         "FASTGC_TPI_RADIUS_CELLS": str(
             int(item["tpi_radius"])
+        ),
+        "FASTGC_MULTISCALE_TPI_RADIUS_M": (
+            "none"
+            if item.get("multiscale_tpi_radius_m") is None
+            else str(float(item["multiscale_tpi_radius_m"]))
+        ),
+        "FASTGC_MULTISCALE_TPI_GEOMETRY": (
+            "euclidean_circle_focal_excluded"
         ),
         "FASTGC_TWI_EPS": str(
             float(item["twi_eps"])
@@ -915,6 +1017,9 @@ def _process_dem_for_product(
         tpi_radius=int(
             item["tpi_radius"]
         ),
+        multiscale_tpi_radius_m=item.get(
+            "multiscale_tpi_radius_m"
+        ),
         twi_eps=float(
             item["twi_eps"]
         ),
@@ -944,6 +1049,56 @@ def _process_dem_for_product(
     }
 
 
+
+def _terrain_product_jobs(
+    requested: list[str],
+    multiscale_tpi_radii_m: tuple[float, ...],
+) -> list[tuple[str, float | None, str]]:
+    """Expand terrain products into deterministic output jobs."""
+    jobs: list[tuple[str, float | None, str]] = []
+
+    for product in requested:
+        if product != "multiscale_tpi":
+            jobs.append((product, None, product))
+            continue
+
+        radii = []
+        seen = set()
+
+        for radius in multiscale_tpi_radii_m:
+            radius = float(radius)
+
+            if not np.isfinite(radius) or radius <= 0.0:
+                raise ValueError(
+                    "Multiscale TPI radii must be finite and > 0 metres."
+                )
+
+            if radius in seen:
+                continue
+
+            seen.add(radius)
+            radii.append(radius)
+
+        if not radii:
+            raise ValueError(
+                "At least one multiscale TPI radius is required."
+            )
+
+        for radius in radii:
+            label = (
+                f"{radius:g}".replace(".", "p")
+            )
+            jobs.append(
+                (
+                    product,
+                    radius,
+                    f"multiscale_tpi_{label}m",
+                )
+            )
+
+    return jobs
+
+
 def run_terrain_from_dem(
     dem_fp: str | os.PathLike[str],
     output_root: str | os.PathLike[str],
@@ -953,6 +1108,7 @@ def run_terrain_from_dem(
     hillshade_altitude: float = 45.0,
     hillshade_z_factor: float = 1.0,
     tpi_radius: int = 3,
+    multiscale_tpi_radii_m: tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0),
     twi_eps: float = 1e-6,
     dtw_max_distance: float | None = None,
     skip_existing: bool = False,
@@ -990,8 +1146,13 @@ def run_terrain_from_dem(
         extra=f"products={', '.join(requested)}",
     )
 
-    for product in requested:
-        out_dir = output_root / product
+    product_jobs = _terrain_product_jobs(
+        requested,
+        multiscale_tpi_radii_m,
+    )
+
+    for product, multiscale_radius_m, output_label in product_jobs:
+        out_dir = output_root / output_label
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # Continuous-domain terrain keeps the established public merged
@@ -1013,7 +1174,7 @@ def run_terrain_from_dem(
 
         out_fp = (
             out_dir
-            / f"{dataset_stem}_FAST_TERRAIN_{product}{dem_fp.suffix}"
+            / f"{dataset_stem}_FAST_TERRAIN_{output_label}{dem_fp.suffix}"
         )
 
         item = {
@@ -1027,6 +1188,7 @@ def run_terrain_from_dem(
             "hillshade_altitude": hillshade_altitude,
             "hillshade_z_factor": hillshade_z_factor,
             "tpi_radius": tpi_radius,
+            "multiscale_tpi_radius_m": multiscale_radius_m,
             "twi_eps": twi_eps,
             "dtw_max_distance": dtw_max_distance,
         }
@@ -1059,6 +1221,7 @@ def run_terrain_from_processed_root(
     hillshade_altitude: float = 45.0,
     hillshade_z_factor: float = 1.0,
     tpi_radius: int = 3,
+    multiscale_tpi_radii_m: tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0),
     twi_eps: float = 1e-6,
     dtw_max_distance: float | None = None,
     skip_existing: bool = False,
@@ -1091,10 +1254,19 @@ def run_terrain_from_processed_root(
         extra=f"products={', '.join(requested)}",
     )
 
-    for product in requested:
+    product_jobs = _terrain_product_jobs(
+        requested,
+        multiscale_tpi_radii_m,
+    )
+
+    for product, multiscale_radius_m, output_label in product_jobs:
         items: list[dict[str, Any]] = []
         for dem_fp in dem_files:
-            out_fp = _terrain_output_path(processed_root, product, dem_fp.name)
+            out_fp = _terrain_output_path(
+                processed_root,
+                output_label,
+                dem_fp.name,
+            )
             items.append(
                 {
                     "dem_fp": str(dem_fp),
@@ -1107,6 +1279,7 @@ def run_terrain_from_processed_root(
                     "hillshade_altitude": hillshade_altitude,
                     "hillshade_z_factor": hillshade_z_factor,
                     "tpi_radius": tpi_radius,
+                    "multiscale_tpi_radius_m": multiscale_radius_m,
                     "twi_eps": twi_eps,
                     "dtw_max_distance": dtw_max_distance,
                 }
@@ -1139,6 +1312,7 @@ __all__ = [
     "compute_hillshade",
     "compute_curvature",
     "compute_tpi",
+    "compute_multiscale_tpi",
     "compute_twi",
     "compute_dtw",
     "compute_tci",

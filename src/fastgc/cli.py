@@ -431,6 +431,19 @@ def main(argv=None):
         help="Neighborhood radius in cells for TPI. Default: 3",
     )
     parser.add_argument(
+        "--multiscale_tpi_radii_m",
+        "--multiscale-tpi-radii-m",
+        dest="multiscale_tpi_radii_m",
+        nargs="+",
+        type=float,
+        default=[5.0, 10.0, 25.0, 50.0, 100.0],
+        help=(
+            "Physical radii in metres for multiscale TPI. "
+            "Default: 5 10 25 50 100"
+        ),
+    )
+
+    parser.add_argument(
         "--twi_eps",
         "--twi-eps",
         dest="twi_eps",
@@ -847,6 +860,7 @@ def main(argv=None):
         hillshade_altitude=args.hillshade_altitude,
         hillshade_z_factor=args.hillshade_z_factor,
         tpi_radius=args.tpi_radius,
+        multiscale_tpi_radii_m=tuple(args.multiscale_tpi_radii_m),
         twi_eps=args.twi_eps,
         dtw_max_distance=args.dtw_max_distance,
         change_input_type=args.change_input_type,
