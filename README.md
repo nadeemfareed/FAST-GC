@@ -1,31 +1,37 @@
 # FAST-GC
 
+```{=html}
 <p align="center">
-  <img src="docs/images/fastgc_banner.png" width="100%" alt="FAST-GC">
+```
+`<img src="docs/images/fastgc_banner.png" width="100%" alt="FAST-GC">`{=html}
+```{=html}
 </p>
-
+```
 ## Fully Adaptive Self-Tuning Ground Classification (FAST-GC)
 
-**Sensor-adaptive ground classification and LiDAR-derived geospatial products**
+**Sensor-adaptive ground classification, spatial LiDAR sampling, and
+LiDAR-derived geospatial products**
 
 FAST-GC is a Python-first framework for automated LiDAR ground
-classification and downstream terrain, surface, canopy,
-forest-structure, individual-tree, and raster change-analysis workflows.
+classification and downstream geospatial analysis. It supports airborne
+laser scanning (ALS), UAV laser scanning (ULS), and terrestrial laser
+scanning (TLS), and integrates ground classification with digital
+terrain and surface modeling, height normalization, canopy modeling,
+terrain geomorphometry, continuous-domain hydrology, forest structure,
+individual-tree workflows, raster change analysis, and FAST-GIS plot
+sampling and clipping.
 
-The core FAST-GC ground-classification algorithm is designed to adapt to
-LiDAR acquisition geometry, point-cloud characteristics, and terrain
-conditions while minimizing scene-specific manual tuning. FAST-GC
-supports airborne laser scanning (ALS), UAV laser scanning (ULS), and
-terrestrial laser scanning (TLS).
-
-FAST-GC 0.2.1 integrates optimized native execution for selected
-computational stages. Supported precompiled distributions use this
-automatically; normal users do not need to select or configure a
-computational backend.
+The core FAST-GC classifier adapts to acquisition geometry, point-cloud
+characteristics, and terrain conditions while minimizing scene-specific
+manual tuning. FAST-GC 0.2.1 also integrates optimized native execution
+for selected computational stages. Supported precompiled distributions
+use this automatically; normal users do not need to select or configure
+a computational backend.
 
 ## Scientific Reference
 
-The FAST-GC methodology is documented in the public preprint:
+The FAST-GC ground-classification methodology is documented in the
+public preprint:
 
 **Fareed, N.; Numata, I.; Silva, C. A.; Prichard, S. J. (2026).**\
 **FAST-GC: A Fully Adaptive Self-Tuning Ground Classification Algorithm
@@ -42,15 +48,25 @@ https://www.preprints.org/manuscript/202609.1631
 
 -   Self-tuning ground classification across ALS, ULS, and TLS point
     clouds
--   LAS/LAZ single-file and batch processing
--   Buffered tiling, parallel processing, and tile merging for large
-    datasets
--   Digital elevation and digital surface modeling
+-   LAS/LAZ single-file, folder, plot-collection, and large-area tiled
+    processing
+-   Buffered tiling, parallel processing, seam-aware merging, and
+    downstream derivation
+-   FAST-GIS spatial sampling, plot import, clipping, buffering, and
+    managed plot collections
+-   Digital elevation models (DEM) and digital surface models (DSM)
 -   Height-normalized LiDAR point clouds
--   Multiple canopy-height-model algorithms
--   Terrain derivatives and forest structural metrics
--   Individual-tree detection and tree-level point-cloud extraction
+-   Multiple canopy-height-model (CHM) algorithms
+-   Terrain morphology, curvature, ruggedness, relief, and multiscale
+    topographic metrics
+-   Continuous-domain D8/MFD hydrology, contributing area, flow length,
+    streams, watersheds, and terrain-hydrology indices
+-   Raster and vector hydrology outputs
+-   Forest structural metrics
+-   Individual-tree detection and crown workflows
+-   Individual-tree point-cloud extraction
 -   Multi-temporal raster change analysis
+-   CRS-aware geospatial processing and reproducible manifests
 
 ## Supported LiDAR Platforms
 
@@ -60,9 +76,9 @@ https://www.preprints.org/manuscript/202609.1631
   `ULS`         UAV / drone Laser Scanning
   `TLS`         Terrestrial Laser Scanning
 
-The acquisition platform is supplied through `--sensor_mode`, allowing
-FAST-GC to route the corresponding sensor-specific ground-classification
-workflow.
+The acquisition platform is supplied through `--sensor_mode`. FAST-GC
+routes the corresponding sensor-specific ground-classification workflow
+while downstream product interfaces remain consistent.
 
 # Installation
 
@@ -82,8 +98,8 @@ fastgc --help
 ```
 
 Supported precompiled wheels include the optimized execution components
-required for normal operation. No separate backend configuration is
-required.
+required for normal operation. No separate computational-backend
+configuration is required.
 
 ## GitHub Source
 
@@ -130,27 +146,166 @@ drive.mount("/content/drive")
 
 # Quick Start
 
+Ground classification:
+
 ``` bash
 fastgc \
   --in_path input.laz \
+  --out_dir output \
   --sensor_mode ALS \
   --products FAST_GC
 ```
 
+Ground classification plus terrain products:
+
+``` bash
+fastgc \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --products FAST_GC FAST_DEM FAST_TERRAIN \
+  --terrain_products slope_degrees aspect hillshade multiscale_tpi
+```
+
 The default product is `FAST_GC`. Input can be a LAS/LAZ file, folder,
-or existing processed-product root depending on the workflow.
+managed FAST-GIS plot collection, or existing processed-product root
+depending on the selected workflow.
 
-# FAST-GC Products
+# FAST-GIS --- Spatial Sampling and Plot Workflows
 
-FAST-GC provides ten integrated product families. Products can be
-requested individually or combined into end-to-end workflows.
+FAST-GIS is the spatial preparation layer integrated with FAST-GC. It is
+**not an additional `--products` family**. Instead, it prepares
+reproducible plot collections from LiDAR surveys and passes those
+collections into the normal FAST-GC processing system.
+
+FAST-GIS supports:
+
+-   random sampling over observed LiDAR coverage
+-   continuous optimized-coverage sampling
+-   rough-height-stratified circular sampling using an existing DSM
+-   imported plot polygons
+-   survey-aware multi-file clipping
+-   core-plus-buffer point extraction
+-   CRS-aware geometry handling
+-   circle, hexagon, square, rectangle, and ellipse plot geometries
+-   continuous-layout width, height, overlap, rotation, and phase
+    controls
+-   reproducible sampling and workspace manifests
+-   direct downstream processing through `--workflow plots-run`
+
+FAST-GIS collections preserve the authoritative core geometry separately
+from the processing buffer. Buffered points can therefore support
+neighborhood-sensitive processing while final raster products can be
+masked back to the intended core plot footprint.
+
+## FAST-GIS Sampling Concepts
+
+  -----------------------------------------------------------------------
+  Sampling mode                       Purpose
+  ----------------------------------- -----------------------------------
+  `random`                            Reproducible random plots over
+                                      observed LiDAR coverage
+
+  `continuous`                        Optimized continuous plot coverage
+                                      with configurable geometry,
+                                      overlap, and rotation
+
+  `rough_height_stratified`           Circular plots stratified using
+                                      rough DSM-relative height classes
+
+  `imported`                          Clip user-supplied polygon plots
+                                      from vector/CSV definitions
+  -----------------------------------------------------------------------
+
+Supported plot shapes are `circle`, `hexagon`, `square`, `rectangle`,
+and `ellipse`. Continuous sampling additionally supports explicit width,
+height, overlap, rotation, and phase-search controls.
+
+The integrated FAST-GIS command implementation is exposed through the
+FAST-GIS entry path associated with the installed FAST-GC package. Use
+the installed command help for the authoritative syntax of the current
+build.
+
+## FAST-GIS → FAST-GC Processing
+
+A FAST-GIS collection contains plot point clouds plus
+`plots_manifest.json` and plot metadata. Process the managed collection
+with:
+
+``` bash
+fastgc \
+  --in_path path/to/ALS_plots \
+  --workflow plots-run \
+  --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_CHM FAST_TERRAIN
+```
+
+For managed FAST-GIS collections, the sensor mode can be read from
+`plots_manifest.json`. External independent plot LAS/LAZ collections can
+also use `plots-run`, but should provide `--sensor_mode`.
+
+Conceptually:
+
+``` text
+LiDAR survey / survey tiles
+          |
+          v
+       FAST-GIS
+          |
+          +--> survey catalog / CRS validation
+          +--> sampling or imported plot geometry
+          +--> core + processing buffer
+          +--> clipped plot point clouds
+          +--> plots_manifest.json + plot metadata
+          |
+          v
+  fastgc --workflow plots-run
+          |
+          v
+   normal FAST-GC products
+```
+
+# FAST-GC Product Families
+
+FAST-GC exposes ten integrated product families through `--products`.
+Products can be requested individually or combined according to their
+dependencies.
+
+  -----------------------------------------------------------------------
+  Product                             Purpose
+  ----------------------------------- -----------------------------------
+  `FAST_GC`                           Sensor-adaptive ground / non-ground
+                                      classification
+
+  `FAST_DEM`                          Bare-earth digital elevation model
+
+  `FAST_NORMALIZED`                   Terrain-normalized LiDAR point
+                                      cloud
+
+  `FAST_DSM`                          Upper-surface digital surface model
+
+  `FAST_CHM`                          Canopy height modeling
+
+  `FAST_TERRAIN`                      Terrain geomorphometry and
+                                      continuous-domain hydrology
+
+  `FAST_STRUCTURE`                    Forest structural metrics
+
+  `FAST_ITD`                          Individual-tree detection / crown
+                                      workflows
+
+  `FAST_TREECLOUDS`                   Individual-tree point-cloud
+                                      extraction
+
+  `FAST_CHANGE`                       Multi-temporal raster change
+                                      analysis
+  -----------------------------------------------------------------------
 
 ## FAST_GC --- Ground Classification
 
 `FAST_GC` is the core product: multi-stage, sensor-adaptive
-ground/non-ground classification for ALS, ULS, and TLS point clouds. The
-resulting classified terrain points support downstream
-terrain-referenced products.
+ground/non-ground classification for ALS, ULS, and TLS point clouds.
+Classified ground points provide the terrain reference used by
+downstream products.
 
 ``` bash
 fastgc \
@@ -184,7 +339,7 @@ fastgc \
 ## FAST_NORMALIZED --- Height-Normalized Point Cloud
 
 `FAST_NORMALIZED` references point elevations to the local terrain
-surface, creating above-ground heights for canopy, structure, and
+surface, producing above-ground heights for canopy, structure, and
 tree-level analysis.
 
 ``` bash
@@ -214,12 +369,10 @@ fastgc \
   --dsm_method max
 ```
 
-
-
 ## FAST_CHM --- Canopy Height Models
 
 `FAST_CHM` generates canopy-height surfaces from terrain-referenced
-LiDAR. Current methods include:
+LiDAR.
 
   Method               Processing concept
   -------------------- ---------------------------------------
@@ -242,18 +395,55 @@ fastgc \
   --out_dir output \
   --sensor_mode ALS \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_CHM \
-  --chm_methods p2r p99 pitfree
+  --chm_methods p2r p99 pitfree adaptive_pitfree
 ```
 
 ![FAST-GC canopy height model](docs/images/FAST_CHM.png)
 
+# FAST_TERRAIN --- Terrain and Hydrology
 
+`FAST_TERRAIN` is the integrated terrain-analysis family. It operates
+from `FAST_DEM` and contains both local terrain geomorphometry and
+continuous-domain hydrological analysis.
 
-## FAST_TERRAIN --- Terrain Derivatives
+The release separates two concepts:
 
-`FAST_TERRAIN` derives terrain descriptors from the elevation surface:
-slope percent, slope degrees, aspect, hillshade, curvature, TPI, TWI,
-DTW, and TCI.
+1.  **Established local/core terrain products** --- selected
+    individually or with `--terrain_products all`.
+2.  **Continuous-domain hydrology products** --- selected explicitly and
+    derived from an authoritative continuous DEM.
+
+This distinction is important. `--terrain_products all` intentionally
+refers to the established local/core terrain set; it should not be
+interpreted as automatically requesting every continuous hydrology
+product.
+
+## Terrain Morphometry
+
+Available terrain descriptors include:
+
+-   `slope_percent`
+-   `slope_degrees`
+-   `aspect`
+-   `hillshade`
+-   `curvature` --- retained legacy Laplacian curvature
+-   `profile_curvature`
+-   `tangential_curvature`
+-   `planform_curvature`
+-   `mean_curvature`
+-   `gaussian_curvature`
+-   `tpi`
+-   `multiscale_tpi`
+-   `positive_openness`
+-   `negative_openness`
+-   `tri`
+-   `roughness`
+-   `local_relief`
+-   legacy-compatible `twi`
+-   legacy-compatible `dtw`
+-   `tci`
+
+Example:
 
 ``` bash
 fastgc \
@@ -261,17 +451,175 @@ fastgc \
   --out_dir output \
   --sensor_mode ALS \
   --products FAST_GC FAST_DEM FAST_TERRAIN \
-  --terrain_products all
+  --terrain_products slope_degrees aspect hillshade profile_curvature \
+                     planform_curvature multiscale_tpi positive_openness \
+                     negative_openness tri roughness local_relief
+```
+
+Default physical scales for multiscale TPI and openness can be
+overridden:
+
+``` bash
+--multiscale_tpi_radii_m 5 10 25 50 100
+--openness_radii_m 5 10 25 50 100
 ```
 
 ![FAST-GC terrain products](docs/images/FAST_SLOPE.png)
 
+## Continuous-Domain Hydrology
+
+The expanded FAST_TERRAIN hydrology system includes:
+
+### DEM conditioning
+
+-   `conditioned_dem`
+-   `depression_depth`
+
+### D8 flow routing
+
+-   `d8_flow_direction`
+-   `d8_flow_accumulation`
+-   `d8_contributing_area`
+-   `d8_specific_catchment_area`
+-   `d8_downslope_flow_length`
+-   `d8_longest_upslope_flow_length`
+
+### Multiple-flow-direction routing
+
+-   `mfd_flow_accumulation`
+-   `mfd_contributing_area`
+-   `mfd_specific_catchment_area`
+
+### Stream network
+
+-   `stream_mask`
+-   `strahler_stream_order`
+-   `stream_link_id`
+
+### Catchments and drainage structure
+
+-   `basin_id`
+-   `subcatchment_id`
+-   `watershed_boundary`
+
+### Hydrologic / erosion-related indices
+
+-   `topographic_wetness_index`
+-   `stream_power_index`
+-   `rusle_s_factor`
+-   `contributing_area_ls_factor`
+
+Continuous hydrology products are requested explicitly. For example:
+
+``` bash
+fastgc \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --products FAST_GC FAST_DEM FAST_TERRAIN \
+  --terrain_products conditioned_dem depression_depth \
+                     d8_flow_direction d8_flow_accumulation \
+                     d8_contributing_area d8_specific_catchment_area \
+                     mfd_flow_accumulation mfd_contributing_area \
+                     stream_mask strahler_stream_order stream_link_id \
+                     basin_id subcatchment_id watershed_boundary \
+                     topographic_wetness_index stream_power_index \
+                     d8_downslope_flow_length d8_longest_upslope_flow_length \
+                     rusle_s_factor contributing_area_ls_factor
+```
+
+## Raster and Vector Hydrology
+
+FAST_TERRAIN supports:
+
+``` bash
+--terrain_output raster
+--terrain_output vector
+--terrain_output both
+```
+
+The default is `raster`.
+
+Vector hydrology is generated from the authoritative continuous DEM.
+Stream-network extraction can be controlled with:
+
+``` bash
+--stream_threshold_area_m2 1000
+--stream_min_order 1
+```
+
+`--stream_threshold_area_m2` defines the minimum contributing area used
+for the analytical stream network. `--stream_min_order` controls the
+minimum Strahler order exported to vector stream layers and does not
+alter the complete analytical raster.
+
+Example requesting terrain hydrology plus vector output:
+
+``` bash
+fastgc \
+  --in_path input.laz \
+  --out_dir output \
+  --sensor_mode ALS \
+  --products FAST_GC FAST_DEM FAST_TERRAIN \
+  --terrain_products conditioned_dem d8_flow_direction \
+                     d8_contributing_area stream_mask \
+                     strahler_stream_order stream_link_id \
+                     basin_id subcatchment_id watershed_boundary \
+                     topographic_wetness_index stream_power_index \
+  --terrain_output both \
+  --stream_threshold_area_m2 1000 \
+  --stream_min_order 1
+```
+
+## Why FAST_TERRAIN Uses the Merged DEM
+
+For tiled large-area workflows, ordinary products can be processed
+tile-by-tile and merged according to their product semantics.
+Hydrological terrain analysis is different because flow topology must
+remain continuous across tile boundaries.
+
+FAST-GC therefore treats the final `FAST_DEM` mosaic as the
+authoritative continuous terrain surface for merged FAST_TERRAIN
+derivation. Final continuous-domain FAST_TERRAIN products are
+regenerated from the successfully merged DEM rather than being created
+by simply mosaicking independently derived hydrology tiles.
+
+Conceptually:
+
+``` text
+Buffered LiDAR tiles
+       |
+       v
+   FAST_GC tiles
+       |
+       v
+   FAST_DEM tiles
+       |
+       v
+  MERGED FAST_DEM
+       |
+       +--------------------------+
+       |                          |
+       v                          v
+Terrain morphometry      Continuous hydrology
+                                  |
+                    +-------------+-------------+
+                    |             |             |
+                   D8            MFD        Streams /
+                                             Basins /
+                                           Watersheds
+```
+
+This continuous-domain rule is especially important for flow direction,
+accumulation, contributing area, stream topology, watersheds, flow
+length, and related indices.
+
 ## FAST_STRUCTURE --- Forest Structure
 
-`FAST_STRUCTURE` derives spatial forest-structure metrics from an
-existing `FAST_NORMALIZED` point cloud, including canopy cover, mean
-height, maximum height, height standard deviation, foliage height
-diversity (FHD), vertical complexity index (VCI), and point count.
+`FAST_STRUCTURE` derives spatial forest-structure metrics from
+`FAST_NORMALIZED`, including canopy cover, mean height, maximum height,
+height standard deviation, foliage height diversity (FHD), vertical
+complexity index (VCI), and point count.
 
 ``` bash
 fastgc \
@@ -282,19 +630,14 @@ fastgc \
   --structure_products all
 ```
 
-
-
 ## FAST_ITD --- Individual Tree Detection
 
 `FAST_ITD` provides individual-tree detection workflows using
-canopy-height or compatible surface information. Watershed-based and
-Yun2021 workflows also support crown delineation; `lmf` provides treetop
-detection. The currently implemented public workflows include
-local-maxima filtering (`lmf`), watershed (`watershed`), adaptive
-watershed (`adaptive_watershed`), and the Yun et al. (2021) workflow
-(`yun2021`). The ITD dispatcher is intentionally extensible so
-additional tree segmentation methods can be integrated as they are
-implemented and validated.
+canopy-height or compatible surface information. The established public
+workflows include local-maxima filtering (`lmf`), watershed
+(`watershed`), adaptive watershed (`adaptive_watershed`), and the Yun et
+al. (2021) workflow (`yun2021`). Watershed-based workflows can support
+crown delineation, while `lmf` provides treetop detection.
 
 ``` bash
 fastgc \
@@ -306,7 +649,9 @@ fastgc \
   --itd_method watershed
 ```
 
-
+The CLI may expose additional dispatcher method names for development or
+compatibility. A method should only be treated as an established
+workflow when its implementation is available and validated.
 
 ## FAST_TREECLOUDS --- Individual-Tree Point Clouds
 
@@ -323,8 +668,6 @@ fastgc \
   --treeclouds_las_source FAST_NORMALIZED \
   --treeclouds_write_individual
 ```
-
-
 
 ## FAST_CHANGE --- Raster Change Analysis
 
@@ -343,71 +686,93 @@ fastgc \
   --change_mode sequential
 ```
 
+# Overall Processing Architecture
 
-
-# Processing Architecture
-
-FAST-GC separates raw-LiDAR/core processing from products that depend on
-previously derived surfaces or point-cloud products. The core processing
-stage comprises `FAST_GC`, `FAST_DEM`, `FAST_NORMALIZED`, `FAST_DSM`,
-`FAST_CHM`, and `FAST_TERRAIN`. `FAST_STRUCTURE` is derived from
-height-normalized point clouds. `FAST_ITD`, `FAST_TREECLOUDS`, and
-`FAST_CHANGE` operate on compatible derived products.
+FAST-GC separates spatial preparation, raw-LiDAR processing,
+terrain-referenced derivation, and specialized downstream analysis.
 
 ``` text
-Input LAS / LAZ
-       |
-       +----------------------------> FAST_DSM
-       |
-       v
-    FAST_GC
-       |
-       v
-    FAST_DEM ----------------------> FAST_TERRAIN
-       |
-       v
- FAST_NORMALIZED
-       |
-       +----------------------------> FAST_CHM
-       |                                  |
-       |                                  v
-       |                              FAST_ITD
-       |                                  |
-       |                                  v
-       |                          FAST_TREECLOUDS
-       |
-       +----------------------------> FAST_STRUCTURE
+                    LiDAR survey / LAS / LAZ
+                              |
+              +---------------+---------------+
+              |                               |
+              | optional                      | direct
+              v                               |
+           FAST-GIS                           |
+   sampling / imported plots                  |
+   clipping / core + buffer                   |
+   manifests / plot collections               |
+              |                               |
+              +---------------+---------------+
+                              |
+                              v
+                           FAST_GC
+                     ground classification
+                              |
+              +---------------+----------------+
+              |                                |
+              v                                v
+           FAST_DEM                          FAST_DSM
+              |                                |
+      +-------+---------+                      |
+      |                 |                      |
+      v                 v                      |
+FAST_NORMALIZED    FAST_TERRAIN                 |
+      |            terrain + hydrology         |
+      |                 |                      |
+      |        authoritative merged DEM        |
+      |        for continuous hydrology        |
+      |                                        |
+ +----+--------------+                         |
+ |                   |                         |
+ v                   v                         |
+FAST_CHM       FAST_STRUCTURE                   |
+ |                                             |
+ v                                             |
+FAST_ITD <-------------------------------------+
+ |
+ v
+FAST_TREECLOUDS
 
-Compatible raster observations ------> FAST_CHANGE
+Compatible DEM / DSM / CHM / TERRAIN rasters
+                     |
+                     v
+                 FAST_CHANGE
 ```
 
-Not every product requires every preceding stage. For example, DSM
-generation can operate directly on a point cloud, whereas
-normalized-height products require a terrain reference.
+Not every product requires every preceding stage. For example,
+`FAST_DSM` can operate directly on a point cloud, while
+`FAST_NORMALIZED` requires a terrain reference. FAST_TERRAIN depends on
+`FAST_DEM`; continuous-domain terrain hydrology uses the authoritative
+merged DEM in merged/tiled workflows.
 
 # Workflow Modes
 
-  ---------------------------------------------------------------------
-  Workflow                           Purpose
-  ---------------------------------- ----------------------------------
-  `run`                              Process an input file or
-                                     collection directly
+  -----------------------------------------------------------------------
+  Workflow                            Purpose
+  ----------------------------------- -----------------------------------
+  `run`                               Process an input file or collection
+                                      directly
 
-  `tile-only`                        Create buffered processing tiles
-                                     without deriving products
+  `plots-run`                         Process managed FAST-GIS plots or
+                                      external independent plot point
+                                      clouds
 
-  `tile-run`                         Tile and process without final
-                                     merging
+  `tile-only`                         Create buffered processing tiles
+                                      without deriving products
 
-  `tile-run-merge`                   Tile, process, and merge final
-                                     outputs
+  `tile-run`                          Tile and process without final
+                                      merging
 
-  `merge`                            Merge previously processed tiled
-                                     outputs
+  `tile-run-merge`                    Tile, process, merge, and derive
+                                      final merged products
 
-  `derive-only`                      Derive downstream products from
-                                     existing FAST-GC outputs
-  ---------------------------------------------------------------------
+  `merge`                             Merge previously processed tiled
+                                      outputs
+
+  `derive-only`                       Derive downstream products from
+                                      existing compatible FAST-GC outputs
+  -----------------------------------------------------------------------
 
 # Processing Scenarios
 
@@ -436,7 +801,16 @@ fastgc \
   --recursive
 ```
 
-## 3. Large Dataset --- Tiling Only
+## 3. FAST-GIS Managed Plot Collection
+
+``` bash
+fastgc \
+  --in_path path/to/ULS_plots \
+  --workflow plots-run \
+  --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_CHM
+```
+
+## 4. Large Dataset --- Tiling Only
 
 ``` bash
 fastgc \
@@ -448,7 +822,7 @@ fastgc \
   --buffer_m 5
 ```
 
-## 4. Tile and Process
+## 5. Tile and Process
 
 ``` bash
 fastgc \
@@ -461,7 +835,7 @@ fastgc \
   --products FAST_GC FAST_DEM FAST_NORMALIZED
 ```
 
-## 5. Complete Tile → Process → Merge
+## 6. Complete Tile → Process → Merge
 
 ``` bash
 fastgc \
@@ -476,30 +850,38 @@ fastgc \
   --jobs 0
 ```
 
-## 6. Complete Core-Product Workflow
+This produces the established local/core FAST_TERRAIN set. Add
+continuous hydrology products explicitly when they are required.
 
-For a large raw LiDAR dataset, the following workflow derives the six
-core products in one tiled run and merges the final outputs:
+## 7. Large-Area Terrain + Hydrology
 
 ``` bash
 fastgc \
-  --in_path input.laz \
+  --in_path large_input.laz \
   --out_dir output \
   --sensor_mode ALS \
   --workflow tile-run-merge \
   --tile_size_m 100 \
   --buffer_m 5 \
-  --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_CHM FAST_TERRAIN \
-  --terrain_products all \
+  --products FAST_GC FAST_DEM FAST_TERRAIN \
+  --terrain_products slope_degrees aspect hillshade multiscale_tpi \
+                     conditioned_dem depression_depth \
+                     d8_flow_direction d8_contributing_area \
+                     mfd_contributing_area \
+                     stream_mask strahler_stream_order stream_link_id \
+                     basin_id subcatchment_id watershed_boundary \
+                     topographic_wetness_index stream_power_index \
+                     rusle_s_factor contributing_area_ls_factor \
+  --terrain_output both \
+  --stream_threshold_area_m2 1000 \
+  --stream_min_order 1 \
   --jobs 0
 ```
 
-`FAST_STRUCTURE`, `FAST_ITD`, `FAST_TREECLOUDS`, and `FAST_CHANGE` are
-specialized or downstream products and should be requested through their
-appropriate workflows rather than treating every product as a single
-raw-LiDAR processing stage.
+The merged `FAST_DEM` becomes the authoritative surface for the final
+continuous-domain FAST_TERRAIN analysis.
 
-## 7. Multiple CHMs in One Run
+## 8. Multiple CHMs in One Run
 
 ``` bash
 fastgc \
@@ -510,7 +892,7 @@ fastgc \
   --chm_methods p2r p99 pitfree adaptive_pitfree
 ```
 
-## 8. Derive Products Without Re-running Ground Classification
+## 9. Derive Products Without Re-running Ground Classification
 
 ``` bash
 fastgc \
@@ -533,7 +915,7 @@ fastgc \
   --structure_products all
 ```
 
-## 9. Merge Existing Tiled Results
+## 10. Merge Existing Tiled Results
 
 ``` bash
 fastgc \
@@ -543,7 +925,7 @@ fastgc \
   --products FAST_GC FAST_DEM FAST_NORMALIZED FAST_DSM FAST_TERRAIN
 ```
 
-## 10. Individual-Tree Workflow
+## 11. Individual-Tree Workflow
 
 ``` bash
 fastgc \
@@ -555,7 +937,7 @@ fastgc \
   --itd_method watershed
 ```
 
-## 11. Raster Change Workflow
+## 12. Raster Change Workflow
 
 ``` bash
 fastgc \
@@ -567,7 +949,7 @@ fastgc \
   --change_mode sequential
 ```
 
-## 12. Google Colab / Google Drive
+## 13. Google Colab / Google Drive
 
 ``` bash
 !fastgc \
@@ -604,6 +986,8 @@ Explicit worker counts can also be supplied with `--jobs`.
 
 # Typical Output Organization
 
+Depending on requested products, an output workspace can contain:
+
 ``` text
 FASTGC_output/
 |
@@ -613,6 +997,21 @@ FASTGC_output/
 +-- FAST_DSM/
 +-- FAST_CHM/
 +-- FAST_TERRAIN/
+|   +-- slope_degrees/
+|   +-- aspect/
+|   +-- curvature/
+|   +-- multiscale_tpi/
+|   +-- positive_openness/
+|   +-- negative_openness/
+|   +-- conditioned_dem/
+|   +-- d8_flow_direction/
+|   +-- d8_contributing_area/
+|   +-- stream_mask/
+|   +-- strahler_stream_order/
+|   +-- basin_id/
+|   +-- watershed_boundary/
+|   +-- ...
++-- FAST_TERRAIN_HYDROLOGY_VECTOR/
 +-- FAST_STRUCTURE/
 +-- FAST_ITD/
 +-- FAST_TREECLOUDS/
@@ -621,7 +1020,46 @@ FASTGC_output/
 
 Point-cloud products are written as LAS/LAZ outputs and raster products
 as geospatial raster outputs according to the selected workflow.
+FAST_TERRAIN vector hydrology is routed separately from raster terrain
+products.
 
+A FAST-GIS workspace additionally maintains sampling/plot metadata such
+as:
+
+``` text
+FAST_GIS_workspace/
+|
++-- workspace_manifest.json
++-- sampling_manifest.json
++-- sample_plots.geojson
++-- ALS_plots/  (or ULS_plots / TLS_plots)
+    +-- plots_manifest.json
+    +-- Plot_001/
+    +-- Plot_002/
+    +-- ...
+```
+
+# Important Terrain/Hydrology Notes
+
+-   `FAST_TERRAIN` depends on `FAST_DEM`.
+-   `--terrain_products all` means the established local/core terrain
+    set; continuous hydrology products are requested explicitly.
+-   Continuous hydrology is derived from an authoritative continuous
+    DEM.
+-   In tiled merged workflows, final continuous-domain FAST_TERRAIN
+    products are derived from the merged FAST_DEM rather than mosaicked
+    from independently derived hydrology tiles.
+-   `--terrain_output raster` is the default.
+-   `--terrain_output vector` and `--terrain_output both` enable vector
+    hydrology generation.
+-   `--stream_threshold_area_m2` controls the analytical stream-network
+    contributing-area threshold.
+-   `--stream_min_order` controls the minimum Strahler order exported to
+    vector streams without changing the complete analytical raster.
+-   Multiscale TPI and openness use physical radii in metres.
+-   Categorical hydrology products preserve categorical raster semantics
+    rather than being treated as ordinary continuous floating-point
+    surfaces.
 
 # Command-Line Reference
 
@@ -638,10 +1076,38 @@ Check the installed version with:
 fastgc --version
 ```
 
-Advanced options are available for CHM generation, terrain products,
-ITD, forest structure, tree-cloud extraction, raster change analysis,
-tiling, and parallel processing.
+Major option groups include:
 
+-   sensor and workflow selection
+-   product selection
+-   DEM / DSM rasterization
+-   CHM generation
+-   terrain and hydrology products
+-   raster/vector terrain output
+-   stream-network controls
+-   multiscale TPI and openness
+-   forest structure
+-   ITD
+-   tree-cloud extraction
+-   raster change analysis
+-   tiling and parallel execution
+
+# Release Validation
+
+FAST-GC release development uses automated regression tests covering
+core routing, CLI contracts, CRS propagation, FAST-GIS behavior, terrain
+product registration, DEM dependencies, terrain raster semantics, D8 and
+MFD hydrology, DEM conditioning, flats, streams, Strahler ordering,
+stream links, watersheds, vector topology, flow length, TWI/SPI,
+RUSLE-related products, openness, and output routing.
+
+Users developing from source should run:
+
+``` bash
+python -m pytest -q
+```
+
+before packaging or publishing modified builds.
 
 # Citation
 
@@ -666,7 +1132,6 @@ https://github.com/nadeemfareed/FAST-GC/issues
 
 # Author
 
-
 FAST-GC was conceived, developed, implemented, and is maintained by
 **Nadeem Fareed**.
 
@@ -674,7 +1139,7 @@ Copyright © 2026 Nadeem Fareed.
 
 # License
 
- licensed under the
-**GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**.
+FAST-GC is licensed under the **GNU Affero General Public License v3.0
+or later (AGPL-3.0-or-later)**.
 
 See `LICENSE` for the complete license terms.

@@ -16,6 +16,7 @@ dependencies:
   - lazrs>=0.7,<1.0
   - rasterio>=1.5,<2.0
   - pyogrio>=0.13,<1.0
+  - geopandas>=1.0,<2.0
   - shapely>=2.0.6,<3.0
   - tqdm>=4.66,<5.0
   - joblib>=1.4,<2.0

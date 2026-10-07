@@ -398,6 +398,43 @@ def main(argv=None):
         choices=TERRAIN_PRODUCT_CHOICES,
         help="Terrain products to generate when FAST_TERRAIN is requested.",
     )
+
+    parser.add_argument(
+        "--terrain_output",
+        "--terrain-output",
+        dest="terrain_output",
+        choices=("raster", "vector", "both"),
+        default="raster",
+        help=(
+            "FAST_TERRAIN output representation. "
+            "Default: raster. Vector hydrology is generated from the "
+            "authoritative continuous DEM."
+        ),
+    )
+
+    parser.add_argument(
+        "--stream_threshold_area_m2",
+        "--stream-threshold-area-m2",
+        dest="stream_threshold_area_m2",
+        type=float,
+        default=1000.0,
+        help=(
+            "Minimum contributing area in square metres used to define "
+            "the analytical stream network. Default: 1000."
+        ),
+    )
+
+    parser.add_argument(
+        "--stream_min_order",
+        "--stream-min-order",
+        dest="stream_min_order",
+        type=int,
+        default=1,
+        help=(
+            "Minimum Strahler order exported to vector stream layers. "
+            "Does not alter the complete analytical raster. Default: 1."
+        ),
+    )
     parser.add_argument(
         "--hillshade_azimuth",
         "--hillshade-azimuth",
@@ -440,6 +477,19 @@ def main(argv=None):
         help=(
             "Physical radii in metres for multiscale TPI. "
             "Default: 5 10 25 50 100"
+        ),
+    )
+
+    parser.add_argument(
+        "--openness_radii_m",
+        "--openness-radii-m",
+        dest="openness_radii_m",
+        nargs="+",
+        type=float,
+        default=[5.0, 10.0, 25.0, 50.0, 100.0],
+        help=(
+            "Physical search radii in metres for positive/negative "
+            "openness. Default: 5 10 25 50 100"
         ),
     )
 
@@ -856,11 +906,15 @@ def main(argv=None):
         chm_fill_ground_voids_zero=args.chm_fill_ground_voids_zero,
         chm_void_ground_threshold=args.chm_void_ground_threshold,
         terrain_products=args.terrain_products,
+        terrain_output=args.terrain_output,
+        stream_threshold_area_m2=args.stream_threshold_area_m2,
+        stream_min_order=args.stream_min_order,
         hillshade_azimuth=args.hillshade_azimuth,
         hillshade_altitude=args.hillshade_altitude,
         hillshade_z_factor=args.hillshade_z_factor,
         tpi_radius=args.tpi_radius,
         multiscale_tpi_radii_m=tuple(args.multiscale_tpi_radii_m),
+        openness_radii_m=tuple(args.openness_radii_m),
         twi_eps=args.twi_eps,
         dtw_max_distance=args.dtw_max_distance,
         change_input_type=args.change_input_type,

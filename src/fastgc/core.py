@@ -34,6 +34,7 @@ from .monster import (
 from .preprocess import tile_las_dataset
 from .structure import run_structure_from_root
 from .terrain import run_terrain_from_dem, run_terrain_from_processed_root
+from .terrain import run_hydrology_vector_from_dem
 from .treeclouds import PRODUCT_TREECLOUDS, run_treeclouds_from_root
 
 PRODUCT_TERRAIN = "FAST_TERRAIN"
@@ -650,6 +651,8 @@ def _run_processing_with_optional_fpfix(
     hillshade_altitude: float,
     hillshade_z_factor: float,
     tpi_radius: int,
+    multiscale_tpi_radii_m=None,
+    openness_radii_m=None,
     twi_eps: float,
     dtw_max_distance: float | None,
     structure_products: list[str] | None,
@@ -694,6 +697,19 @@ def _run_processing_with_optional_fpfix(
         )
 
     base_products = [p for p in resolved_products if p in {PRODUCT_GC, PRODUCT_DEM, PRODUCT_NORMALIZED, PRODUCT_DSM}]
+
+    # Dependency invariant:
+    # FAST_DEM is derived from FAST_GC ground-classified points in original
+    # elevation coordinates. FAST_NORMALIZED is NOT a FAST_DEM prerequisite.
+    if (
+        PRODUCT_DEM in resolved_products
+        and PRODUCT_NORMALIZED not in resolved_products
+        and PRODUCT_NORMALIZED in base_products
+    ):
+        raise RuntimeError(
+            "Internal dependency error: FAST_DEM unexpectedly requested "
+            "FAST_NORMALIZED."
+        )
 
     # False-positive suppression is now part of the internal terrain-manifold
     # classification path. Legacy Python arguments remain accepted only for
@@ -756,6 +772,7 @@ def _run_processing_with_optional_fpfix(
             hillshade_z_factor=hillshade_z_factor,
             tpi_radius=tpi_radius,
             multiscale_tpi_radii_m=multiscale_tpi_radii_m,
+            openness_radii_m=openness_radii_m,
             twi_eps=twi_eps,
             dtw_max_distance=dtw_max_distance,
             n_jobs=n_jobs,
@@ -899,11 +916,15 @@ def run_fastgc(
     chm_fill_ground_voids_zero: bool = True,
     chm_void_ground_threshold: float = 0.15,
     terrain_products: list[str] | None = None,
+    terrain_output: str = "raster",
+    stream_threshold_area_m2: float = 1000.0,
+    stream_min_order: int = 1,
     hillshade_azimuth: float = 315.0,
     hillshade_altitude: float = 45.0,
     hillshade_z_factor: float = 1.0,
     tpi_radius: int = 3,
     multiscale_tpi_radii_m: tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0),
+    openness_radii_m: tuple[float, ...] | list[float] | None = None,
     twi_eps: float = 1e-6,
     dtw_max_distance: float | None = None,
     structure_products: list[str] | None = None,
@@ -1101,6 +1122,7 @@ def run_fastgc(
                 hillshade_z_factor=hillshade_z_factor,
                 tpi_radius=tpi_radius,
             multiscale_tpi_radii_m=multiscale_tpi_radii_m,
+            openness_radii_m=openness_radii_m,
                 twi_eps=twi_eps,
                 dtw_max_distance=dtw_max_distance,
                 structure_products=structure_products,
@@ -1237,6 +1259,7 @@ def run_fastgc(
             hillshade_z_factor=hillshade_z_factor,
             tpi_radius=tpi_radius,
             multiscale_tpi_radii_m=multiscale_tpi_radii_m,
+            openness_radii_m=openness_radii_m,
             twi_eps=twi_eps,
             dtw_max_distance=dtw_max_distance,
             structure_products=structure_products,
@@ -1335,24 +1358,38 @@ def run_fastgc(
 
             merged_terrain_root = merge_root / PRODUCT_TERRAIN
 
-            run_terrain_from_dem(
-                dem_fp=merged_dem_fp,
-                output_root=merged_terrain_root,
-                terrain_products=terrain_products,
-                hillshade_azimuth=hillshade_azimuth,
-                hillshade_altitude=hillshade_altitude,
-                hillshade_z_factor=hillshade_z_factor,
-                tpi_radius=tpi_radius,
-            multiscale_tpi_radii_m=multiscale_tpi_radii_m,
-                twi_eps=twi_eps,
-                dtw_max_distance=dtw_max_distance,
-                skip_existing=skip_existing,
-                overwrite=overwrite,
-                n_jobs=n_jobs,
-                joblib_backend=joblib_backend,
-                joblib_batch_size=joblib_batch_size,
-                joblib_pre_dispatch=joblib_pre_dispatch,
-            )
+            if terrain_output in {"raster", "both"}:
+                run_terrain_from_dem(
+                    dem_fp=merged_dem_fp,
+                    output_root=merged_terrain_root,
+                    terrain_products=terrain_products,
+                    hillshade_azimuth=hillshade_azimuth,
+                    hillshade_altitude=hillshade_altitude,
+                    hillshade_z_factor=hillshade_z_factor,
+                    tpi_radius=tpi_radius,
+                multiscale_tpi_radii_m=multiscale_tpi_radii_m,
+                openness_radii_m=openness_radii_m,
+                    twi_eps=twi_eps,
+                    dtw_max_distance=dtw_max_distance,
+                    stream_threshold_area_m2=stream_threshold_area_m2,
+                    skip_existing=skip_existing,
+                    overwrite=overwrite,
+                    n_jobs=n_jobs,
+                    joblib_backend=joblib_backend,
+                    joblib_batch_size=joblib_batch_size,
+                    joblib_pre_dispatch=joblib_pre_dispatch,
+                )
+
+            if terrain_output in {"vector", "both"}:
+                vector_fp = run_hydrology_vector_from_dem(
+                    dem_fp=merged_dem_fp,
+                    output_root=merged_terrain_root,
+                    stream_threshold_area_m2=stream_threshold_area_m2,
+                    stream_min_order=stream_min_order,
+                )
+                merged_outputs[
+                    f"{PRODUCT_TERRAIN}_HYDROLOGY_VECTOR"
+                ] = str(vector_fp)
             if merged_terrain_root.exists():
                 for terrain_dir in sorted(merged_terrain_root.iterdir()):
                     if not terrain_dir.is_dir():
@@ -1655,6 +1692,7 @@ def run_fastgc(
                 hillshade_z_factor=hillshade_z_factor,
                 tpi_radius=tpi_radius,
             multiscale_tpi_radii_m=multiscale_tpi_radii_m,
+            openness_radii_m=openness_radii_m,
                 twi_eps=twi_eps,
                 dtw_max_distance=dtw_max_distance,
                 n_jobs=n_jobs,
@@ -1881,6 +1919,7 @@ def run_fastgc(
                 hillshade_z_factor=hillshade_z_factor,
                 tpi_radius=tpi_radius,
             multiscale_tpi_radii_m=multiscale_tpi_radii_m,
+            openness_radii_m=openness_radii_m,
                 twi_eps=twi_eps,
                 dtw_max_distance=dtw_max_distance,
                 structure_products=structure_products,

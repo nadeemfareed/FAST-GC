@@ -134,3 +134,10 @@ FASTGC_ALS_*/
 
 # Local Rust build artifacts
 /native/target/
+
+# FAST-GC generated tile workspaces
+ALS_tiles/
+ULS_tiles/
+TLS_tiles/
+BAD_SENSOR_tiles/
+dist_repaired/

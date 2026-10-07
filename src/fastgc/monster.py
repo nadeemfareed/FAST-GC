@@ -633,6 +633,28 @@ class ProgressDashboard:
 
         except Exception:
             return False
+    def _stdout_safe_text(self, text: str) -> str:
+        """Return text guaranteed encodable by the active stdout stream."""
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        try:
+            text.encode(encoding, errors="strict")
+            return text
+        except (UnicodeEncodeError, LookupError):
+            # Preserve useful ASCII approximations for the dashboard bar,
+            # then replace any remaining unsupported characters rather than
+            # allowing progress rendering to terminate processing.
+            text = (
+                text
+                .replace("\u2588", "#")
+                .replace("\u2591", "-")
+            )
+            try:
+                return text.encode(encoding, errors="replace").decode(
+                    encoding, errors="replace"
+                )
+            except LookupError:
+                return text.encode("ascii", errors="replace").decode("ascii")
+
     def _write_line(self, line: str) -> None:
         if not self.enabled:
             return
@@ -640,21 +662,13 @@ class ProgressDashboard:
         if self._native_win and self._write_native_windows(line):
             return
 
+        safe_line = self._stdout_safe_text(line)
+
         if self._tty:
             #
             # Native Windows consoles are handled above through WriteConsoleW.
             # For any remaining TTY, keep the dynamic single-line dashboard,
             # but never allow the terminal encoding to terminate processing.
-            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-            try:
-                safe_line = line.encode(encoding, errors="strict").decode(encoding)
-            except (UnicodeEncodeError, LookupError):
-                safe_line = (
-                    line
-                    .replace("\u2588", "#")
-                    .replace("\u2591", "-")
-                )
-
             sys.stdout.write("\r\x1b[2K" + safe_line)
             sys.stdout.flush()
             self._drawn = True
@@ -670,7 +684,7 @@ class ProgressDashboard:
             or (now - self._last_snapshot_time) >= 10.0
         )
         if should_emit:
-            sys.stdout.write(line + "\n")
+            sys.stdout.write(safe_line + "\n")
             sys.stdout.flush()
             self._last_snapshot_done = self.done
             self._last_snapshot_time = now

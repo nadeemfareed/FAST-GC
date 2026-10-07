@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import os
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,33 @@ except Exception:  # pragma: no cover
     rasterio = None
 
 from .monster import log_info, run_stage, stage_banner
+from .hydrology import (
+    condition_dem,
+    contributing_area_ls_factor,
+    d8_basin_labels,
+    d8_contributing_area,
+    d8_downslope_flow_length,
+    d8_flow_accumulation,
+    d8_flow_direction_resolved,
+    d8_longest_upslope_flow_length,
+    d8_specific_catchment_area,
+    extract_d8_stream_network,
+    mfd_contributing_area,
+    mfd_flow_accumulation,
+    mfd_specific_catchment_area,
+    rusle_s_factor,
+    stream_power_index,
+    subcatchment_labels,
+    topographic_wetness_index,
+    watershed_boundary_mask,
+)
+from .terrain_vector import (
+    labels_to_polygons,
+    polygon_boundaries,
+    stream_lines_from_topology,
+    stream_nodes_to_points,
+    write_geopackage_layer,
+)
 
 PRODUCT_TERRAIN = "FAST_TERRAIN"
 
@@ -36,13 +65,96 @@ TERRAIN_PRODUCT_CHOICES = {
     "gaussian_curvature",
     "tpi",
     "multiscale_tpi",
+    "positive_openness",
+    "negative_openness",
     "tri",
     "roughness",
     "local_relief",
     "twi",
     "dtw",
     "tci",
+
+    # Continuous-domain hydrology.
+    "conditioned_dem",
+    "depression_depth",
+    "d8_flow_direction",
+    "d8_flow_accumulation",
+    "d8_contributing_area",
+    "d8_specific_catchment_area",
+    "mfd_flow_accumulation",
+    "mfd_contributing_area",
+    "mfd_specific_catchment_area",
+    "stream_mask",
+    "strahler_stream_order",
+    "stream_link_id",
+    "basin_id",
+    "watershed_boundary",
+    "subcatchment_id",
+    "topographic_wetness_index",
+    "stream_power_index",
+    "d8_downslope_flow_length",
+    "d8_longest_upslope_flow_length",
+    "rusle_s_factor",
+    "contributing_area_ls_factor",
 }
+
+
+# Public FAST_TERRAIN product families.
+#
+# "all" intentionally means the established local/core terrain set.
+# It must remain safe for ordinary buffered tile processing.
+#
+# Continuous hydrology is requested explicitly and is derived only from
+# an authoritative continuous DEM.
+#
+# Legacy products remain available for backward compatibility but are
+# never silently selected by "all".
+FAST_TERRAIN_ALL_PRODUCTS = (
+    "slope_percent",
+    "slope_degrees",
+    "aspect",
+    "hillshade",
+    "curvature",
+    "profile_curvature",
+    "tangential_curvature",
+    "planform_curvature",
+    "mean_curvature",
+    "gaussian_curvature",
+    "tpi",
+    "tri",
+    "roughness",
+    "local_relief",
+)
+
+FAST_TERRAIN_LEGACY_PRODUCTS = frozenset({
+    "twi",
+    "dtw",
+    "tci",
+})
+
+FAST_TERRAIN_CONTINUOUS_HYDROLOGY_PRODUCTS = frozenset({
+    "conditioned_dem",
+    "depression_depth",
+    "d8_flow_direction",
+    "d8_flow_accumulation",
+    "d8_contributing_area",
+    "d8_specific_catchment_area",
+    "mfd_flow_accumulation",
+    "mfd_contributing_area",
+    "mfd_specific_catchment_area",
+    "stream_mask",
+    "strahler_stream_order",
+    "stream_link_id",
+    "basin_id",
+    "watershed_boundary",
+    "subcatchment_id",
+    "topographic_wetness_index",
+    "stream_power_index",
+    "d8_downslope_flow_length",
+    "d8_longest_upslope_flow_length",
+    "rusle_s_factor",
+    "contributing_area_ls_factor",
+})
 
 
 def _require_rasterio():
@@ -54,31 +166,21 @@ def _resolve_terrain_products(products: list[str] | None) -> list[str]:
     requested = list(products or ["all"])
 
     if "all" in requested:
-        return [
-            "slope_percent",
-            "slope_degrees",
-            "aspect",
-            "hillshade",
-            "curvature",
-            "profile_curvature",
-            "tangential_curvature",
-            "planform_curvature",
-            "mean_curvature",
-            "gaussian_curvature",
-            "tpi",
-            "tri",
-            "roughness",
-            "local_relief",
-        ]
+        return list(FAST_TERRAIN_ALL_PRODUCTS)
 
     out: list[str] = []
     seen: set[str] = set()
-    for p in requested:
-        if p not in TERRAIN_PRODUCT_CHOICES:
-            raise ValueError(f"Unsupported terrain product: {p}")
-        if p not in seen:
-            out.append(p)
-            seen.add(p)
+
+    for product in requested:
+        if product not in TERRAIN_PRODUCT_CHOICES:
+            raise ValueError(
+                f"Unsupported terrain product: {product}"
+            )
+
+        if product not in seen:
+            out.append(product)
+            seen.add(product)
+
     return out
 
 
@@ -104,18 +206,22 @@ def _write_raster(
     _require_rasterio()
     os.makedirs(os.path.dirname(out_fp), exist_ok=True)
 
+    arr_out = np.asarray(arr)
+
     profile_out = profile.copy()
     profile_out.update(
-        dtype="float32",
+        dtype=arr_out.dtype.name,
         count=1,
         compress="lzw",
     )
 
     if nodata is not None:
         profile_out["nodata"] = nodata
+    else:
+        profile_out.pop("nodata", None)
 
     with rasterio.open(out_fp, "w", **profile_out) as dst:
-        dst.write(arr.astype(np.float32), 1)
+        dst.write(arr_out, 1)
 
         if tags:
             dst.update_tags(
@@ -652,6 +758,317 @@ def compute_multiscale_tpi(
     return out.astype(np.float32)
 
 
+
+def _openness_direction_offsets(
+    radius_m: float,
+    dx: float,
+    dy: float,
+    directions: int = 8,
+) -> list[list[tuple[int, int, float]]]:
+    """Build unique raster offsets for directional openness rays."""
+    radius_m = float(radius_m)
+    dx = abs(float(dx))
+    dy = abs(float(dy))
+    directions = int(directions)
+
+    if not np.isfinite(radius_m) or radius_m <= 0.0:
+        raise ValueError("Openness radius must be finite and > 0 metres.")
+
+    if dx <= 0.0 or dy <= 0.0:
+        raise ValueError("DEM pixel sizes must be > 0.")
+
+    if directions < 4:
+        raise ValueError("Openness requires at least 4 directions.")
+
+    step = min(dx, dy)
+
+    n_steps = int(
+        np.floor(
+            radius_m / step + 1.0e-12
+        )
+    )
+
+    all_offsets: list[list[tuple[int, int, float]]] = []
+
+    for k in range(directions):
+        azimuth = (
+            2.0 * np.pi * float(k) / float(directions)
+        )
+
+        cells: dict[tuple[int, int], float] = {}
+
+        for step_index in range(1, n_steps + 1):
+            distance = float(step_index) * step
+
+            dc = int(
+                round(
+                    distance * np.sin(azimuth) / dx
+                )
+            )
+
+            dr = int(
+                round(
+                    -distance * np.cos(azimuth) / dy
+                )
+            )
+
+            if dr == 0 and dc == 0:
+                continue
+
+            horizontal = float(
+                np.hypot(
+                    float(dc) * dx,
+                    float(dr) * dy,
+                )
+            )
+
+            # Exact physical-radius boundary.
+            if (
+                horizontal <= 0.0
+                or horizontal > radius_m + 1.0e-12
+            ):
+                continue
+
+            cells[(dr, dc)] = horizontal
+
+        offsets = [
+            (dr, dc, horizontal)
+            for (dr, dc), horizontal in cells.items()
+        ]
+
+        offsets.sort(key=lambda x: x[2])
+        all_offsets.append(offsets)
+
+    return all_offsets
+
+
+def compute_openness(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+    radius_m: float,
+    *,
+    directions: int = 8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute positive and negative topographic openness.
+
+    Returns
+    -------
+    positive_openness, negative_openness : ndarray
+        Angular openness in degrees.
+
+    Notes
+    -----
+    Uses directional horizon angles following the Yokoyama-style
+    openness definition. The search scale is a physical Euclidean
+    radius and rasterized cells outside that radius are excluded.
+    """
+    z = np.asarray(dem, dtype=np.float64)
+    valid = np.isfinite(z)
+
+    positive_sum = np.zeros(
+        z.shape,
+        dtype=np.float64,
+    )
+
+    negative_sum = np.zeros(
+        z.shape,
+        dtype=np.float64,
+    )
+
+    direction_count = np.zeros(
+        z.shape,
+        dtype=np.int16,
+    )
+
+    offsets_by_direction = _openness_direction_offsets(
+        radius_m,
+        dx,
+        dy,
+        directions=directions,
+    )
+
+    rows, cols = z.shape
+
+    for offsets in offsets_by_direction:
+
+        max_up = np.full(
+            z.shape,
+            -np.inf,
+            dtype=np.float64,
+        )
+
+        max_down = np.full(
+            z.shape,
+            -np.inf,
+            dtype=np.float64,
+        )
+
+        found = np.zeros(
+            z.shape,
+            dtype=bool,
+        )
+
+        for dr, dc, horizontal in offsets:
+
+            src_r0 = max(0, -dr)
+            src_r1 = min(rows, rows - dr)
+
+            src_c0 = max(0, -dc)
+            src_c1 = min(cols, cols - dc)
+
+            if (
+                src_r0 >= src_r1
+                or src_c0 >= src_c1
+            ):
+                continue
+
+            dst_r0 = src_r0 + dr
+            dst_r1 = src_r1 + dr
+
+            dst_c0 = src_c0 + dc
+            dst_c1 = src_c1 + dc
+
+            center = z[
+                src_r0:src_r1,
+                src_c0:src_c1,
+            ]
+
+            neighbor = z[
+                dst_r0:dst_r1,
+                dst_c0:dst_c1,
+            ]
+
+            pair_valid = (
+                np.isfinite(center)
+                & np.isfinite(neighbor)
+            )
+
+            if not np.any(pair_valid):
+                continue
+
+            dz = neighbor - center
+
+            up = np.arctan2(
+                dz,
+                horizontal,
+            )
+
+            down = np.arctan2(
+                -dz,
+                horizontal,
+            )
+
+            up_target = max_up[
+                src_r0:src_r1,
+                src_c0:src_c1,
+            ]
+
+            down_target = max_down[
+                src_r0:src_r1,
+                src_c0:src_c1,
+            ]
+
+            found_target = found[
+                src_r0:src_r1,
+                src_c0:src_c1,
+            ]
+
+            np.maximum(
+                up_target,
+                up,
+                out=up_target,
+                where=pair_valid,
+            )
+
+            np.maximum(
+                down_target,
+                down,
+                out=down_target,
+                where=pair_valid,
+            )
+
+            found_target |= pair_valid
+
+        positive_direction = (
+            90.0 - np.degrees(max_up)
+        )
+
+        negative_direction = (
+            90.0 - np.degrees(max_down)
+        )
+
+        positive_sum[found] += positive_direction[found]
+        negative_sum[found] += negative_direction[found]
+
+        direction_count[found] += 1
+
+    positive = np.divide(
+        positive_sum,
+        direction_count,
+        out=np.full(
+            z.shape,
+            np.nan,
+            dtype=np.float64,
+        ),
+        where=direction_count > 0,
+    )
+
+    negative = np.divide(
+        negative_sum,
+        direction_count,
+        out=np.full(
+            z.shape,
+            np.nan,
+            dtype=np.float64,
+        ),
+        where=direction_count > 0,
+    )
+
+    positive[~valid] = np.nan
+    negative[~valid] = np.nan
+
+    return (
+        positive.astype(np.float32),
+        negative.astype(np.float32),
+    )
+
+
+def compute_positive_openness(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+    radius_m: float,
+    *,
+    directions: int = 8,
+) -> np.ndarray:
+    return compute_openness(
+        dem,
+        dx,
+        dy,
+        radius_m,
+        directions=directions,
+    )[0]
+
+
+def compute_negative_openness(
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+    radius_m: float,
+    *,
+    directions: int = 8,
+) -> np.ndarray:
+    return compute_openness(
+        dem,
+        dx,
+        dy,
+        radius_m,
+        directions=directions,
+    )[1]
+
+
 def compute_tri(dem: np.ndarray) -> np.ndarray:
     """Riley Terrain Ruggedness Index using a 3x3 neighborhood.
 
@@ -825,6 +1242,248 @@ def _terrain_output_path(processed_root: Path, product_name: str, dem_name: str)
     return processed_root / PRODUCT_TERRAIN / product_name / dem_name
 
 
+
+HYDROLOGY_TERRAIN_PRODUCTS = {
+    "conditioned_dem",
+    "depression_depth",
+    "d8_flow_direction",
+    "d8_flow_accumulation",
+    "d8_contributing_area",
+    "d8_specific_catchment_area",
+    "mfd_flow_accumulation",
+    "mfd_contributing_area",
+    "mfd_specific_catchment_area",
+    "stream_mask",
+    "strahler_stream_order",
+    "stream_link_id",
+    "basin_id",
+    "watershed_boundary",
+    "subcatchment_id",
+    "topographic_wetness_index",
+    "stream_power_index",
+    "d8_downslope_flow_length",
+    "d8_longest_upslope_flow_length",
+    "rusle_s_factor",
+    "contributing_area_ls_factor",
+}
+
+
+if HYDROLOGY_TERRAIN_PRODUCTS != set(
+    FAST_TERRAIN_CONTINUOUS_HYDROLOGY_PRODUCTS
+):
+    raise RuntimeError(
+        "FAST_TERRAIN hydrology product registries are inconsistent."
+    )
+
+
+def _compute_hydrology_array(
+    product: str,
+    dem: np.ndarray,
+    dx: float,
+    dy: float,
+    *,
+    stream_threshold_area_m2: float = 1000.0,
+    mfd_exponent: float = 1.1,
+    twi_min_slope_radians: float = 1.0e-6,
+    ls_m: float = 0.4,
+    ls_n: float = 1.3,
+) -> np.ndarray:
+    """Compute one continuous-domain FAST_TERRAIN hydrology product."""
+
+    if product not in HYDROLOGY_TERRAIN_PRODUCTS:
+        raise ValueError(
+            f"Unsupported hydrology terrain product: {product}"
+        )
+
+    z = np.asarray(dem, dtype=np.float64)
+
+    conditioned, depth = condition_dem(z)
+
+    if product == "conditioned_dem":
+        return conditioned
+
+    if product == "depression_depth":
+        return depth
+
+    direction, receiver = d8_flow_direction_resolved(
+        conditioned,
+        dx,
+        dy,
+    )
+
+    if product == "d8_flow_direction":
+        return direction.astype(np.float64)
+
+    accumulation = d8_flow_accumulation(
+        conditioned,
+        dx,
+        dy,
+        receiver=receiver,
+    )
+
+    if product == "d8_flow_accumulation":
+        return accumulation
+
+    area = d8_contributing_area(
+        conditioned,
+        dx,
+        dy,
+        accumulation=accumulation,
+    )
+
+    if product == "d8_contributing_area":
+        return area
+
+    sca = d8_specific_catchment_area(
+        conditioned,
+        dx,
+        dy,
+        accumulation=accumulation,
+    )
+
+    if product == "d8_specific_catchment_area":
+        return sca
+
+    if product in {
+        "mfd_flow_accumulation",
+        "mfd_contributing_area",
+        "mfd_specific_catchment_area",
+    }:
+        mfd_acc = mfd_flow_accumulation(
+            conditioned,
+            dx,
+            dy,
+            exponent=mfd_exponent,
+        )
+
+        if product == "mfd_flow_accumulation":
+            return mfd_acc
+
+        mfd_area = mfd_contributing_area(
+            conditioned,
+            dx,
+            dy,
+            exponent=mfd_exponent,
+            accumulation=mfd_acc,
+        )
+
+        if product == "mfd_contributing_area":
+            return mfd_area
+
+        return mfd_specific_catchment_area(
+            conditioned,
+            dx,
+            dy,
+            exponent=mfd_exponent,
+            accumulation=mfd_acc,
+        )
+
+    if product in {
+        "stream_mask",
+        "strahler_stream_order",
+        "stream_link_id",
+        "subcatchment_id",
+    }:
+        streams = extract_d8_stream_network(
+            area,
+            receiver,
+            threshold_area=stream_threshold_area_m2,
+        )
+
+        stream_mask = streams["stream_mask"]
+
+        if product == "stream_mask":
+            return stream_mask.astype(np.float64)
+
+        if product == "strahler_stream_order":
+            return streams["stream_order"].astype(
+                np.float64
+            )
+
+        if product == "stream_link_id":
+            return streams["stream_link"].astype(
+                np.float64
+            )
+
+        return subcatchment_labels(
+            stream_mask,
+            receiver,
+        ).astype(np.float64)
+
+    if product in {
+        "basin_id",
+        "watershed_boundary",
+    }:
+        basin = d8_basin_labels(
+            conditioned,
+            receiver,
+        )
+
+        if product == "basin_id":
+            return basin.astype(np.float64)
+
+        return watershed_boundary_mask(
+            basin
+        ).astype(np.float64)
+
+    # Slope for hydrologic indices is calculated from the
+    # conditioned analytical surface.
+    slope_degrees = compute_slope_degrees(
+        conditioned,
+        dx,
+        dy,
+    ).astype(np.float64)
+
+    slope_radians = np.deg2rad(
+        slope_degrees
+    )
+
+    if product == "topographic_wetness_index":
+        return topographic_wetness_index(
+            sca,
+            slope_radians,
+            min_slope_radians=twi_min_slope_radians,
+        )
+
+    if product == "stream_power_index":
+        return stream_power_index(
+            sca,
+            slope_radians,
+        )
+
+    if product == "d8_downslope_flow_length":
+        return d8_downslope_flow_length(
+            conditioned,
+            receiver,
+            dx,
+            dy,
+        )
+
+    if product == "d8_longest_upslope_flow_length":
+        return d8_longest_upslope_flow_length(
+            conditioned,
+            receiver,
+            dx,
+            dy,
+        )
+
+    if product == "rusle_s_factor":
+        return rusle_s_factor(
+            slope_radians
+        )
+
+    if product == "contributing_area_ls_factor":
+        return contributing_area_ls_factor(
+            sca,
+            slope_radians,
+            m=ls_m,
+            n=ls_n,
+        )
+
+    raise ValueError(
+        f"Unhandled hydrology terrain product: {product}"
+    )
+
 def _compute_terrain_array(
     product: str,
     dem: np.ndarray,
@@ -836,9 +1495,22 @@ def _compute_terrain_array(
     hillshade_z_factor: float,
     tpi_radius: int,
     multiscale_tpi_radius_m: float | None,
+    openness_radius_m: float | None,
     twi_eps: float,
     dtw_max_distance: float | None,
+    stream_threshold_area_m2: float = 1000.0,
 ) -> np.ndarray:
+    if product in HYDROLOGY_TERRAIN_PRODUCTS:
+        return _compute_hydrology_array(
+            product,
+            dem,
+            dx,
+            dy,
+            stream_threshold_area_m2=(
+                stream_threshold_area_m2
+            ),
+        )
+
     if product == "slope_percent":
         return compute_slope_percent(dem, dx, dy)
     if product == "slope_degrees":
@@ -879,6 +1551,29 @@ def _compute_terrain_array(
             dy,
             radius_m=multiscale_tpi_radius_m,
         )
+
+    if product in {
+        "positive_openness",
+        "negative_openness",
+    }:
+        if openness_radius_m is None:
+            raise ValueError(
+                f"{product} requires a physical radius in metres."
+            )
+
+        positive, negative = compute_openness(
+            dem,
+            dx,
+            dy,
+            radius_m=openness_radius_m,
+            directions=8,
+        )
+
+        if product == "positive_openness":
+            return positive
+
+        return negative
+
     if product == "tri":
         return compute_tri(dem)
     if product == "roughness":
@@ -894,14 +1589,116 @@ def _compute_terrain_array(
     raise ValueError(f"Unsupported terrain product: {product}")
 
 
-FAST_TERRAIN_SCHEMA = "1"
+FAST_TERRAIN_SCHEMA = "2"
+
+_CATEGORICAL_TERRAIN_RASTER_SPEC: dict[str, tuple[str, int]] = {
+    "d8_flow_direction": ("uint8", 255),
+    "stream_mask": ("uint8", 255),
+    "watershed_boundary": ("uint8", 255),
+    "strahler_stream_order": ("uint16", 65535),
+    "stream_link_id": ("int32", -1),
+    "basin_id": ("int32", -1),
+    "subcatchment_id": ("int32", -1),
+}
+
+
+def _terrain_raster_storage(
+    product: str,
+) -> tuple[str, int | float | None]:
+    """Return on-disk dtype and nodata for a terrain product."""
+    spec = _CATEGORICAL_TERRAIN_RASTER_SPEC.get(product)
+    if spec is not None:
+        return spec
+    return "float32", None
+
+
+def _prepare_terrain_raster_output(
+    product: str,
+    arr: np.ndarray,
+    valid_mask: np.ndarray,
+    source_nodata: float | int | None,
+) -> tuple[np.ndarray, float | int | None]:
+    """Prepare scientifically explicit raster storage semantics."""
+    spec = _CATEGORICAL_TERRAIN_RASTER_SPEC.get(product)
+
+    if spec is None:
+        out = _apply_valid_mask(
+            arr,
+            valid_mask,
+            source_nodata,
+        )
+        return np.asarray(out, dtype=np.float32), source_nodata
+
+    dtype_name, categorical_nodata = spec
+    dtype = np.dtype(dtype_name)
+
+    work = np.asarray(arr, dtype=np.float64)
+    out = np.full(
+        work.shape,
+        categorical_nodata,
+        dtype=dtype,
+    )
+
+    finite_valid = valid_mask & np.isfinite(work)
+
+    if np.any(finite_valid):
+        values = work[finite_valid]
+
+        # Categorical hydrology outputs must represent exact integer codes/IDs.
+        rounded = np.rint(values)
+        if not np.allclose(values, rounded, rtol=0.0, atol=1.0e-9):
+            raise ValueError(
+                f"{product} produced non-integer categorical values."
+            )
+
+        info = np.iinfo(dtype)
+        if np.any(rounded < info.min) or np.any(rounded > info.max):
+            raise OverflowError(
+                f"{product} values exceed storage range for {dtype_name}."
+            )
+
+        # Protect the reserved nodata sentinel.
+        if np.any(rounded == categorical_nodata):
+            raise OverflowError(
+                f"{product} produced the reserved nodata value "
+                f"{categorical_nodata}."
+            )
+
+        out[finite_valid] = rounded.astype(dtype)
+
+    return out, categorical_nodata
 
 
 def _terrain_provenance(item: dict[str, Any]) -> dict[str, str]:
     """Return deterministic provenance tags for one terrain computation."""
     dtw_max_distance = item.get("dtw_max_distance")
+    product = str(item["product"])
 
-    return {
+    hydrology_tags: dict[str, str] = {}
+
+    if product in HYDROLOGY_TERRAIN_PRODUCTS:
+        hydrology_tags = {
+            "FASTGC_HYDRO_CONDITIONING": "priority_flood",
+            "FASTGC_HYDRO_CONNECTIVITY": "8",
+            "FASTGC_HYDRO_D8_FLAT_RESOLUTION": "barnes_style_flat_mask_open_boundary",
+            "FASTGC_HYDRO_STREAM_THRESHOLD_M2": str(
+                float(item.get("stream_threshold_area_m2", 1000.0))
+            ),
+            "FASTGC_HYDRO_MFD_EXPONENT": str(
+                float(item.get("mfd_exponent", 1.1))
+            ),
+            "FASTGC_HYDRO_TWI_MIN_SLOPE_RAD": str(
+                float(item.get("twi_min_slope_radians", 1.0e-6))
+            ),
+            "FASTGC_HYDRO_LS_M": str(
+                float(item.get("ls_m", 0.4))
+            ),
+            "FASTGC_HYDRO_LS_N": str(
+                float(item.get("ls_n", 1.3))
+            ),
+        }
+
+    provenance = {
         "FASTGC_PRODUCT": "FAST_TERRAIN",
         "FASTGC_TERRAIN_PRODUCT": str(item["product"]),
         "FASTGC_ANALYTICAL_DOMAIN": str(
@@ -929,6 +1726,16 @@ def _terrain_provenance(item: dict[str, Any]) -> dict[str, str]:
         "FASTGC_MULTISCALE_TPI_GEOMETRY": (
             "euclidean_circle_focal_excluded"
         ),
+        "FASTGC_OPENNESS_RADIUS_M": (
+            "none"
+            if item.get("openness_radius_m") is None
+            else str(float(item["openness_radius_m"]))
+        ),
+        "FASTGC_OPENNESS_DIRECTIONS": "8",
+        "FASTGC_OPENNESS_UNITS": "degrees",
+        "FASTGC_OPENNESS_RADIUS_GEOMETRY": (
+            "physical_euclidean_exact_clip"
+        ),
         "FASTGC_TWI_EPS": str(
             float(item["twi_eps"])
         ),
@@ -938,6 +1745,9 @@ def _terrain_provenance(item: dict[str, Any]) -> dict[str, str]:
             else str(float(dtw_max_distance))
         ),
     }
+
+    provenance.update(hydrology_tags)
+    return provenance
 
 
 def _terrain_provenance_matches(
@@ -1020,15 +1830,22 @@ def _process_dem_for_product(
         multiscale_tpi_radius_m=item.get(
             "multiscale_tpi_radius_m"
         ),
+        openness_radius_m=item.get(
+            "openness_radius_m"
+        ),
         twi_eps=float(
             item["twi_eps"]
         ),
         dtw_max_distance=item[
             "dtw_max_distance"
         ],
+        stream_threshold_area_m2=float(
+            item.get("stream_threshold_area_m2", 1000.0)
+        ),
     )
 
-    arr = _apply_valid_mask(
+    arr, output_nodata = _prepare_terrain_raster_output(
+        item["product"],
         arr,
         valid_mask,
         nodata,
@@ -1038,7 +1855,7 @@ def _process_dem_for_product(
         arr,
         profile,
         str(out_fp),
-        nodata=nodata,
+        nodata=output_nodata,
         tags=provenance,
     )
 
@@ -1053,24 +1870,46 @@ def _process_dem_for_product(
 def _terrain_product_jobs(
     requested: list[str],
     multiscale_tpi_radii_m: tuple[float, ...],
-) -> list[tuple[str, float | None, str]]:
-    """Expand terrain products into deterministic output jobs."""
-    jobs: list[tuple[str, float | None, str]] = []
+    openness_radii_m: tuple[float, ...],
+) -> list[tuple[str, float | None, float | None, str]]:
+    """Expand scale-dependent terrain products into deterministic jobs."""
+    jobs: list[
+        tuple[str, float | None, float | None, str]
+    ] = []
 
     for product in requested:
-        if product != "multiscale_tpi":
-            jobs.append((product, None, product))
+
+        if product == "multiscale_tpi":
+            source_radii = multiscale_tpi_radii_m
+        elif product in {
+            "positive_openness",
+            "negative_openness",
+        }:
+            source_radii = openness_radii_m
+        else:
+            jobs.append(
+                (
+                    product,
+                    None,
+                    None,
+                    product,
+                )
+            )
             continue
 
-        radii = []
-        seen = set()
+        radii: list[float] = []
+        seen: set[float] = set()
 
-        for radius in multiscale_tpi_radii_m:
+        for radius in source_radii:
             radius = float(radius)
 
-            if not np.isfinite(radius) or radius <= 0.0:
+            if (
+                not np.isfinite(radius)
+                or radius <= 0.0
+            ):
                 raise ValueError(
-                    "Multiscale TPI radii must be finite and > 0 metres."
+                    f"{product} radii must be finite "
+                    "and > 0 metres."
                 )
 
             if radius in seen:
@@ -1081,23 +1920,230 @@ def _terrain_product_jobs(
 
         if not radii:
             raise ValueError(
-                "At least one multiscale TPI radius is required."
+                f"At least one {product} radius is required."
             )
 
         for radius in radii:
             label = (
                 f"{radius:g}".replace(".", "p")
             )
-            jobs.append(
-                (
-                    product,
-                    radius,
-                    f"multiscale_tpi_{label}m",
+
+            if product == "multiscale_tpi":
+                jobs.append(
+                    (
+                        product,
+                        radius,
+                        None,
+                        f"multiscale_tpi_{label}m",
+                    )
                 )
-            )
+            else:
+                jobs.append(
+                    (
+                        product,
+                        None,
+                        radius,
+                        f"{product}_{label}m",
+                    )
+                )
 
     return jobs
 
+
+
+TERRAIN_OUTPUT_CHOICES = (
+    "raster",
+    "vector",
+    "both",
+)
+
+
+def run_hydrology_vector_from_dem(
+    dem_fp: str | os.PathLike[str],
+    output_root: str | os.PathLike[str],
+    *,
+    stream_threshold_area_m2: float = 1000.0,
+    stream_min_order: int = 1,
+) -> str:
+    """Export continuous-domain hydrology as GeoPackage vectors.
+
+    Vector filtering does not alter the analytical raster products.
+    """
+    _require_rasterio()
+
+    if float(stream_threshold_area_m2) <= 0:
+        raise ValueError(
+            "stream_threshold_area_m2 must be > 0."
+        )
+
+    if int(stream_min_order) < 1:
+        raise ValueError(
+            "stream_min_order must be >= 1."
+        )
+
+    dem_fp = Path(dem_fp)
+    output_root = Path(output_root)
+
+    dem, profile, transform, nodata = _read_dem(
+        str(dem_fp)
+    )
+
+    valid = _dem_valid_mask(
+        dem,
+        nodata,
+    )
+
+    z = np.asarray(dem, dtype=np.float64).copy()
+    z[~valid] = np.nan
+
+    dx, dy = _pixel_size(transform)
+
+    conditioned, _depth = condition_dem(z)
+
+    _direction, receiver = d8_flow_direction_resolved(
+        conditioned,
+        dx,
+        dy,
+    )
+
+    accumulation = d8_flow_accumulation(
+        conditioned,
+        dx,
+        dy,
+        receiver=receiver,
+    )
+
+    area = d8_contributing_area(
+        conditioned,
+        dx,
+        dy,
+        accumulation=accumulation,
+    )
+
+    streams = extract_d8_stream_network(
+        area,
+        receiver,
+        threshold_area=float(
+            stream_threshold_area_m2
+        ),
+    )
+
+    basin = d8_basin_labels(
+        conditioned,
+        receiver,
+    )
+
+    subcatchment = subcatchment_labels(
+        streams["stream_mask"],
+        receiver,
+    )
+
+    crs = profile.get("crs")
+
+    vector_root = output_root / "Vector" / "Hydrology"
+    vector_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    gpkg = vector_root / (
+        f"{dem_fp.stem}_FAST_TERRAIN_HYDROLOGY.gpkg"
+    )
+
+    if gpkg.exists():
+        gpkg.unlink()
+
+    lines = stream_lines_from_topology(
+        streams["stream_mask"],
+        streams["stream_order"],
+        streams["stream_link"],
+        receiver,
+        transform,
+        contributing_area=area,
+        min_order=int(stream_min_order),
+        crs=crs,
+    )
+
+    write_geopackage_layer(
+        lines,
+        gpkg,
+        layer="streams",
+    )
+
+    for key, layer, node_type in (
+        ("headwaters", "headwaters", "headwater"),
+        ("junctions", "junctions", "junction"),
+        (
+            "stream_outlets",
+            "stream_outlets",
+            "stream_outlet",
+        ),
+    ):
+        mask = np.asarray(
+            streams[key],
+            dtype=bool,
+        )
+
+        # Apply requested stream-order threshold to exported
+        # stream-node vectors only.
+        mask &= (
+            np.asarray(streams["stream_order"])
+            >= int(stream_min_order)
+        )
+
+        nodes = stream_nodes_to_points(
+            mask,
+            transform,
+            node_type=node_type,
+            stream_order=streams["stream_order"],
+            contributing_area=area,
+            crs=crs,
+        )
+
+        write_geopackage_layer(
+            nodes,
+            gpkg,
+            layer=layer,
+        )
+
+    basins = labels_to_polygons(
+        basin,
+        transform,
+        crs=crs,
+        label_field="basin_id",
+    )
+
+    write_geopackage_layer(
+        basins,
+        gpkg,
+        layer="basins",
+    )
+
+    basin_boundaries = polygon_boundaries(
+        basins,
+        id_field="basin_id",
+    )
+
+    write_geopackage_layer(
+        basin_boundaries,
+        gpkg,
+        layer="watershed_boundaries",
+    )
+
+    subcatchments = labels_to_polygons(
+        subcatchment,
+        transform,
+        crs=crs,
+        label_field="subcatchment_id",
+    )
+
+    write_geopackage_layer(
+        subcatchments,
+        gpkg,
+        layer="subcatchments",
+    )
+
+    return str(gpkg)
 
 def run_terrain_from_dem(
     dem_fp: str | os.PathLike[str],
@@ -1109,8 +2155,10 @@ def run_terrain_from_dem(
     hillshade_z_factor: float = 1.0,
     tpi_radius: int = 3,
     multiscale_tpi_radii_m: tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0),
+    openness_radii_m: tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0),
     twi_eps: float = 1e-6,
     dtw_max_distance: float | None = None,
+    stream_threshold_area_m2: float = 1000.0,
     skip_existing: bool = False,
     overwrite: bool = False,
     n_jobs: int | None = None,
@@ -1136,6 +2184,10 @@ def run_terrain_from_dem(
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    stream_threshold_area_m2 = float(stream_threshold_area_m2)
+    if not math.isfinite(stream_threshold_area_m2) or stream_threshold_area_m2 <= 0:
+        raise ValueError("stream_threshold_area_m2 must be a finite value > 0.")
+
     requested = _resolve_terrain_products(terrain_products)
 
     stage_banner(
@@ -1149,9 +2201,15 @@ def run_terrain_from_dem(
     product_jobs = _terrain_product_jobs(
         requested,
         multiscale_tpi_radii_m,
+        openness_radii_m,
     )
 
-    for product, multiscale_radius_m, output_label in product_jobs:
+    for (
+        product,
+        multiscale_radius_m,
+        openness_radius_m,
+        output_label,
+    ) in product_jobs:
         out_dir = output_root / output_label
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1189,8 +2247,14 @@ def run_terrain_from_dem(
             "hillshade_z_factor": hillshade_z_factor,
             "tpi_radius": tpi_radius,
             "multiscale_tpi_radius_m": multiscale_radius_m,
+            "openness_radius_m": openness_radius_m,
             "twi_eps": twi_eps,
             "dtw_max_distance": dtw_max_distance,
+            "stream_threshold_area_m2": stream_threshold_area_m2,
+            "mfd_exponent": 1.1,
+            "twi_min_slope_radians": 1.0e-6,
+            "ls_m": 0.4,
+            "ls_n": 1.3,
         }
 
         log_info(
@@ -1222,6 +2286,7 @@ def run_terrain_from_processed_root(
     hillshade_z_factor: float = 1.0,
     tpi_radius: int = 3,
     multiscale_tpi_radii_m: tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0),
+    openness_radii_m: tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0),
     twi_eps: float = 1e-6,
     dtw_max_distance: float | None = None,
     skip_existing: bool = False,
@@ -1239,6 +2304,27 @@ def run_terrain_from_processed_root(
         raise FileNotFoundError(f"FAST_DEM folder not found: {dem_root}")
 
     requested = _resolve_terrain_products(terrain_products)
+
+    tile_unsafe = {
+        "positive_openness",
+        "negative_openness",
+        *HYDROLOGY_TERRAIN_PRODUCTS,
+    }
+
+    unsafe_requested = [
+        p for p in requested
+        if p in tile_unsafe
+    ]
+
+    if unsafe_requested:
+        raise ValueError(
+            "Requested FAST_TERRAIN product(s) require a continuous "
+            "authoritative DEM. Hydrologic/topological products cannot "
+            "be independently derived on ordinary LiDAR tiles. Use the "
+            "merged-DEM terrain workflow. Products: "
+            + ", ".join(unsafe_requested)
+        )
+
     dem_files = sorted([p for p in dem_root.glob("*.tif") if p.is_file()])
     if not dem_files:
         raise FileNotFoundError(f"No DEM rasters found in: {dem_root}")
@@ -1257,9 +2343,15 @@ def run_terrain_from_processed_root(
     product_jobs = _terrain_product_jobs(
         requested,
         multiscale_tpi_radii_m,
+        openness_radii_m,
     )
 
-    for product, multiscale_radius_m, output_label in product_jobs:
+    for (
+        product,
+        multiscale_radius_m,
+        openness_radius_m,
+        output_label,
+    ) in product_jobs:
         items: list[dict[str, Any]] = []
         for dem_fp in dem_files:
             out_fp = _terrain_output_path(
@@ -1280,6 +2372,7 @@ def run_terrain_from_processed_root(
                     "hillshade_z_factor": hillshade_z_factor,
                     "tpi_radius": tpi_radius,
                     "multiscale_tpi_radius_m": multiscale_radius_m,
+                    "openness_radius_m": openness_radius_m,
                     "twi_eps": twi_eps,
                     "dtw_max_distance": dtw_max_distance,
                 }
@@ -1304,6 +2397,9 @@ def run_terrain_from_processed_root(
 __all__ = [
     "PRODUCT_TERRAIN",
     "TERRAIN_PRODUCT_CHOICES",
+    "FAST_TERRAIN_ALL_PRODUCTS",
+    "FAST_TERRAIN_LEGACY_PRODUCTS",
+    "FAST_TERRAIN_CONTINUOUS_HYDROLOGY_PRODUCTS",
     "run_terrain_from_processed_root",
     "run_terrain_from_dem",
     "compute_slope_percent",
@@ -1313,6 +2409,9 @@ __all__ = [
     "compute_curvature",
     "compute_tpi",
     "compute_multiscale_tpi",
+    "compute_openness",
+    "compute_positive_openness",
+    "compute_negative_openness",
     "compute_twi",
     "compute_dtw",
     "compute_tci",

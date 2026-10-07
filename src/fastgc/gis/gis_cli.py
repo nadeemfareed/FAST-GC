@@ -7,6 +7,7 @@ from pathlib import Path
 from .plot_runner import extract_plots
 from .random_sampling import sample_random_and_clip
 from .rough_sampling import sample_and_clip
+from .continuous_sampling import sample_continuous_and_clip
 
 
 def main(argv=None):
@@ -14,7 +15,7 @@ def main(argv=None):
     p.add_argument("--in_path", "--in-path", dest="in_path", required=True)
     p.add_argument("--out_dir", "--out-dir", dest="out_dir", required=True)
     p.add_argument("--sensor_mode", "--sensor-mode", dest="sensor_mode", choices=["ALS", "ULS", "TLS"], required=True)
-    p.add_argument("--sampling", choices=["random", "rough_height_stratified", "imported"], default="random")
+    p.add_argument("--sampling", choices=["random", "rough_height_stratified", "imported", "continuous"], default="random")
     p.add_argument("--dsm_path", "--dsm-path", dest="dsm_path",
                    help="Existing DSM GeoTIFF; required only for rough_height_stratified")
     p.add_argument("--plot_file", "--plot-file", dest="plot_file",
@@ -23,9 +24,14 @@ def main(argv=None):
                    help="Source CRS override for LAS/LAZ without embedded CRS, or for CSV plot centers")
     p.add_argument("--layer", help="Optional vector layer for imported GPKG/vector data")
     p.add_argument("--plots", type=int, default=30)
-    p.add_argument("--shape", choices=["circle", "hexagon"], default="hexagon")
+    p.add_argument("--shape", choices=["circle", "hexagon", "square", "rectangle", "ellipse"], default="hexagon")
     p.add_argument("--radius", type=float, default=15.0)
     p.add_argument("--buffer", type=float, default=5.0)
+    p.add_argument("--width_m", "--width-m", dest="width_m", type=float, default=30.0)
+    p.add_argument("--height_m", "--height-m", dest="height_m", type=float, default=30.0)
+    p.add_argument("--overlap_m", "--overlap-m", dest="overlap_m", type=float, default=5.0)
+    p.add_argument("--rotation_deg", "--rotation-deg", dest="rotation_deg", type=float, default=0.0)
+    p.add_argument("--phase_steps", "--phase-steps", dest="phase_steps", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--coverage_cell_m", "--coverage-cell-m", dest="coverage_cell_m", type=float, default=5.0,
                    help="Raw XY occupancy grid used by random sampling (metres)")
@@ -51,6 +57,31 @@ def main(argv=None):
             sensor_mode=a.sensor_mode, shape=a.shape,
             source_crs=a.source_crs,
         )
+    elif a.sampling == "continuous":
+        if a.width_m <= 0 or a.height_m <= 0:
+            p.error("--width_m and --height_m must be positive")
+        if a.overlap_m < 0:
+            p.error("--overlap_m must be nonnegative")
+        if a.phase_steps < 1:
+            p.error("--phase_steps must be positive")
+
+        result = sample_continuous_and_clip(
+            a.in_path,
+            a.out_dir,
+            radius=a.radius,
+            width=a.width_m,
+            height=a.height_m,
+            overlap=a.overlap_m,
+            buffer=a.buffer,
+            shape=a.shape,
+            rotation_deg=a.rotation_deg,
+            coverage_cell_m=a.coverage_cell_m,
+            phase_steps=a.phase_steps,
+            chunk_size=a.chunk_size,
+            sensor_mode=a.sensor_mode,
+            source_crs=a.source_crs,
+        )
+
     elif a.sampling == "rough_height_stratified":
         if a.shape != "circle":
             p.error("rough_height_stratified currently supports --shape circle; random supports hexagon")
