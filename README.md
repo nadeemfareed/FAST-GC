@@ -103,7 +103,7 @@ configuration is required.
 ``` bash
 git clone https://github.com/nadeemfareed/FAST-GC.git
 cd FAST-GC
-pip install .
+pip install -e .
 ```
 
 A source build may require a Rust toolchain because selected
