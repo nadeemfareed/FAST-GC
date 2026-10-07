@@ -1,12 +1,9 @@
 # FAST-GC
 
-```{=html}
 <p align="center">
-```
-`<img src="docs/images/fastgc_banner.png" width="100%" alt="FAST-GC">`{=html}
-```{=html}
+  <img src="docs/images/fastgc_banner.png" width="100%" alt="FAST-GC">
 </p>
-```
+
 ## Fully Adaptive Self-Tuning Ground Classification (FAST-GC)
 
 **Sensor-adaptive ground classification, spatial LiDAR sampling, and
