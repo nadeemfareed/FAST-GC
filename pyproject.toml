@@ -119,3 +119,6 @@ manifest-path = "native/Cargo.toml"
 python-source = "src"
 module-name = "fastgc._fastgc_native"
 bindings = "pyo3"
+include = [
+  { path = "LICENSE", format = "sdist" }
+]
