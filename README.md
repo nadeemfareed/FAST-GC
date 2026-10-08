@@ -80,17 +80,14 @@ while downstream product interfaces remain consistent.
 # Installation
 
 FAST-GC 0.2.1 supports Python **3.12-3.14**.
-
-
+``` bash
 conda create -n fastgc python=3.12 pip -y
 conda activate fastgc
 python -m pip install "fastgc==0.2.1"
-
-Verify the installation:
-
 fastgc --version
 fastgc --help
 python -m pip check
+```
 
 ## PyPI --- Recommended
 
