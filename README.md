@@ -81,6 +81,20 @@ while downstream product interfaces remain consistent.
 
 FAST-GC 0.2.1 supports Python **3.12-3.14**.
 
+
+# 1. Clone the latest public repository
+cd "$HOME"
+git clone https://github.com/nadeemfareed/FAST-GC.git
+cd FAST-GC
+conda env create -f environment.yml
+conda activate fastgc
+# 4. Verify installation
+python -c "import fastgc; print('FAST-GC:', fastgc.__version__)"
+python -c "import lazrs; print('LAZ support: OK')"
+fastgc --version
+fastgc --help
+pip check
+
 ## PyPI --- Recommended
 
 ``` bash
