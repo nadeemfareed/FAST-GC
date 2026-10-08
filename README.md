@@ -1108,7 +1108,7 @@ citation and DOI when the peer-reviewed article is published.
 
 # Repository and Support
 
-**Source code:** https://github.com/nadeemfareed/FAST-GC\
+**Source code:** https://github.com/nadeemfareed/FAST-GC
 **Issues and feature requests:**
 https://github.com/nadeemfareed/FAST-GC/issues
 
