@@ -1107,8 +1107,6 @@ scientific reference. This README will be updated with the final journal
 citation and DOI when the peer-reviewed article is published.
 
 # Repository and Support
-
-**Source code:** https://github.com/nadeemfareed/FAST-GC
 **Issues and feature requests:**
 https://github.com/nadeemfareed/FAST-GC/issues
 
