@@ -98,29 +98,6 @@ Supported precompiled wheels include the optimized execution components
 required for normal operation. No separate computational-backend
 configuration is required.
 
-## GitHub Source
-
-``` bash
-git clone https://github.com/nadeemfareed/FAST-GC.git
-cd FAST-GC
-pip install -e .
-```
-
-A source build may require a Rust toolchain because selected
-computational kernels use native acceleration.
-
-## Conda Development Environment
-
-``` bash
-git clone https://github.com/nadeemfareed/FAST-GC.git
-cd FAST-GC
-conda env create -f environment.yml
-conda activate fastgc
-pip install -e .
-```
-
-See `INSTALLATION.md` for the complete development and environment
-policy.
 
 ## Google Colab
 
