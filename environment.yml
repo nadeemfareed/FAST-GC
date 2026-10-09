@@ -1,26 +1,32 @@
+
 name: fastgc
 
 channels:
   - conda-forge
 
 dependencies:
-  - python>=3.12,<3.15
+  - python=3.12
   - pip>=25
   - setuptools>=75
   - wheel>=0.44
+
+  # Rust/Maturin source build requirements
+  - rust
+  - cargo
+
+  # Native geospatial dependencies
   - numpy>=2.0,<3.0
   - scipy>=1.15,<2.0
   - laspy>=2.5.4,<3.0
   - lazrs-python>=0.7,<1.0
   - rasterio>=1.5,<2.0
+  - pyproj>=3.7,<4
   - pyogrio>=0.13,<1.0
   - geopandas>=1.0,<2.0
   - shapely>=2.0.6,<3.0
+
+  # Processing utilities
   - tqdm>=4.66,<5.0
   - joblib>=1.4,<2.0
   - psutil>=6.0,<8.0
   - packaging>=24.2,<27.0
-  - pip:
-      # Install this checkout in editable mode without resolving a second copy
-      # of the dependencies already created inside the isolated Conda env.
-      - -e . --no-deps
