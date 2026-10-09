@@ -1,3 +1,4 @@
+
 [build-system]
 requires = ["maturin>=1.9,<2.0"]
 build-backend = "maturin"
@@ -44,8 +45,10 @@ classifiers = [
 ]
 
 # Runtime dependency contract for Python 3.12-3.14.
-# Isolation is provided by the installer/environment (venv, pipx, Conda), not by pip itself.
-# Pyogrio replaces Fiona for bulk vector I/O and Python 3.14 wheel compatibility.
+# Isolation is provided by the installer/environment (venv, pipx, Conda),
+# not by pip itself.
+# Pyogrio replaces Fiona for bulk vector I/O and Python 3.14 wheel
+# compatibility.
 dependencies = [
   "numpy>=2.0,<3.0",
   "scipy>=1.15,<2.0",
@@ -68,18 +71,32 @@ Repository = "https://github.com/nadeemfareed/FAST-GC"
 Issues = "https://github.com/nadeemfareed/FAST-GC/issues"
 
 [project.optional-dependencies]
-# Optional ML integration. Kept outside the core install to avoid CUDA/CPU
-# resolver conflicts and to allow users to select the correct PyTorch wheel.
+
+# Optional ML integration. Kept outside the core installation to avoid
+# CUDA/CPU resolver conflicts and allow users to select the appropriate
+# PyTorch wheel for their hardware.
 ml = [
   "scikit-learn>=1.6,<2.0",
   "torch>=2.7,<3.0"
 ]
 
+# Optional scientific visualization.
 viz = [
   "matplotlib>=3.9,<4.0",
   "plotly>=6.0,<7.0"
 ]
 
+# Optional Jupyter Notebook and JupyterLab integration.
+# FAST-GC processing remains accessible through the published CLI.
+# These dependencies are not required for standard CLI processing.
+notebook = [
+  "ipykernel>=6.29,<8.0",
+  "jupyterlab>=4.0,<5.0",
+  "matplotlib>=3.9,<4.0",
+  "plotly>=6.0,<7.0"
+]
+
+# Development, testing, linting, and packaging tools.
 dev = [
   "build>=1.2",
   "twine>=6.0",
@@ -91,11 +108,16 @@ dev = [
   "packaging>=24.2"
 ]
 
+# Complete optional environment: ML, visualization, notebooks,
+# and development tools.
+# PyTorch remains subject to platform-specific CPU/CUDA selection.
 all = [
   "scikit-learn>=1.6,<2.0",
   "torch>=2.7,<3.0",
   "matplotlib>=3.9,<4.0",
   "plotly>=6.0,<7.0",
+  "ipykernel>=6.29,<8.0",
+  "jupyterlab>=4.0,<5.0",
   "build>=1.2",
   "twine>=6.0",
   "pytest>=8.3",
