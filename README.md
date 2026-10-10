@@ -141,12 +141,15 @@ fastgc \
 Ground classification plus terrain products:
 
 ``` bash
-fastgc \
-  --in_path input.laz \
-  --out_dir output \
-  --sensor_mode ALS \
-  --products FAST_GC FAST_DEM FAST_TERRAIN \
-  --terrain_products slope_degrees aspect hillshade multiscale_tpi
+fastgc `
+    --in_path "C:\OneDrive\Pictures\Site5.las" `
+    --out_dir "C:\FASTGC_BENCHMARK\Site5_PREDISPATCH" `
+    --sensor_mode ALS `
+    --workflow tile-run-merge `
+    --tile_size_m 140 `
+    --buffer_m 4 `
+    --joblib_pre_dispatch "2*n_jobs" `
+    --products FAST_GC
 ```
 
 The default product is `FAST_GC`. Input can be a LAS/LAZ file, folder,
