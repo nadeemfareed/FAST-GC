@@ -1418,6 +1418,54 @@ def run_fastgc(
 
     if workflow == "derive-only":
         p = Path(in_path)
+        # A standalone DEM is already an authoritative continuous terrain
+        # domain. It must not be interpreted as a FAST_GC processed directory.
+        if p.suffix.lower() in {".tif", ".tiff"}:
+            if not p.is_file():
+                raise FileNotFoundError(f"Input DEM not found: {p}")
+            if requested_products != [PRODUCT_TERRAIN]:
+                raise ValueError(
+                    "A standalone DEM supports only --products FAST_TERRAIN "
+                    "with --workflow derive-only."
+                )
+            import rasterio
+
+            with rasterio.open(p) as src:
+                if src.count != 1 or src.width < 2 or src.height < 2:
+                    raise ValueError("Terrain input must be a single-band DEM of at least 2x2 pixels")
+                if src.transform.a == 0 or src.transform.e == 0:
+                    raise ValueError("DEM must have nonzero pixel dimensions")
+
+            terrain_root = (Path(out_dir) if out_dir is not None else p.parent) / PRODUCT_TERRAIN
+            if terrain_output in {"raster", "both"}:
+                run_terrain_from_dem(
+                    dem_fp=p,
+                    output_root=terrain_root,
+                    terrain_products=terrain_products,
+                    hillshade_azimuth=hillshade_azimuth,
+                    hillshade_altitude=hillshade_altitude,
+                    hillshade_z_factor=hillshade_z_factor,
+                    tpi_radius=tpi_radius,
+                    multiscale_tpi_radii_m=multiscale_tpi_radii_m,
+                    openness_radii_m=openness_radii_m,
+                    twi_eps=twi_eps,
+                    dtw_max_distance=dtw_max_distance,
+                    stream_threshold_area_m2=stream_threshold_area_m2,
+                    skip_existing=skip_existing,
+                    overwrite=overwrite,
+                    n_jobs=n_jobs,
+                    joblib_backend=joblib_backend,
+                    joblib_batch_size=joblib_batch_size,
+                    joblib_pre_dispatch=joblib_pre_dispatch,
+                )
+            if terrain_output in {"vector", "both"}:
+                run_hydrology_vector_from_dem(
+                    dem_fp=p,
+                    output_root=terrain_root,
+                    stream_threshold_area_m2=stream_threshold_area_m2,
+                    stream_min_order=stream_min_order,
+                )
+            return str(terrain_root)
         workspace_manifest: dict | None = None
         direct_dsm_input: Path | None = None
 

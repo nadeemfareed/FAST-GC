@@ -845,8 +845,13 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
-    if args.workflow != "plots-run" and args.sensor_mode is None:
-        parser.error("--sensor_mode is required unless --workflow plots-run is used")
+    direct_dem_terrain = (
+        args.workflow == "derive-only"
+        and os.path.splitext(args.in_path)[1].lower() in {".tif", ".tiff"}
+        and args.products == ["FAST_TERRAIN"]
+    )
+    if args.workflow != "plots-run" and args.sensor_mode is None and not direct_dem_terrain:
+        parser.error("--sensor_mode is required unless --workflow plots-run or standalone DEM terrain derivation is used")
 
     if args.workflow == "plots-run":
         from .gis.plots_run import resolve_plots_run_input
@@ -862,10 +867,11 @@ def main(argv=None):
 
         args.sensor_mode = plot_manifest.sensor_mode
 
-    try:
-        configure_sensor_compute_backend(args.sensor_mode)
-    except (ValueError, RuntimeError) as exc:
-        raise SystemExit(str(exc)) from exc
+    if not direct_dem_terrain:
+        try:
+            configure_sensor_compute_backend(args.sensor_mode)
+        except (ValueError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from exc
 
 
     if isinstance(args.joblib_batch_size, str) and args.joblib_batch_size.strip().lower() != "auto":
