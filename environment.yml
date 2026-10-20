@@ -1,4 +1,4 @@
-
+﻿
 name: fastgc
 
 channels:
@@ -30,3 +30,7 @@ dependencies:
   - joblib>=1.4,<2.0
   - psutil>=6.0,<8.0
   - packaging>=24.2,<27.0
+  - pip:
+      # Install the repository in editable mode using Conda-managed dependencies.
+      - -e . --no-deps
+
