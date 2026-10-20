@@ -859,3 +859,58 @@ def test_external_manifest_refreshes_after_publish_before_cleanup(
     assert not (
         collection / ".fastgc_plots_run_work"
     ).exists()
+
+
+def test_plots_run_forwards_terrain_hydrology_options(tmp_path, monkeypatch):
+    """Each plot receives the caller's terrain and hydrology configuration."""
+    root = _make_collection(tmp_path)
+    calls = []
+
+    def fake_run_fastgc(**kwargs):
+        calls.append(kwargs)
+        return str(kwargs["out_dir"])
+
+    real_run = (
+        test_plots_run_dispatches_each_plot_to_existing_run_workflow._real
+    )
+
+    monkeypatch.setattr(core, "run_fastgc", fake_run_fastgc)
+
+    result = real_run(
+        in_path=str(root),
+        out_dir=None,
+        sensor_mode="ALS",
+        products=["FAST_GC", "FAST_DEM", "FAST_TERRAIN"],
+        workflow="plots-run",
+        terrain_products=["slope_degrees", "flow_accumulation"],
+        terrain_output="both",
+        stream_threshold_area_m2=250.0,
+        stream_min_order=3,
+        hillshade_azimuth=225.0,
+        hillshade_altitude=35.0,
+        tpi_radius=5,
+        multiscale_tpi_radii_m=(5.0, 15.0),
+        openness_radii_m=(10.0, 20.0),
+        twi_eps=1e-5,
+        dtw_max_distance=75.0,
+    )
+
+    assert Path(result) == root.resolve()
+    assert len(calls) == 2
+
+    for call in calls:
+        assert call["workflow"] == "run"
+        assert call["terrain_products"] == [
+            "slope_degrees",
+            "flow_accumulation",
+        ]
+        assert call["terrain_output"] == "both"
+        assert call["stream_threshold_area_m2"] == 250.0
+        assert call["stream_min_order"] == 3
+        assert call["hillshade_azimuth"] == 225.0
+        assert call["hillshade_altitude"] == 35.0
+        assert call["tpi_radius"] == 5
+        assert call["multiscale_tpi_radii_m"] == (5.0, 15.0)
+        assert call["openness_radii_m"] == (10.0, 20.0)
+        assert call["twi_eps"] == 1e-5
+        assert call["dtw_max_distance"] == 75.0
