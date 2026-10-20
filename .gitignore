@@ -141,3 +141,6 @@ ULS_tiles/
 TLS_tiles/
 BAD_SENSOR_tiles/
 dist_repaired/
+
+# Local automated tests (kept outside the public repository)
+/tests/
