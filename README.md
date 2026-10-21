@@ -76,6 +76,7 @@ https://www.preprints.org/manuscript/202609.1631
 The acquisition platform is supplied through `--sensor_mode`. FAST-GC
 routes the corresponding sensor-specific ground-classification workflow
 while downstream product interfaces remain consistent.
+📖 **[FAST-GC Book — Scientific Documentation and User Guide](https://nadeemfareed.github.io/fastgcBOOK/)**
 
 # Installation
 
