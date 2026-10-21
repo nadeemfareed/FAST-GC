@@ -24,6 +24,7 @@ manual tuning. FAST-GC 0.2.1 also integrates optimized native execution
 for selected computational stages. Supported precompiled distributions
 use this automatically; normal users do not need to select or configure
 a computational backend.
+
 📖 **[FAST-GC Book — Scientific Documentation and User Guide](https://nadeemfareed.github.io/fastgcBOOK/)**
 
 ## Scientific Reference
