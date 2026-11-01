@@ -1,7 +1,29 @@
+
 # FAST-GC
 
 <p align="center">
   <img src="docs/images/fastgc_banner.png" width="100%" alt="FAST-GC">
+</p>
+
+<p align="center">
+  <a href="https://github.com/nadeemfareed/FAST-GC/stargazers">
+    <img src="https://img.shields.io/github/stars/nadeemfareed/FAST-GC?style=flat-square&logo=github&color=yellow" alt="GitHub Stars">
+  </a>
+  <a href="https://github.com/nadeemfareed/FAST-GC/network/members">
+    <img src="https://img.shields.io/github/forks/nadeemfareed/FAST-GC?style=flat-square&logo=github" alt="GitHub Forks">
+  </a>
+  <a href="https://pypi.org/project/fastgc/">
+    <img src="https://img.shields.io/pypi/v/fastgc?style=flat-square&logo=pypi" alt="PyPI Version">
+  </a>
+  <a href="https://pypi.org/project/fastgc/">
+    <img src="https://img.shields.io/pypi/pyversions/fastgc?style=flat-square&logo=python" alt="Python Versions">
+  </a>
+  <a href="https://pypi.org/project/fastgc/">
+    <img src="https://img.shields.io/pypi/dm/fastgc?style=flat-square&color=green" alt="PyPI Downloads">
+  </a>
+  <a href="https://github.com/nadeemfareed/FAST-GC/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/nadeemfareed/FAST-GC?style=flat-square" alt="License">
+  </a>
 </p>
 
 ## Fully Adaptive Self-Tuning Ground Classification (FAST-GC)
