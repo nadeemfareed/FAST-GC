@@ -28,8 +28,10 @@
 
 ## Fully Adaptive Self-Tuning Ground Classification (FAST-GC)
 
-**Sensor-adaptive ground classification, spatial LiDAR sampling, and
-LiDAR-derived geospatial products**
+**Sensor-adaptive LiDAR ground classification, spatial point-cloud sampling, and terrain and forest geospatial products.**
+
+FAST-GC is an open-source Python framework for automated ground classification and geospatial product generation from airborne laser scanning (ALS), uncrewed aerial laser scanning (ULS), and terrestrial laser scanning (TLS) point clouds. It integrates adaptive, sensor-aware processing with terrain reconstruction and LiDAR-derived elevation and forest structure products.
+
 
 FAST-GC is a Python-first framework for automated LiDAR ground
 classification and downstream geospatial analysis. It supports airborne
