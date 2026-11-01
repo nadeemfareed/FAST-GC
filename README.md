@@ -6,27 +6,30 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/nadeemfareed/FAST-GC/stargazers">
-    <img src="https://img.shields.io/github/stars/nadeemfareed/FAST-GC?style=flat-square&logo=github&color=yellow" alt="GitHub Stars">
-  </a>
-  <a href="https://github.com/nadeemfareed/FAST-GC/network/members">
-    <img src="https://img.shields.io/github/forks/nadeemfareed/FAST-GC?style=flat-square&logo=github" alt="GitHub Forks">
+  <a href="https://pypi.org/project/fastgc/">
+    <img src="https://img.shields.io/pypi/v/fastgc?style=flat-square&logo=pypi&label=PyPI" alt="PyPI Version">
   </a>
   <a href="https://pypi.org/project/fastgc/">
-    <img src="https://img.shields.io/pypi/v/fastgc?style=flat-square&logo=pypi" alt="PyPI Version">
+    <img src="https://img.shields.io/pypi/pyversions/fastgc?style=flat-square&logo=python&label=Python" alt="Python Versions">
   </a>
-  <a href="https://pypi.org/project/fastgc/">
-    <img src="https://img.shields.io/pypi/pyversions/fastgc?style=flat-square&logo=python" alt="Python Versions">
+  <a href="https://github.com/nadeemfareed/FAST-GC">
+    <img src="https://img.shields.io/badge/Windows-Tested-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows">
   </a>
-  <a href="https://pypi.org/project/fastgc/">
-    <img src="https://img.shields.io/pypi/dm/fastgc?style=flat-square&color=green" alt="PyPI Downloads">
+  <a href="https://github.com/nadeemfareed/FAST-GC">
+    <img src="https://img.shields.io/badge/Ubuntu%20WSL2-Tested-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Ubuntu WSL2">
   </a>
-  <a href="https://github.com/nadeemfareed/FAST-GC/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/nadeemfareed/FAST-GC?style=flat-square" alt="License">
+  <a href="https://colab.research.google.com/">
+    <img src="https://img.shields.io/badge/Google%20Colab-Setup%20required-F9AB00?style=flat-square&logo=googlecolab&logoColor=white" alt="Google Colab">
+  </a>
+  <a href="https://jupyter.org/">
+    <img src="https://img.shields.io/badge/Jupyter-Notebook-F37626?style=flat-square&logo=jupyter&logoColor=white" alt="Jupyter Notebook">
   </a>
 </p>
 
 ## Fully Adaptive Self-Tuning Ground Classification (FAST-GC)
+
+**Sensor-adaptive ground classification, spatial LiDAR sampling, and LiDAR-derived geospatial products**
+
 
 **Sensor-adaptive LiDAR ground classification, spatial point-cloud sampling, and terrain and forest geospatial products.**
 
