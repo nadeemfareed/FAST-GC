@@ -1,4 +1,4 @@
-﻿FROM python:3.14-slim
+FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -8,6 +8,8 @@ WORKDIR /app
 
 # Runtime libraries required by binary geospatial wheels and common CRS/data IO.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      pkg-config \
       libgomp1 \
       libexpat1 \
     && rm -rf /var/lib/apt/lists/*

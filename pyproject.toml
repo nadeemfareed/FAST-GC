@@ -132,8 +132,6 @@ all = [
 fastgc = "fastgc.cli:main"
 fastgc-check = "fastgc.check_env:main"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
 
 # FASTGC_UNIFIED_MATURIN_V1
 [tool.maturin]
