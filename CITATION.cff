@@ -1,6 +1,7 @@
 cff-version: 1.2.0
 message: "If you use FAST-GC in research, please cite the software release and the associated FAST-GC publication when available."
-title: "FAST-GC: Fully Adaptive Self-Tuning Sensor-Agnostic Ground Classification for LiDAR point clouds"
+title: " FAST-GC: A Fully Adaptive Self-Tuning Ground Classification Algorithm
+for Multi-Platform LiDAR Sensors"
 type: software
 authors:
   - family-names: Fareed
