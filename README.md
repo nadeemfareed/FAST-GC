@@ -1120,15 +1120,9 @@ before packaging or publishing modified builds.
 If FAST-GC contributes to your research, please cite:
 
 > Fareed, N.; Numata, I.; Silva, C. A.; Prichard, S. J. (2026).\
-> **FAST-GC: A Fully Adaptive Self-Tuning Ground Classification
-> Algorithm for Multi-Platform LiDAR Sensors.**\
-> Preprints.org, Version 1.\
-> https://www.preprints.org/manuscript/202609.1631
-
-The manuscript has been submitted for peer-reviewed publication. Until
-the final article is available, the public preprint above is the current
-scientific reference. This README will be updated with the final journal
-citation and DOI when the peer-reviewed article is published.
+> **Fareed, N.; Numata, I.; Silva, C.A.; Prichard, S.J. FAST-GC:
+> A Fully Adaptive Self-Tuning Ground Classification Algorithm for Multi-Platform LiDAR Sensors.
+> Sensors 2026, 26, 7032. https://doi.org/10.3390/s26217032**
 
 # Repository and Support
 **Issues and feature requests:**
