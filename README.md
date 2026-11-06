@@ -56,20 +56,12 @@ a computational backend.
 
 ## Scientific Reference
 
-The FAST-GC ground-classification methodology is documented in the
-public preprint:
+The FAST-GC ground-classification methodology is documented in published article:
 
-**Fareed, N.; Numata, I.; Silva, C. A.; Prichard, S. J. (2026).**\
-**FAST-GC: A Fully Adaptive Self-Tuning Ground Classification Algorithm
-for Multi-Platform LiDAR Sensors.**\
-Preprints.org, Version 1.
+**Fareed, N.; Numata, I.; Silva, C.A.; Prichard, S.J. FAST-GC: 
+A Fully Adaptive Self-Tuning Ground Classification Algorithm for Multi-Platform LiDAR Sensors. Sensors 2026, 26, 7032. https://doi.org/10.3390/s26217032**\
 
-https://www.preprints.org/manuscript/202609.1631
-
-> The manuscript is publicly available as a preprint and has been
-> submitted for peer-reviewed publication. The citation will be updated
-> when the final peer-reviewed article becomes available.
-
+https://www.mdpi.com/4181180
 ## Key Capabilities
 
 -   Self-tuning ground classification across ALS, ULS, and TLS point
