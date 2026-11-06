@@ -59,8 +59,7 @@ a computational backend.
 The FAST-GC ground-classification methodology is documented in published article:
 
 **Fareed, N.; Numata, I.; Silva, C.A.; Prichard, S.J. FAST-GC: 
-A Fully Adaptive Self-Tuning Ground Classification Algorithm for Multi-Platform LiDAR Sensors. Sensors 2026, 26, 7032. https://doi.org/10.3390/s26217032**\
-
+A Fully Adaptive Self-Tuning Ground Classification Algorithm for Multi-Platform LiDAR Sensors. Sensors 2026, 26, 7032**. 
 https://www.mdpi.com/4181180
 ## Key Capabilities
 
